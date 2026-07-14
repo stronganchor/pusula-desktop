@@ -2,6 +2,9 @@
   "name": "pusula-desktop",
   "private": true,
   "version": "0.1.0",
+  "description": "Offline-first Windows desktop application for Pusula business records",
+  "license": "UNLICENSED",
+  "repository": "https://github.com/stronganchor/pusula-desktop",
   "type": "module",
   "scripts": {
     "dev": "vite",

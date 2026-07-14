@@ -1,16 +1,25 @@
-use std::{sync::Arc, time::Duration};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+use std::{
+    path::{Path as FsPath, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 
 use axum::{
     body::Body,
-    extract::{DefaultBodyLimit, State},
+    extract::{DefaultBodyLimit, Path as RoutePath, State},
     http::{header, HeaderMap, HeaderValue, Request, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{get, post, put},
     Json, Router,
 };
 use chrono::{DateTime, SecondsFormat, Utc};
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use tokio::{io::AsyncWriteExt, sync::Semaphore};
 use uuid::Uuid;
 
 use crate::{
@@ -25,6 +34,8 @@ pub struct GatewayState {
     database: Database,
     b2: B2Client,
     object_prefix: Arc<str>,
+    relay_directory: Arc<PathBuf>,
+    relay_slots: Arc<Semaphore>,
     max_backup_bytes: u64,
     rate_capacity: u32,
     rate_refill: Duration,
@@ -39,10 +50,13 @@ impl GatewayState {
         rate_capacity: u32,
         rate_refill: Duration,
     ) -> Self {
+        let relay_directory = relay_directory(database.path());
         Self {
             database,
             b2,
             object_prefix: object_prefix.into(),
+            relay_directory: Arc::new(relay_directory),
+            relay_slots: Arc::new(Semaphore::new(1)),
             max_backup_bytes,
             rate_capacity,
             rate_refill,
@@ -50,11 +64,50 @@ impl GatewayState {
     }
 }
 
+fn relay_directory(database_path: &FsPath) -> PathBuf {
+    database_path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| FsPath::new("."))
+        .join("relay-spool")
+}
+
+/// Remove encrypted relay fragments left by a process or host crash. Production
+/// calls this before binding the listener, so no active request can be touched.
+pub async fn cleanup_stale_relay_spools(database_path: &FsPath) -> Result<u64> {
+    let directory = relay_directory(database_path);
+    let mut entries = match tokio::fs::read_dir(&directory).await {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(AppError::internal(error)),
+    };
+    let mut removed = 0_u64;
+    while let Some(entry) = entries.next_entry().await.map_err(AppError::internal)? {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !name.starts_with(".relay-") || !name.ends_with(".sqlite3.age.part") {
+            continue;
+        }
+        let file_type = entry.file_type().await.map_err(AppError::internal)?;
+        if !file_type.is_file() && !file_type.is_symlink() {
+            continue;
+        }
+        tokio::fs::remove_file(entry.path())
+            .await
+            .map_err(AppError::internal)?;
+        removed = removed.saturating_add(1);
+    }
+    Ok(removed)
+}
+
 pub fn router(state: GatewayState) -> Router {
     Router::new()
         .route("/healthz", get(health))
         .route("/v1/enroll", post(enroll))
         .route("/v1/backups/upload-url", post(upload_url))
+        .route("/v1/backups/relay/{backup_id}", put(relay_backup))
         .route("/v1/backups/complete", post(complete_backup))
         .route("/v1/backups/status", get(backup_status))
         .layer(DefaultBodyLimit::max(16 * 1024))
@@ -270,6 +323,218 @@ async fn complete_backup(
     })
     .await?;
     Ok(Json(completion_response(completed)?))
+}
+
+async fn relay_backup(
+    State(state): State<GatewayState>,
+    RoutePath(backup_id): RoutePath<String>,
+    headers: HeaderMap,
+    body: Body,
+) -> Result<Json<CompleteResponse>> {
+    validate_uuid(&backup_id)?;
+    let device = authenticate(&state, &headers).await?;
+    let device_id = device.id;
+    let lookup_device_id = device_id.clone();
+    let lookup_backup_id = backup_id.clone();
+    let backup = run_db(state.database.clone(), move |database| {
+        database.backup_for_device(&lookup_device_id, &lookup_backup_id)
+    })
+    .await?;
+
+    validate_relay_headers(&headers, backup.size_bytes)?;
+    if backup.status == "completed" {
+        return Ok(Json(completion_response(backup)?));
+    }
+    if backup.status != "pending" {
+        return Err(AppError::Conflict("backup is not pending"));
+    }
+    if backup.size_bytes > state.max_backup_bytes {
+        return Err(AppError::Conflict(
+            "backup exceeds the configured relay limit",
+        ));
+    }
+
+    let _relay_slot =
+        state
+            .relay_slots
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| AppError::RateLimited {
+                retry_after_seconds: 5,
+            })?;
+    let admission_database = state.database.clone();
+    let admission_device_id = device_id.clone();
+    let admission_backup_id = backup_id.clone();
+    let rate_capacity = state.rate_capacity;
+    let refill_seconds = state.rate_refill.as_secs();
+    run_db(admission_database, move |database| {
+        database.begin_relay_attempt(
+            &admission_device_id,
+            &admission_backup_id,
+            rate_capacity,
+            refill_seconds,
+        )
+    })
+    .await?;
+
+    let spool = spool_relay_body(
+        state.relay_directory.as_ref(),
+        &backup_id,
+        body,
+        backup.size_bytes,
+        &backup.sha256,
+    )
+    .await?;
+    let upload_result = state
+        .b2
+        .upload_ciphertext(
+            &backup.object_key,
+            backup.size_bytes,
+            &backup.sha256,
+            spool.path(),
+        )
+        .await;
+    spool.cleanup().await?;
+    let verified = upload_result?;
+
+    let completed = run_db(state.database, move |database| {
+        database.mark_backup_completed(
+            &device_id,
+            &backup_id,
+            verified.etag.as_deref(),
+            verified.version_id.as_deref(),
+        )
+    })
+    .await?;
+    Ok(Json(completion_response(completed)?))
+}
+
+fn validate_relay_headers(headers: &HeaderMap, expected_size: u64) -> Result<()> {
+    if headers.contains_key(header::TRANSFER_ENCODING) {
+        return Err(AppError::BadRequest(
+            "relay requests must not use transfer encoding",
+        ));
+    }
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .ok_or(AppError::BadRequest(
+            "relay content type must be application/octet-stream",
+        ))?;
+    if content_type != "application/octet-stream" {
+        return Err(AppError::BadRequest(
+            "relay content type must be application/octet-stream",
+        ));
+    }
+    let content_length = headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or(AppError::BadRequest(
+            "relay content length is required and must be numeric",
+        ))?;
+    if content_length != expected_size {
+        return Err(AppError::BadRequest(
+            "relay content length does not match the reservation",
+        ));
+    }
+    Ok(())
+}
+
+struct RelaySpool {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl RelaySpool {
+    fn path(&self) -> &FsPath {
+        &self.path
+    }
+
+    async fn cleanup(mut self) -> Result<()> {
+        match tokio::fs::remove_file(&self.path).await {
+            Ok(()) => {
+                self.armed = false;
+                Ok(())
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                self.armed = false;
+                Ok(())
+            }
+            Err(error) => Err(AppError::internal(error)),
+        }
+    }
+}
+
+impl Drop for RelaySpool {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+async fn spool_relay_body(
+    directory: &FsPath,
+    backup_id: &str,
+    body: Body,
+    expected_size: u64,
+    expected_sha256: &str,
+) -> Result<RelaySpool> {
+    tokio::fs::create_dir_all(directory)
+        .await
+        .map_err(AppError::internal)?;
+    #[cfg(unix)]
+    tokio::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))
+        .await
+        .map_err(AppError::internal)?;
+
+    let path = directory.join(format!(
+        ".relay-{backup_id}-{}.sqlite3.age.part",
+        Uuid::new_v4()
+    ));
+    let spool = RelaySpool { path, armed: true };
+    let mut file = tokio::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(spool.path())
+        .await
+        .map_err(AppError::internal)?;
+    #[cfg(unix)]
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))
+        .await
+        .map_err(AppError::internal)?;
+
+    let mut stream = body.into_data_stream();
+    let mut received = 0_u64;
+    let mut hasher = Sha256::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|_| AppError::BadRequest("relay body stream failed"))?;
+        received = received
+            .checked_add(u64::try_from(chunk.len()).map_err(AppError::internal)?)
+            .ok_or(AppError::BadRequest("relay body is too large"))?;
+        if received > expected_size {
+            return Err(AppError::BadRequest(
+                "relay body exceeds the reserved content length",
+            ));
+        }
+        hasher.update(&chunk);
+        file.write_all(&chunk).await.map_err(AppError::internal)?;
+    }
+    if received != expected_size {
+        return Err(AppError::BadRequest(
+            "relay body is shorter than the reserved content length",
+        ));
+    }
+    if hex::encode(hasher.finalize()) != expected_sha256 {
+        return Err(AppError::BadRequest(
+            "relay ciphertext checksum does not match the reservation",
+        ));
+    }
+    file.flush().await.map_err(AppError::internal)?;
+    file.shutdown().await.map_err(AppError::internal)?;
+    drop(file);
+    Ok(spool)
 }
 
 fn completion_response(backup: BackupRecord) -> Result<CompleteResponse> {

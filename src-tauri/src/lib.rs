@@ -373,8 +373,9 @@ pub fn run() {
             let database_path = app_data_dir.join("data").join("pusula.sqlite3");
             let database =
                 Database::initialize(database_path).map_err(|error| error.to_string())?;
-            let backup_service = BackupService::production(database.clone(), app_data_dir)
-                .map_err(|error| error.to_string())?;
+            let backup_service =
+                BackupService::production(database.clone(), app_data_dir, &app.config().identifier)
+                    .map_err(|error| error.to_string())?;
             app.manage(DbState {
                 database,
                 maintenance_gate: Arc::new(RwLock::new(())),

@@ -32,6 +32,7 @@ type DatabaseStatus = {
   integrity_check: string;
   last_modified_at: string | null;
   onboarding_complete: boolean;
+  import_verification_pending: boolean;
   last_import: ImportSummary | null;
   counts: RecordCounts;
   totals: FinancialTotals;
@@ -351,6 +352,15 @@ async function importFile(mode: ModalMode): Promise<boolean> {
     return false;
   }
 
+  try {
+    await invoke("acknowledge_import_verification", { summary });
+  } catch (error) {
+    blockAfterCommittedImport(
+      `İçe aktarma yeniden okundu ancak kalıcı doğrulama işareti temizlenemedi. ${String(error)}`,
+    );
+    return false;
+  }
+
   renderStatus(status, summary);
   setMessage(`İçe aktarma tamamlandı ve yeniden okunarak doğrulandı. SHA-256: ${summary.sha256}`);
   setBusy(false);
@@ -553,13 +563,19 @@ export async function initializeDataManagement(): Promise<void> {
       `SQLite bütünlük denetimi başarısız (${status.integrity_check}). Veri girişi engellendi; kurtarma runbook'unu kullanın.`,
     );
   }
-  if (status.last_import) {
+  if (status.import_verification_pending) {
+    if (!status.last_import) {
+      throw new Error(
+        "Doğrulama bekleyen içe aktarma için kalıcı özet bulunamadı. Veri girişi engellendi; destek alın.",
+      );
+    }
     const verificationError = importVerificationError(status, status.last_import);
     if (verificationError) {
       throw new Error(
         `Son içe aktarma açılış denetimini geçemedi (${verificationError}). Veri girişi engellendi; destek alın.`,
       );
     }
+    await invoke("acknowledge_import_verification", { summary: status.last_import });
   }
   if (isEmpty(status) && !status.onboarding_complete) {
     await showFirstRun(status);

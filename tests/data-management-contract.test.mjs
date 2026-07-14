@@ -36,6 +36,12 @@ test("import completion evidence is retained and rendered", () => {
   assert.match(source, /setBusy\(true\)/);
   assert.match(source, /importVerificationError\(status, status\.last_import\)/);
   assert.match(source, /Son içe aktarma açılış denetimini geçemedi/);
+  assert.match(source, /if \(status\.import_verification_pending\)/);
+  assert.match(source, /invoke\("acknowledge_import_verification", \{ summary \}\)/);
+  assert.match(
+    source,
+    /invoke\("acknowledge_import_verification", \{ summary: status\.last_import \}\)/,
+  );
 
   const committedFailure = source.slice(
     source.indexOf("let status: DatabaseStatus"),

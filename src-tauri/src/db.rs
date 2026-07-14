@@ -370,6 +370,7 @@ impl Database {
         )?;
         write_setting(&transaction, "last_import", &serialized_summary)?;
         write_setting(&transaction, "onboarding_complete", "true")?;
+        write_setting(&transaction, "import_verification_pending", "true")?;
         mark_modified(&transaction)?;
         transaction.commit()?;
 
@@ -441,6 +442,49 @@ impl Database {
         Ok(())
     }
 
+    pub fn acknowledge_import_verification(&self, expected: &ImportSummary) -> AppResult<()> {
+        validate_import_summary(expected)?;
+        let mut connection = self.connect()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let pending = parse_setting_bool(
+            &read_required_setting(&transaction, "import_verification_pending")?,
+            "import_verification_pending",
+        )?;
+        if !pending {
+            return Err(AppError::user(
+                "Doğrulama bekleyen bir içe aktarma bulunamadı.",
+            ));
+        }
+
+        let stored: ImportSummary =
+            serde_json::from_str(&read_required_setting(&transaction, "last_import")?)?;
+        validate_import_summary(&stored)?;
+        if stored != *expected {
+            return Err(AppError::user(
+                "Kalıcı içe aktarma özeti beklenen özetle eşleşmiyor.",
+            ));
+        }
+
+        let integrity_check: String =
+            transaction.pragma_query_value(None, "integrity_check", |row| row.get(0))?;
+        if integrity_check != "ok" {
+            return Err(AppError::user(format!(
+                "İçe aktarma sonrası SQLite bütünlük sonucu geçersiz: {integrity_check}."
+            )));
+        }
+        if counts_from_database(&transaction)? != expected.counts
+            || totals_from_database(&transaction)? != expected.totals
+        {
+            return Err(AppError::user(
+                "İçe aktarma sonrası satır sayıları veya mali toplamlar değişti.",
+            ));
+        }
+
+        write_setting(&transaction, "import_verification_pending", "false")?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub fn status(&self) -> AppResult<DatabaseStatus> {
         let mut connection = self.connect()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
@@ -456,6 +500,10 @@ impl Database {
         let onboarding_complete = parse_setting_bool(
             &read_required_setting(&transaction, "onboarding_complete")?,
             "onboarding_complete",
+        )?;
+        let import_verification_pending = parse_setting_bool(
+            &read_required_setting(&transaction, "import_verification_pending")?,
+            "import_verification_pending",
         )?;
         let last_modified_at = read_optional_setting(&transaction, "last_modified_at")?;
         let last_import = read_optional_setting(&transaction, "last_import")?
@@ -475,6 +523,7 @@ impl Database {
             integrity_check,
             last_modified_at,
             onboarding_complete,
+            import_verification_pending,
             last_import,
             counts,
             totals,
@@ -552,6 +601,14 @@ fn ensure_database_settings(connection: &mut Connection) -> AppResult<()> {
                 if initialized { "true" } else { "false" },
             )?;
         }
+    }
+
+    let import_verification = read_optional_setting(&transaction, "import_verification_pending")?;
+    match import_verification {
+        Some(value) => {
+            parse_setting_bool(&value, "import_verification_pending")?;
+        }
+        None => write_setting(&transaction, "import_verification_pending", "false")?,
     }
     transaction.commit()?;
     Ok(())
@@ -1265,6 +1322,7 @@ mod tests {
         let summary = target.import_data(bundle, false).unwrap();
         let status = target.status().unwrap();
         assert!(status.onboarding_complete);
+        assert!(status.import_verification_pending);
         assert_eq!(status.last_import, Some(summary.clone()));
         assert_eq!(status.totals, summary.totals);
 
@@ -1273,6 +1331,7 @@ mod tests {
         let reopened_status = reopened.status().unwrap();
         assert_eq!(reopened_status.database_id, database_id);
         assert!(reopened_status.onboarding_complete);
+        assert!(reopened_status.import_verification_pending);
         assert_eq!(reopened_status.last_import, Some(summary));
     }
 
@@ -1327,6 +1386,7 @@ mod tests {
         assert!(target.import_data(bundle, false).is_err());
         let status = target.status().unwrap();
         assert!(!status.onboarding_complete);
+        assert!(!status.import_verification_pending);
         assert_eq!(status.last_import, None);
     }
 

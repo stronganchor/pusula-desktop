@@ -146,6 +146,7 @@ pub struct DatabaseStatus {
     pub integrity_check: String,
     pub last_modified_at: Option<String>,
     pub onboarding_complete: bool,
+    pub import_verification_pending: bool,
     pub last_import: Option<ImportSummary>,
     pub counts: RecordCounts,
     pub totals: FinancialTotals,

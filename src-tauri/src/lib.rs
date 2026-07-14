@@ -254,6 +254,21 @@ async fn acknowledge_empty_start(state: State<'_, DbState>) -> Result<(), String
 }
 
 #[tauri::command]
+async fn acknowledge_import_verification(
+    state: State<'_, DbState>,
+    summary: ImportSummary,
+) -> Result<(), String> {
+    let database = state.database.clone();
+    let _guard = state.maintenance_gate.clone().write_owned().await;
+    run_database_task(move || {
+        database
+            .acknowledge_import_verification(&summary)
+            .map_err(|error| error.to_string())
+    })
+    .await
+}
+
+#[tauri::command]
 async fn backup_enroll(
     state: State<'_, BackupState>,
     enrollment_code: String,
@@ -385,6 +400,7 @@ pub fn run() {
             import_data_file,
             database_status,
             acknowledge_empty_start,
+            acknowledge_import_verification,
             backup_enroll,
             backup_now,
             backup_status,

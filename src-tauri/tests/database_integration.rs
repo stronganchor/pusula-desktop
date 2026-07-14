@@ -272,3 +272,44 @@ fn imports_php_generated_wordpress_fixture_exactly() {
         "https://example.com/pusula"
     );
 }
+
+#[test]
+fn verified_import_can_change_normally_and_reopen() {
+    let fixture: ExportBundle =
+        serde_json::from_str(include_str!("../../tests/fixtures/pusula-lite-v1.json")).unwrap();
+    let (directory, database) = test_database("verified-import-lifecycle");
+    let summary = database.import_data(fixture, false).unwrap();
+    assert!(database.status().unwrap().import_verification_pending);
+    database.acknowledge_import_verification(&summary).unwrap();
+    assert!(!database.status().unwrap().import_verification_pending);
+
+    add_customer(&database, 99, "İçe Aktarma Sonrası Müşteri");
+    let sale = api(
+        &database,
+        "/sales",
+        "POST",
+        json!({
+            "customer_id": 99,
+            "date": "2026-07-15",
+            "total": 50,
+            "request_key": "post-import-sale",
+            "installments": [{ "due_date": "2026-08-15", "amount": 50 }]
+        }),
+    );
+    let installment_id = sale["installment_ids"][0].as_i64().unwrap();
+    api(
+        &database,
+        &format!("/installments/{installment_id}/payments"),
+        "POST",
+        json!({ "amount": 10, "payment_date": "2026-07-15" }),
+    );
+    drop(database);
+
+    let reopened =
+        Database::initialize(directory.path().join("verified-import-lifecycle.sqlite3")).unwrap();
+    let reopened_status = reopened.status().unwrap();
+    assert!(!reopened_status.import_verification_pending);
+    assert_ne!(reopened_status.counts, summary.counts);
+    assert_ne!(reopened_status.totals, summary.totals);
+    assert_eq!(reopened_status.last_import, Some(summary));
+}

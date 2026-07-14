@@ -1,0 +1,157 @@
+name: Signed Windows Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: SemVer without the v prefix
+        required: true
+        type: string
+      prerelease:
+        description: Publish as a prerelease
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: pusula-windows-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: windows-latest
+    env:
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+      WINDOWS_CODESIGN_PFX_BASE64: ${{ secrets.WINDOWS_CODESIGN_PFX_BASE64 }}
+      WINDOWS_CODESIGN_PASSWORD: ${{ secrets.WINDOWS_CODESIGN_PASSWORD }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Require signing credentials
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($name in 'TAURI_SIGNING_PRIVATE_KEY','TAURI_SIGNING_PRIVATE_KEY_PASSWORD','WINDOWS_CODESIGN_PFX_BASE64','WINDOWS_CODESIGN_PASSWORD') {
+            if ([string]::IsNullOrWhiteSpace((Get-Item "env:$name").Value)) { throw "Missing required release secret: $name" }
+          }
+
+      - run: npm ci
+      - name: Verify version metadata
+        shell: pwsh
+        run: .\scripts\Test-VersionConsistency.ps1 -ExpectedVersion '${{ inputs.version }}'
+      - run: npm run build
+      - run: cargo fmt --manifest-path src-tauri/Cargo.toml --check
+      - run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+      - run: cargo test --manifest-path src-tauri/Cargo.toml
+
+      - name: Import Authenticode certificate
+        id: certificate
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $pfxPath = Join-Path $env:RUNNER_TEMP 'pusula-codesign.pfx'
+          [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:WINDOWS_CODESIGN_PFX_BASE64))
+          $securePassword = ConvertTo-SecureString $env:WINDOWS_CODESIGN_PASSWORD -AsPlainText -Force
+          $certificate = Import-PfxCertificate -FilePath $pfxPath -CertStoreLocation Cert:\CurrentUser\My -Password $securePassword
+          if (-not $certificate.HasPrivateKey) { throw 'Imported certificate has no private key' }
+          "thumbprint=$($certificate.Thumbprint)" >> $env:GITHUB_OUTPUT
+          Remove-Item -LiteralPath $pfxPath -Force
+
+      - name: Create build overrides
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $windows = [ordered]@{
+            certificateThumbprint = '${{ steps.certificate.outputs.thumbprint }}'
+            digestAlgorithm = 'sha256'
+            timestampUrl = 'http://timestamp.digicert.com'
+          }
+          [ordered]@{ bundle = [ordered]@{ windows = $windows } } |
+            ConvertTo-Json -Depth 8 |
+            Set-Content -LiteralPath (Join-Path $env:RUNNER_TEMP 'offline-signing.json') -Encoding UTF8
+          $leanWindows = [ordered]@{}
+          foreach ($entry in $windows.GetEnumerator()) { $leanWindows[$entry.Key] = $entry.Value }
+          $leanWindows.webviewInstallMode = [ordered]@{ type = 'skip' }
+          [ordered]@{ bundle = [ordered]@{ windows = $leanWindows } } |
+            ConvertTo-Json -Depth 8 |
+            Set-Content -LiteralPath (Join-Path $env:RUNNER_TEMP 'updater-signing.json') -Encoding UTF8
+
+      - name: Build signed offline installer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          npm run tauri -- build --bundles nsis --config (Join-Path $env:RUNNER_TEMP 'offline-signing.json')
+          $installer = Get-ChildItem -LiteralPath 'src-tauri\target\release\bundle\nsis' -Filter '*-setup.exe' | Select-Object -First 1
+          if (-not $installer) { throw 'Offline installer was not created' }
+          New-Item -ItemType Directory -Force -Path release-assets | Out-Null
+          Copy-Item -LiteralPath $installer.FullName -Destination "release-assets\Pusula_${{ inputs.version }}_x64_offline-setup.exe"
+
+      - name: Build signed lean updater
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $bundlePath = Resolve-Path -LiteralPath 'src-tauri\target\release\bundle\nsis'
+          if (-not $bundlePath.Path.StartsWith((Resolve-Path '.').Path, [System.StringComparison]::OrdinalIgnoreCase)) { throw 'Unsafe bundle path' }
+          Remove-Item -LiteralPath $bundlePath.Path -Recurse -Force
+          npm run tauri -- build --bundles nsis --config (Join-Path $env:RUNNER_TEMP 'updater-signing.json')
+          $bundleDir = 'src-tauri\target\release\bundle\nsis'
+          $installer = Get-ChildItem -LiteralPath $bundleDir -Filter '*-setup.exe' | Select-Object -First 1
+          $updater = Get-ChildItem -LiteralPath $bundleDir -Filter '*.nsis.zip' | Select-Object -First 1
+          if (-not $installer -or -not $updater -or -not (Test-Path -LiteralPath "$($updater.FullName).sig")) { throw 'Lean updater artifacts are incomplete' }
+          Copy-Item -LiteralPath $installer.FullName -Destination "release-assets\Pusula_${{ inputs.version }}_x64-setup.exe"
+          Copy-Item -LiteralPath $updater.FullName -Destination "release-assets\Pusula_${{ inputs.version }}_x64.nsis.zip"
+          Copy-Item -LiteralPath "$($updater.FullName).sig" -Destination "release-assets\Pusula_${{ inputs.version }}_x64.nsis.zip.sig"
+
+      - name: Verify Authenticode signatures
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($installer in Get-ChildItem -LiteralPath release-assets -Filter '*.exe') {
+            $signature = Get-AuthenticodeSignature -LiteralPath $installer.FullName
+            if ($signature.Status -ne 'Valid') { throw "Invalid Authenticode signature: $($installer.Name) [$($signature.Status)]" }
+          }
+
+      - name: Create update manifest
+        shell: pwsh
+        run: |
+          .\scripts\New-UpdateManifest.ps1 `
+            -Version '${{ inputs.version }}' `
+            -SignaturePath "release-assets\Pusula_${{ inputs.version }}_x64.nsis.zip.sig" `
+            -ArtifactName "Pusula_${{ inputs.version }}_x64.nsis.zip" `
+            -Repository '${{ github.repository }}' `
+            -OutputPath 'release-assets\latest.json'
+
+      - name: Publish GitHub release
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $arguments = @(
+            'release','create',"v${{ inputs.version }}",
+            '--target','main',
+            '--title',"Pusula ${{ inputs.version }}",
+            '--generate-notes'
+          )
+          if ('${{ inputs.prerelease }}' -eq 'true') { $arguments += '--prerelease' }
+          $arguments += Get-ChildItem -LiteralPath release-assets | ForEach-Object { $_.FullName }
+          gh @arguments
+
+      - name: Remove imported certificate
+        if: always() && steps.certificate.outputs.thumbprint != ''
+        shell: pwsh
+        run: Remove-Item -LiteralPath "Cert:\CurrentUser\My\${{ steps.certificate.outputs.thumbprint }}" -Force -ErrorAction SilentlyContinue
+

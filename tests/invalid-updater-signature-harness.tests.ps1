@@ -53,7 +53,14 @@ try {
     if ($cleanupIndex -lt 0 -or $passEvidenceWriteIndex -le $cleanupIndex) {
         throw 'Runtime pass evidence must be written only after fail-closed cleanup completes.'
     }
-    foreach ($functionName in @('Stop-ExactProcess', 'Wait-LoopbackPortClosed')) {
+    foreach ($functionName in @(
+            'Stop-ExactProcess',
+            'Wait-LoopbackPortClosed',
+            'Invoke-GitRead',
+            'Invoke-GitQuietDiff',
+            'Resolve-RequiredExecutable',
+            'Assert-ExpectedCleanSource'
+        )) {
         $functionAst = $harnessAst.Find({
                 param($node)
                 $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
@@ -107,6 +114,61 @@ try {
     }
     if (Wait-LoopbackPortClosed -Port $occupiedPort -AttemptCount 2 -DelayMilliseconds 1) {
         throw 'Loopback-port cleanup check did not accept a closed port.'
+    }
+
+    $preferredCargo = Join-Path $env:USERPROFILE '.cargo\bin\cargo.exe'
+    if (Test-Path -LiteralPath $preferredCargo -PathType Leaf) {
+        $resolvedCargo = Resolve-RequiredExecutable -Name 'cargo.exe' -PreferredPath $preferredCargo
+        if ($resolvedCargo -cne (Resolve-Path -LiteralPath $preferredCargo).Path) {
+            throw 'Rust toolchain resolution did not select the exact preferred Cargo executable.'
+        }
+    }
+
+    $sourceGuardRoot = Join-Path $fixtureRoot 'source-guard-repository'
+    [IO.Directory]::CreateDirectory($sourceGuardRoot) | Out-Null
+    & git -C $sourceGuardRoot init --quiet
+    & git -C $sourceGuardRoot config user.name 'Pusula Harness Test'
+    & git -C $sourceGuardRoot config user.email 'harness-test@invalid.example'
+    $guardFile = Join-Path $sourceGuardRoot 'source.txt'
+    [IO.File]::WriteAllText($guardFile, 'committed source', [Text.UTF8Encoding]::new($false))
+    & git -C $sourceGuardRoot add -- source.txt
+    & git -C $sourceGuardRoot commit --quiet -m 'fixture source'
+    if ($LASTEXITCODE -ne 0) { throw 'Could not create source-guard test repository.' }
+    $guardCommit = (& git -C $sourceGuardRoot rev-parse HEAD).Trim().ToLowerInvariant()
+    $productionRepoRoot = $repoRoot
+    try {
+        $repoRoot = $sourceGuardRoot
+        if ((Assert-ExpectedCleanSource -ExpectedCommit $guardCommit -Phase 'clean fixture') -cne $guardCommit) {
+            throw 'Source guard did not return the exact clean fixture commit.'
+        }
+
+        (Get-Item -LiteralPath $guardFile).LastWriteTimeUtc = [DateTime]::UtcNow
+        Assert-ExpectedCleanSource -ExpectedCommit $guardCommit -Phase 'timestamp-only fixture' | Out-Null
+
+        $untrackedGuard = Join-Path $sourceGuardRoot 'untracked.txt'
+        [IO.File]::WriteAllText($untrackedGuard, 'untracked', [Text.UTF8Encoding]::new($false))
+        Assert-ThrowsLike -Pattern '*source is not clean*untracked*' -Action {
+            Assert-ExpectedCleanSource -ExpectedCommit $guardCommit -Phase 'untracked fixture' | Out-Null
+        }
+        Remove-Item -LiteralPath $untrackedGuard -Force
+
+        [IO.File]::WriteAllText($guardFile, 'working change', [Text.UTF8Encoding]::new($false))
+        Assert-ThrowsLike -Pattern '*source is not clean*working tree*' -Action {
+            Assert-ExpectedCleanSource -ExpectedCommit $guardCommit -Phase 'working fixture' | Out-Null
+        }
+        [IO.File]::WriteAllText($guardFile, 'committed source', [Text.UTF8Encoding]::new($false))
+
+        [IO.File]::WriteAllText($guardFile, 'staged change', [Text.UTF8Encoding]::new($false))
+        & git -C $sourceGuardRoot add -- source.txt
+        Assert-ThrowsLike -Pattern '*source is not clean*index*' -Action {
+            Assert-ExpectedCleanSource -ExpectedCommit $guardCommit -Phase 'staged fixture' | Out-Null
+        }
+        [IO.File]::WriteAllText($guardFile, 'committed source', [Text.UTF8Encoding]::new($false))
+        & git -C $sourceGuardRoot add -- source.txt
+        Assert-ExpectedCleanSource -ExpectedCommit $guardCommit -Phase 'restored fixture' | Out-Null
+    }
+    finally {
+        $repoRoot = $productionRepoRoot
     }
 
     [IO.Directory]::CreateDirectory($fixtureRoot) | Out-Null

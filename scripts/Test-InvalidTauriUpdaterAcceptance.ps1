@@ -97,6 +97,32 @@ function Invoke-GitRead {
     return (($output -join "`n").Trim())
 }
 
+function Invoke-GitQuietDiff {
+    param([switch] $Cached)
+
+    $arguments = @('diff')
+    if ($Cached) { $arguments += '--cached' }
+    $arguments += @('--quiet', '--no-ext-diff', '--ignore-submodules=none', '--')
+    & git -C $repoRoot @arguments
+    return [int]$LASTEXITCODE
+}
+
+function Resolve-RequiredExecutable {
+    param(
+        [Parameter(Mandatory = $true)][string] $Name,
+        [Parameter(Mandatory = $true)][string] $PreferredPath
+    )
+
+    if (Test-Path -LiteralPath $PreferredPath -PathType Leaf) {
+        return (Resolve-Path -LiteralPath $PreferredPath -ErrorAction Stop).Path
+    }
+    $command = Get-Command $Name -CommandType Application -ErrorAction SilentlyContinue
+    if ($null -eq $command) {
+        throw "Required executable was not found: $Name"
+    }
+    return $command.Source
+}
+
 function Assert-ExpectedCleanSource {
     param(
         [Parameter(Mandatory = $true)][string] $ExpectedCommit,
@@ -107,9 +133,24 @@ function Assert-ExpectedCleanSource {
     if ($actualCommit -cne $ExpectedCommit.ToLowerInvariant()) {
         throw "Repository HEAD $actualCommit does not match expected source commit $ExpectedCommit during $Phase."
     }
-    $status = Invoke-GitRead -ArgumentList @('status', '--porcelain=v1', '--untracked-files=all')
-    if (-not [string]::IsNullOrWhiteSpace($status)) {
-        throw "Repository source is not clean during $Phase.`n$status"
+    $workingDiff = Invoke-GitQuietDiff
+    $cachedDiff = Invoke-GitQuietDiff -Cached
+    if ($workingDiff -gt 1 -or $cachedDiff -gt 1) {
+        throw "Git could not verify repository cleanliness during $Phase."
+    }
+    $untracked = Invoke-GitRead -ArgumentList @('ls-files', '--others', '--exclude-standard')
+    if ($workingDiff -eq 1 -or $cachedDiff -eq 1 -or -not [string]::IsNullOrWhiteSpace($untracked)) {
+        $details = @()
+        if ($workingDiff -eq 1) {
+            $details += "working tree: $(Invoke-GitRead -ArgumentList @('diff', '--name-only', '--'))"
+        }
+        if ($cachedDiff -eq 1) {
+            $details += "index: $(Invoke-GitRead -ArgumentList @('diff', '--cached', '--name-only', '--'))"
+        }
+        if (-not [string]::IsNullOrWhiteSpace($untracked)) {
+            $details += "untracked: $untracked"
+        }
+        throw "Repository source is not clean during $Phase.`n$($details -join "`n")"
     }
     return $actualCommit
 }
@@ -401,12 +442,27 @@ try {
 
     $node = (Get-Command node -ErrorAction Stop).Source
     $npm = (Get-Command npm.cmd -ErrorAction Stop).Source
+    $rustupBin = Join-Path $env:USERPROFILE '.cargo\bin'
+    $cargo = Resolve-RequiredExecutable `
+        -Name 'cargo.exe' `
+        -PreferredPath (Join-Path $rustupBin 'cargo.exe')
+    $rustc = Resolve-RequiredExecutable `
+        -Name 'rustc.exe' `
+        -PreferredPath (Join-Path $rustupBin 'rustc.exe')
     $sourceCommit = Assert-ExpectedCleanSource `
         -ExpectedCommit $ExpectedSourceCommit `
         -Phase 'before the isolated runtime build'
     $oldCargoTarget = $env:CARGO_TARGET_DIR
+    $oldCargoCommand = $env:CARGO
+    $oldPath = $env:PATH
     try {
         $env:CARGO_TARGET_DIR = $cargoTarget
+        $env:CARGO = $cargo
+        $toolDirectories = @((Split-Path $cargo -Parent), (Split-Path $rustc -Parent)) |
+            Select-Object -Unique
+        $env:PATH = ((@($toolDirectories) + @($oldPath)) -join [IO.Path]::PathSeparator)
+        & $cargo --version | Out-Host
+        if ($LASTEXITCODE -ne 0) { throw 'The isolated build Rust toolchain is not executable.' }
         Push-Location $repoRoot
         try {
             & $npm run tauri -- build --debug --no-bundle --ci --config $overridePath
@@ -418,6 +474,8 @@ try {
     }
     finally {
         $env:CARGO_TARGET_DIR = $oldCargoTarget
+        $env:CARGO = $oldCargoCommand
+        $env:PATH = $oldPath
     }
 
     $debugExecutable = Join-Path $cargoTarget 'debug\pusula-desktop.exe'

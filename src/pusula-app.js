@@ -1,3 +1,5 @@
+import { escapeHtml, formatIsoDateDashed, formatIsoDateSlashed } from './html-safety.js';
+
 (() => {
   const state = {
     customers: [],
@@ -111,17 +113,9 @@
     if (m) return `${m[3]}-${m[2]}-${m[1]}`;
     return '';
   };
-  const fromISO = (iso) => {
-    if (!iso) return '';
-    const [y, m, d] = iso.split('-');
-    return `${d}-${m}-${y}`;
-  };
+  const fromISO = formatIsoDateDashed;
 
-  const fromISOSlash = (iso) => {
-    if (!iso) return '';
-    const [y, m, d] = iso.split('-');
-    return `${d}/${m}/${y}`;
-  };
+  const fromISOSlash = formatIsoDateSlashed;
 
   function parseISODate(iso) {
     const s = String(iso || '').trim();
@@ -997,23 +991,23 @@
 	    backdrop.innerHTML = `
 	      <div class="pusula-modal" role="dialog" aria-modal="true">
 	        <div class="pusula-modal-header ${showTitle ? '' : 'no-title'}">
-	          ${showTitle ? `<div class="pusula-modal-title">${title}</div>` : ''}
+	          ${showTitle ? `<div class="pusula-modal-title">${escapeHtml(title)}</div>` : ''}
 	          <button class="pusula-modal-close" type="button" data-action="close" aria-label="Kapat">✕</button>
 	        </div>
 	        <div class="pusula-modal-body">
 	          <div class="pusula-modal-main ${hasInfo ? 'two-col' : 'one-col'}">
 	            ${hasInfo ? '<div class="pusula-modal-info"></div>' : ''}
 	            <div class="pusula-modal-editor">
-	              ${textareaLabel ? `<div class="pusula-modal-label">${textareaLabel}</div>` : ''}
+	              ${textareaLabel ? `<div class="pusula-modal-label">${escapeHtml(textareaLabel)}</div>` : ''}
 	              <textarea class="pusula-modal-textarea" rows="10"></textarea>
 	              <div class="pusula-modal-status" aria-live="polite"></div>
 	            </div>
 	          </div>
 	        </div>
 	        <div class="pusula-modal-actions">
-	          ${hasDelete ? `<button type="button" class="pusula-modal-btn danger" data-action="delete">${deleteLabel || 'SİL'}</button>` : ''}
+	          ${hasDelete ? `<button type="button" class="pusula-modal-btn danger" data-action="delete">${escapeHtml(deleteLabel || 'SİL')}</button>` : ''}
 	          <button type="button" class="pusula-modal-btn" data-action="cancel">VAZGEÇ</button>
-	          <button type="button" class="pusula-modal-btn primary" data-action="save">${saveLabel || 'KAYDET'}</button>
+	          <button type="button" class="pusula-modal-btn primary" data-action="save">${escapeHtml(saveLabel || 'KAYDET')}</button>
 	        </div>
 	      </div>
 	    `;
@@ -1252,7 +1246,7 @@
     list.forEach((r) => {
       const tr = document.createElement('tr');
       const reg = r.registration_date ? fromISO(r.registration_date) : '';
-      tr.innerHTML = `<td>${r.id}</td><td>${reg}</td><td>${r.name || ''}</td><td>${r.phone || ''}</td><td>${r.address || ''}</td><td>${formatMoney(r.debt_total || 0)}</td>`;
+      tr.innerHTML = `<td>${escapeHtml(r.id)}</td><td>${escapeHtml(reg)}</td><td>${escapeHtml(r.name)}</td><td>${escapeHtml(r.phone)}</td><td>${escapeHtml(r.address)}</td><td>${formatMoney(r.debt_total || 0)}</td>`;
       if (Number(r.late_unpaid) === 1) tr.classList.add('late');
       const isSelected = state.selected && String(state.selected.id) === String(r.id);
       tr.addEventListener('click', () => {
@@ -2207,7 +2201,7 @@
     let preferredRow = null;
     list.forEach((s) => {
       const tr = document.createElement('tr');
-      tr.innerHTML = `<td>${s.id}</td><td>${fromISO(s.date)}</td><td>${formatMoney(s.total || 0)}</td><td>${truncateDescription(s.description || '')}</td>`;
+      tr.innerHTML = `<td>${escapeHtml(s.id)}</td><td>${escapeHtml(fromISO(s.date))}</td><td>${formatMoney(s.total || 0)}</td><td>${escapeHtml(truncateDescription(s.description || ''))}</td>`;
       tr.addEventListener('click', () => {
         state.currentSale = s;
         state.currentSaleExplicit = true;
@@ -2567,9 +2561,9 @@
       <div class="receipt">
         <div class="no-print">Not: Yazdırma ekranında “Üstbilgi ve altbilgiler” seçeneğini kapatın.</div>
         <div class="brand">
-          ${company.name ? `<p class="name">${company.name}</p>` : ''}
-          ${company.address ? `<p class="line">${company.address}</p>` : ''}
-          ${businessContactLine ? `<p class="line">${businessContactLine}</p>` : ''}
+          ${company.name ? `<p class="name">${escapeHtml(company.name)}</p>` : ''}
+          ${company.address ? `<p class="line">${escapeHtml(company.address)}</p>` : ''}
+          ${businessContactLine ? `<p class="line">${escapeHtml(businessContactLine)}</p>` : ''}
         </div>
         <div class="rule"></div>
         <p class="title">Taksit Tahsilat Makbuzu</p>
@@ -2578,10 +2572,10 @@
           <div><strong>Saat:</strong> ${timeStr}</div>
         </div>
         <div class="info">
-          <div class="row"><div class="label"><strong>Makbuz No:</strong></div><div>${payment.id || ''}</div></div>
-          <div class="row"><div class="label"><strong>Hesap No:</strong></div><div>${customer.id || ''}</div></div>
-          <div class="row"><div class="label"><strong>Müşteri:</strong></div><div>${customer.name || ''}</div></div>
-          <div class="row"><div class="label"><strong>Adres:</strong></div><div>${customer.address || ''}</div></div>
+          <div class="row"><div class="label"><strong>Makbuz No:</strong></div><div>${escapeHtml(payment.id)}</div></div>
+          <div class="row"><div class="label"><strong>Hesap No:</strong></div><div>${escapeHtml(customer.id)}</div></div>
+          <div class="row"><div class="label"><strong>Müşteri:</strong></div><div>${escapeHtml(customer.name)}</div></div>
+          <div class="row"><div class="label"><strong>Adres:</strong></div><div>${escapeHtml(customer.address)}</div></div>
         </div>
         <table>
           <thead>
@@ -2595,7 +2589,7 @@
           </thead>
           <tbody>
             <tr>
-              <td>${sale && sale.id ? sale.id : (installment.sale_id || '')}</td>
+              <td>${escapeHtml(sale && sale.id ? sale.id : installment.sale_id)}</td>
               <td>${fromISOSlash(dueDate)}</td>
               <td>${formatMoney(installmentAmountVal)}</td>
               <td>${formatMoney(paymentAmountVal)}</td>
@@ -2610,14 +2604,15 @@
         <div class="footer-rule"></div>
         <div class="footer">
           <p class="thanks">Mağazamızdan yapmış olduğunuz ödeme için teşekkür ederiz</p>
-          ${company.name ? `<p class="name">${company.name}</p>` : ''}
-          ${company.footerSub ? `<p class="sub">${company.footerSub}</p>` : ''}
+          ${company.name ? `<p class="name">${escapeHtml(company.name)}</p>` : ''}
+          ${company.footerSub ? `<p class="sub">${escapeHtml(company.footerSub)}</p>` : ''}
         </div>
       </div>
       </body></html>`;
 
     const w = window.open('', '_blank');
     if (w) {
+      try { w.opener = null; } catch (e) { /* ignore */ }
       try { w.document.title = ''; } catch (e) { /* ignore */ }
       w.document.write(html);
       w.document.close();
@@ -2754,9 +2749,9 @@
       <div class="receipt">
         <div class="no-print">Not: Yazdırma ekranında “Üstbilgi ve altbilgiler” seçeneğini kapatın.</div>
         <div class="brand">
-          ${company.name ? `<p class="name">${company.name}</p>` : ''}
-          ${company.address ? `<p class="line">${company.address}</p>` : ''}
-          ${businessContactLine ? `<p class="line">${businessContactLine}</p>` : ''}
+          ${company.name ? `<p class="name">${escapeHtml(company.name)}</p>` : ''}
+          ${company.address ? `<p class="line">${escapeHtml(company.address)}</p>` : ''}
+          ${businessContactLine ? `<p class="line">${escapeHtml(businessContactLine)}</p>` : ''}
         </div>
         <div class="rule"></div>
         <p class="title">${monthName} ${year} Taksit Ödemesi</p>
@@ -2765,9 +2760,9 @@
           <div><strong>Saat:</strong> ${timeStr}</div>
         </div>
         <div class="info">
-          <div class="row"><div class="label"><strong>Hesap No:</strong></div><div>${customerId}</div></div>
-          <div class="row"><div class="label"><strong>Müşteri:</strong></div><div>${customerName}</div></div>
-          <div class="row"><div class="label"><strong>Adres:</strong></div><div>${customerAddress}</div></div>
+          <div class="row"><div class="label"><strong>Hesap No:</strong></div><div>${escapeHtml(customerId)}</div></div>
+          <div class="row"><div class="label"><strong>Müşteri:</strong></div><div>${escapeHtml(customerName)}</div></div>
+          <div class="row"><div class="label"><strong>Adres:</strong></div><div>${escapeHtml(customerAddress)}</div></div>
         </div>
         <table>
           <thead>
@@ -2787,7 +2782,7 @@
             <tr>
               <td>${fromISOSlash(due)}</td>
               <td>${formatMoney(i.amount)}</td>
-              <td>${i.sale_id || ''}</td>
+              <td>${escapeHtml(i.sale_id)}</td>
               <td>${status}</td>
             </tr>`;
     });
@@ -2802,14 +2797,15 @@
         <div class="footer-rule"></div>
         <div class="footer">
           <p class="thanks">Mağazamızdan yapmış olduğunuz ödeme için teşekkür ederiz</p>
-          ${company.name ? `<p class="name">${company.name}</p>` : ''}
-          ${company.footerSub ? `<p class="sub">${company.footerSub}</p>` : ''}
+          ${company.name ? `<p class="name">${escapeHtml(company.name)}</p>` : ''}
+          ${company.footerSub ? `<p class="sub">${escapeHtml(company.footerSub)}</p>` : ''}
         </div>
       </div>
       </body></html>`;
 
     const w = window.open('', '_blank');
     if (w) {
+      try { w.opener = null; } catch (e) { /* ignore */ }
       try { w.document.title = ''; } catch (e) { /* ignore */ }
       w.document.write(html);
       w.document.close();
@@ -2958,9 +2954,9 @@
       <div class="receipt">
         <div class="no-print">Not: Yazdırma ekranında “Üstbilgi ve altbilgiler” seçeneğini kapatın.</div>
         <div class="brand">
-          ${company.name ? `<p class="name">${company.name}</p>` : ''}
-          ${company.address ? `<p class="line">${company.address}</p>` : ''}
-          ${businessContactLine ? `<p class="line">${businessContactLine}</p>` : ''}
+          ${company.name ? `<p class="name">${escapeHtml(company.name)}</p>` : ''}
+          ${company.address ? `<p class="line">${escapeHtml(company.address)}</p>` : ''}
+          ${businessContactLine ? `<p class="line">${escapeHtml(businessContactLine)}</p>` : ''}
         </div>
         <div class="rule"></div>
         <p class="title">${receiptTitle}</p>
@@ -2969,9 +2965,9 @@
           <div><strong>Saat:</strong> ${timeStr}</div>
         </div>
         <div class="info">
-          <div class="row"><div class="label"><strong>Hesap No:</strong></div><div>${cust.id || ''}</div></div>
-          <div class="row"><div class="label"><strong>Sayın:</strong></div><div>${cust.name || ''}</div></div>
-          <div class="row"><div class="label"><strong>Adres:</strong></div><div>${cust.address || ''}</div></div>
+          <div class="row"><div class="label"><strong>Hesap No:</strong></div><div>${escapeHtml(cust.id)}</div></div>
+          <div class="row"><div class="label"><strong>Sayın:</strong></div><div>${escapeHtml(cust.name)}</div></div>
+          <div class="row"><div class="label"><strong>Adres:</strong></div><div>${escapeHtml(cust.address)}</div></div>
         </div>
         <div class="box">
           <div class="line"><strong>${fmtDate(sale.date)}</strong> Tarihinde <span class="money">${formatTL(sale.total)}</span> Alışveriş Yapılıp</div>
@@ -3018,13 +3014,14 @@
         <div class="footer-rule"></div>
         <div class="footer">
           <p class="thanks">Mağazamızdan yapmış olduğunuz alış verişten dolayı teşekkür ederiz</p>
-          ${company.name ? `<p class="name">${company.name}</p>` : ''}
-          ${company.footerSub ? `<p class="sub">${company.footerSub}</p>` : ''}
+          ${company.name ? `<p class="name">${escapeHtml(company.name)}</p>` : ''}
+          ${company.footerSub ? `<p class="sub">${escapeHtml(company.footerSub)}</p>` : ''}
         </div>
       </div>
       </body></html>`;
     const w = window.open('', '_blank');
     if (w) {
+      try { w.opener = null; } catch (e) { /* ignore */ }
       try { w.document.title = ''; } catch (e) { /* ignore */ }
       w.document.write(html);
       w.document.close();
@@ -3152,7 +3149,7 @@
         const tr = document.createElement('tr');
         const saleId = s.sale_id || s.id || '';
         const amount = Number(s.amount ?? s.total ?? 0);
-        tr.innerHTML = `<td>${saleId}</td><td>${s.customer_name || ''}</td><td>${fromISO(s.date)}</td><td>${formatMoney(amount)}</td><td>${truncateDescription(formatReportDescription(s))}</td>`;
+        tr.innerHTML = `<td>${escapeHtml(saleId)}</td><td>${escapeHtml(s.customer_name)}</td><td>${escapeHtml(fromISO(s.date))}</td><td>${formatMoney(amount)}</td><td>${escapeHtml(truncateDescription(formatReportDescription(s)))}</td>`;
         tr.addEventListener('dblclick', (e) => {
           e.preventDefault();
           if (!saleId) return;
@@ -3346,14 +3343,14 @@
         <td>${amount}</td>
         <td>${paidAmount}</td>
         <td>${remainingAmount}</td>
-        <td>${row && row.customer_id ? row.customer_id : ''}</td>
-        <td>${row && row.customer_name ? row.customer_name : ''}</td>
-        <td>${row && row.customer_phone ? row.customer_phone : ''}</td>
-        <td>${address}</td>
-        <td>${row && row.sale_id ? row.sale_id : ''}</td>
-        <td>${saleDate}</td>
+        <td>${escapeHtml(row && row.customer_id ? row.customer_id : '')}</td>
+        <td>${escapeHtml(row && row.customer_name ? row.customer_name : '')}</td>
+        <td>${escapeHtml(row && row.customer_phone ? row.customer_phone : '')}</td>
+        <td>${escapeHtml(address)}</td>
+        <td>${escapeHtml(row && row.sale_id ? row.sale_id : '')}</td>
+        <td>${escapeHtml(saleDate)}</td>
         <td>${saleTotal}</td>
-        <td>${desc}</td>
+        <td>${escapeHtml(desc)}</td>
       `;
       const isLatePayment = row && row.due_date && row.due_date < todayISO && remaining > 0;
       if (isPaidToday) {

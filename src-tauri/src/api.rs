@@ -9,7 +9,7 @@ use url::Url;
 use crate::{
     db::{
         mark_modified, read_business_profile, validate_iso_date, validate_profile,
-        write_business_profile, Database,
+        write_business_profile, Database, MAX_SAFE_JS_INTEGER,
     },
     error::{AppError, AppResult},
     models::BusinessProfile,
@@ -147,7 +147,7 @@ fn parse_id(value: &str, label: &str) -> AppResult<i64> {
     let id = value
         .parse::<i64>()
         .map_err(|_| AppError::user(format!("Geçersiz {label} numarası.")))?;
-    if id <= 0 {
+    if id <= 0 || id > MAX_SAFE_JS_INTEGER {
         return Err(AppError::user(format!("Geçersiz {label} numarası.")));
     }
     Ok(id)
@@ -176,9 +176,13 @@ fn i64_field(map: &Map<String, Value>, key: &str) -> AppResult<Option<i64>> {
         Value::String(text) => text.trim().parse().ok(),
         _ => None,
     };
-    parsed
-        .map(Some)
-        .ok_or_else(|| AppError::user(format!("{key} tam sayı olmalıdır.")))
+    let parsed = parsed.ok_or_else(|| AppError::user(format!("{key} tam sayı olmalıdır.")))?;
+    if parsed.unsigned_abs() > MAX_SAFE_JS_INTEGER as u64 {
+        return Err(AppError::user(format!(
+            "{key} güvenli uygulama aralığını aşıyor."
+        )));
+    }
+    Ok(Some(parsed))
 }
 
 fn bool_field(map: &Map<String, Value>, key: &str) -> Option<bool> {
@@ -246,6 +250,11 @@ fn parse_decimal_kurus(raw: &str) -> AppResult<i64> {
         result = result
             .checked_neg()
             .ok_or_else(|| AppError::user("Para tutarı desteklenen aralığı aşıyor."))?;
+    }
+    if result.unsigned_abs() > MAX_SAFE_JS_INTEGER as u64 {
+        return Err(AppError::user(
+            "Para tutarı güvenli uygulama aralığını aşıyor.",
+        ));
     }
     Ok(result)
 }
@@ -1912,5 +1921,31 @@ mod tests {
         assert_eq!(money_to_kurus(&json!("10.005")).unwrap(), 1_001);
         assert_eq!(money_to_kurus(&json!("10,004")).unwrap(), 1_000);
         assert_eq!(money_to_kurus(&json!(0.1)).unwrap(), 10);
+    }
+
+    #[test]
+    fn rejects_money_and_ids_outside_javascript_safe_integer_range() {
+        assert_eq!(
+            money_to_kurus(&json!("90071992547409.91")).unwrap(),
+            MAX_SAFE_JS_INTEGER
+        );
+        assert!(money_to_kurus(&json!("90071992547409.92")).is_err());
+        assert_eq!(
+            money_to_kurus(&json!("-90071992547409.91")).unwrap(),
+            -MAX_SAFE_JS_INTEGER
+        );
+        assert!(money_to_kurus(&json!("-90071992547409.92")).is_err());
+        assert_eq!(
+            parse_id(&MAX_SAFE_JS_INTEGER.to_string(), "kayıt").unwrap(),
+            MAX_SAFE_JS_INTEGER
+        );
+        assert!(parse_id(&(MAX_SAFE_JS_INTEGER + 1).to_string(), "kayıt").is_err());
+        assert!(i64_field(
+            json!({ "customer_id": MAX_SAFE_JS_INTEGER + 1 })
+                .as_object()
+                .unwrap(),
+            "customer_id"
+        )
+        .is_err());
     }
 }

@@ -4,7 +4,7 @@ pub mod db;
 mod error;
 pub mod models;
 
-use std::{path::PathBuf, time::Duration};
+use std::{future::Future, path::PathBuf, sync::Arc, time::Duration};
 
 use backup::{
     BackupEnrollment, BackupRunReport, BackupService, BackupStatusReport, RetentionClass,
@@ -13,17 +13,52 @@ pub use db::Database;
 pub use models::{DatabaseStatus, ExportBundle, ExportSummary, ImportSummary};
 use serde_json::Value;
 use tauri::{Manager, State};
+use tokio::sync::RwLock;
 
 struct DbState {
     database: Database,
+    maintenance_gate: Arc<RwLock<()>>,
 }
 
 struct BackupState {
     service: BackupService,
 }
 
+async fn run_database_task<T, F>(operation: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+{
+    tokio::task::spawn_blocking(operation)
+        .await
+        .map_err(|_| "Veritabanı işlemi beklenmedik biçimde durdu.".to_owned())?
+}
+
+async fn run_import_operation<T, Recovery, RecoveryFuture, Import, ImportFuture>(
+    replace: bool,
+    recovery: Recovery,
+    import: Import,
+) -> Result<T, String>
+where
+    Recovery: FnOnce() -> RecoveryFuture,
+    RecoveryFuture: Future<Output = Result<BackupRunReport, String>>,
+    Import: FnOnce() -> ImportFuture,
+    ImportFuture: Future<Output = Result<T, String>>,
+{
+    if replace {
+        let report = recovery().await?;
+        if !report.encrypted_snapshot_created || !report.safe_to_continue {
+            return Err(
+                "Şifreli yerel kurtarma anlık görüntüsü doğrulanamadığı için içe aktarma engellendi."
+                    .to_owned(),
+            );
+        }
+    }
+    import().await
+}
+
 #[tauri::command]
-fn api_request(
+async fn api_request(
     state: State<'_, DbState>,
     path: String,
     method: Option<String>,
@@ -35,59 +70,118 @@ fn api_request(
         }
         other => other,
     });
-    state
-        .database
-        .api_request(&path, method.as_deref(), body)
-        .map_err(|error| error.to_string())
+    let database = state.database.clone();
+    let _guard = state.maintenance_gate.clone().read_owned().await;
+    run_database_task(move || {
+        database
+            .api_request(&path, method.as_deref(), body)
+            .map_err(|error| error.to_string())
+    })
+    .await
 }
 
 #[tauri::command]
-fn export_data(state: State<'_, DbState>) -> Result<ExportBundle, String> {
-    state
-        .database
-        .export_data()
-        .map_err(|error| error.to_string())
+async fn export_data(state: State<'_, DbState>) -> Result<ExportBundle, String> {
+    let database = state.database.clone();
+    let _guard = state.maintenance_gate.clone().read_owned().await;
+    run_database_task(move || database.export_data().map_err(|error| error.to_string())).await
 }
 
 #[tauri::command]
-fn import_data(
-    state: State<'_, DbState>,
+async fn import_data(
+    database_state: State<'_, DbState>,
+    backup_state: State<'_, BackupState>,
     bundle: ExportBundle,
     replace: Option<bool>,
 ) -> Result<ImportSummary, String> {
-    state
-        .database
-        .import_data(bundle, replace.unwrap_or(false))
-        .map_err(|error| error.to_string())
+    let replace = replace.unwrap_or(false);
+    let database = database_state.database.clone();
+    let backup = backup_state.service.clone();
+    let _guard = database_state.maintenance_gate.clone().write_owned().await;
+    run_import_operation(
+        replace,
+        move || async move {
+            backup
+                .prepare_for_destructive_import()
+                .await
+                .map_err(|error| error.to_string())
+        },
+        move || async move {
+            run_database_task(move || {
+                database
+                    .import_data(bundle, replace)
+                    .map_err(|error| error.to_string())
+            })
+            .await
+        },
+    )
+    .await
 }
 
 #[tauri::command]
-fn export_data_file(
+async fn export_data_file(
     state: State<'_, DbState>,
     path: String,
     overwrite: Option<bool>,
 ) -> Result<ExportSummary, String> {
-    state
-        .database
-        .export_data_file(&PathBuf::from(path), overwrite.unwrap_or(false))
-        .map_err(|error| error.to_string())
+    let database = state.database.clone();
+    let _guard = state.maintenance_gate.clone().read_owned().await;
+    run_database_task(move || {
+        database
+            .export_data_file(&PathBuf::from(path), overwrite.unwrap_or(false))
+            .map_err(|error| error.to_string())
+    })
+    .await
 }
 
 #[tauri::command]
-fn import_data_file(
-    state: State<'_, DbState>,
+async fn import_data_file(
+    database_state: State<'_, DbState>,
+    backup_state: State<'_, BackupState>,
     path: String,
     replace: Option<bool>,
 ) -> Result<ImportSummary, String> {
-    state
-        .database
-        .import_data_file(&PathBuf::from(path), replace.unwrap_or(false))
-        .map_err(|error| error.to_string())
+    let replace = replace.unwrap_or(false);
+    let database = database_state.database.clone();
+    let backup = backup_state.service.clone();
+    let _guard = database_state.maintenance_gate.clone().write_owned().await;
+    run_import_operation(
+        replace,
+        move || async move {
+            backup
+                .prepare_for_destructive_import()
+                .await
+                .map_err(|error| error.to_string())
+        },
+        move || async move {
+            run_database_task(move || {
+                database
+                    .import_data_file(&PathBuf::from(path), replace)
+                    .map_err(|error| error.to_string())
+            })
+            .await
+        },
+    )
+    .await
 }
 
 #[tauri::command]
-fn database_status(state: State<'_, DbState>) -> Result<DatabaseStatus, String> {
-    state.database.status().map_err(|error| error.to_string())
+async fn database_status(state: State<'_, DbState>) -> Result<DatabaseStatus, String> {
+    let database = state.database.clone();
+    let _guard = state.maintenance_gate.clone().read_owned().await;
+    run_database_task(move || database.status().map_err(|error| error.to_string())).await
+}
+
+#[tauri::command]
+async fn acknowledge_empty_start(state: State<'_, DbState>) -> Result<(), String> {
+    let database = state.database.clone();
+    let _guard = state.maintenance_gate.clone().read_owned().await;
+    run_database_task(move || {
+        database
+            .acknowledge_empty_start()
+            .map_err(|error| error.to_string())
+    })
+    .await
 }
 
 #[tauri::command]
@@ -137,9 +231,11 @@ async fn prepare_for_update(state: State<'_, BackupState>) -> Result<BackupRunRe
 
 #[tauri::command]
 async fn prepare_for_destructive_import(
-    state: State<'_, BackupState>,
+    database_state: State<'_, DbState>,
+    backup_state: State<'_, BackupState>,
 ) -> Result<BackupRunReport, String> {
-    let service = state.service.clone();
+    let service = backup_state.service.clone();
+    let _guard = database_state.maintenance_gate.clone().write_owned().await;
     service
         .prepare_for_destructive_import()
         .await
@@ -149,6 +245,13 @@ async fn prepare_for_destructive_import(
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.show();
+                let _ = window.unminimize();
+                let _ = window.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_process::init())
@@ -163,7 +266,10 @@ pub fn run() {
                 Database::initialize(database_path).map_err(|error| error.to_string())?;
             let backup_service = BackupService::production(database.clone(), app_data_dir)
                 .map_err(|error| error.to_string())?;
-            app.manage(DbState { database });
+            app.manage(DbState {
+                database,
+                maintenance_gate: Arc::new(RwLock::new(())),
+            });
             app.manage(BackupState {
                 service: backup_service.clone(),
             });
@@ -183,6 +289,7 @@ pub fn run() {
             export_data_file,
             import_data_file,
             database_status,
+            acknowledge_empty_start,
             backup_enroll,
             backup_now,
             backup_status,
@@ -191,4 +298,71 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("Pusula başlatılamadı");
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex as StdMutex,
+    };
+
+    use super::*;
+    use crate::backup::RemoteResult;
+
+    fn successful_recovery_report() -> BackupRunReport {
+        BackupRunReport {
+            encrypted_snapshot_created: true,
+            safe_to_continue: true,
+            retention_class: RetentionClass::Rolling,
+            created_at: "2026-07-14T12:00:00Z".to_owned(),
+            uploaded_count: 0,
+            pending_count: 1,
+            local_recovery_count: 1,
+            queue_healthy: true,
+            quarantined_file_count: 0,
+            remote_result: RemoteResult::LocalRecovery,
+        }
+    }
+
+    #[tokio::test]
+    async fn replacement_stops_before_import_when_recovery_fails() {
+        let applied = Arc::new(AtomicBool::new(false));
+        let import_applied = applied.clone();
+        let result = run_import_operation(
+            true,
+            || async { Err("local fsync failed".to_owned()) },
+            move || async move {
+                import_applied.store(true, Ordering::SeqCst);
+                Ok::<_, String>(())
+            },
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(!applied.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn replacement_applies_only_after_verified_local_recovery() {
+        let events = Arc::new(StdMutex::new(Vec::new()));
+        let recovery_events = events.clone();
+        let import_events = events.clone();
+        let result = run_import_operation(
+            true,
+            move || async move {
+                recovery_events.lock().unwrap().push("recovery");
+                Ok(successful_recovery_report())
+            },
+            move || async move {
+                import_events.lock().unwrap().push("import");
+                Ok::<_, String>(17)
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result, 17);
+        assert_eq!(*events.lock().unwrap(), vec!["recovery", "import"]);
+    }
 }

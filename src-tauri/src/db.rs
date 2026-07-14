@@ -6,7 +6,7 @@ use std::{
 };
 
 use chrono::{DateTime, Local, NaiveDate, NaiveDateTime};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -21,6 +21,7 @@ use crate::{
 
 pub const SCHEMA_VERSION: i32 = 1;
 pub const EXPORT_FORMAT_VERSION: u32 = 1;
+pub(crate) const MAX_SAFE_JS_INTEGER: i64 = 9_007_199_254_740_991;
 
 const MIGRATION_1: &str = r#"
 CREATE TABLE business_profile (
@@ -114,7 +115,7 @@ impl Database {
         let mut connection = Connection::open(&path)?;
         configure_connection(&connection)?;
         migrate(&mut connection)?;
-        ensure_database_identity(&connection)?;
+        ensure_database_settings(&mut connection)?;
 
         Ok(Self { path })
     }
@@ -135,10 +136,23 @@ impl Database {
     }
 
     pub fn export_data(&self) -> AppResult<ExportBundle> {
-        let connection = self.connect()?;
-        let business_profile = read_business_profile(&connection)?;
+        self.export_data_with_hook(|| {})
+    }
 
-        let customers = query_all(&connection, "SELECT id, name, phone, address, work_address, notes, registration_date FROM customers ORDER BY id", |row| {
+    fn export_data_with_hook<F>(&self, after_snapshot_started: F) -> AppResult<ExportBundle>
+    where
+        F: FnOnce(),
+    {
+        let mut connection = self.connect()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let business_profile = read_business_profile(&transaction)?;
+
+        // The first read above establishes the WAL snapshot. This hook is a
+        // deterministic test seam for proving that later table reads cannot
+        // observe a concurrent commit from a newer database state.
+        after_snapshot_started();
+
+        let customers = query_all(&transaction, "SELECT id, name, phone, address, work_address, notes, registration_date FROM customers ORDER BY id", |row| {
             Ok(CustomerExport {
                 id: row.get(0)?,
                 name: row.get(1)?,
@@ -150,7 +164,7 @@ impl Database {
             })
         })?;
 
-        let contacts = query_all(&connection, "SELECT id, customer_id, name, phone, home_address, work_address FROM contacts ORDER BY id", |row| {
+        let contacts = query_all(&transaction, "SELECT id, customer_id, name, phone, home_address, work_address FROM contacts ORDER BY id", |row| {
             Ok(ContactExport {
                 id: row.get(0)?,
                 customer_id: row.get(1)?,
@@ -161,7 +175,7 @@ impl Database {
             })
         })?;
 
-        let sales = query_all(&connection, "SELECT id, customer_id, date, total_kurus, description, request_key FROM sales ORDER BY id", |row| {
+        let sales = query_all(&transaction, "SELECT id, customer_id, date, total_kurus, description, request_key FROM sales ORDER BY id", |row| {
             Ok(SaleExport {
                 id: row.get(0)?,
                 customer_id: row.get(1)?,
@@ -173,7 +187,7 @@ impl Database {
         })?;
 
         let installments = query_all(
-            &connection,
+            &transaction,
             "SELECT id, sale_id, due_date, amount_kurus, paid_date FROM installments ORDER BY id",
             |row| {
                 Ok(InstallmentExport {
@@ -186,7 +200,7 @@ impl Database {
             },
         )?;
 
-        let payments = query_all(&connection, "SELECT id, installment_id, amount_kurus, payment_date, created_at FROM installment_payments ORDER BY id", |row| {
+        let payments = query_all(&transaction, "SELECT id, installment_id, amount_kurus, payment_date, created_at FROM installment_payments ORDER BY id", |row| {
             Ok(PaymentExport {
                 id: row.get(0)?,
                 installment_id: row.get(1)?,
@@ -223,11 +237,20 @@ impl Database {
             },
         };
         bundle.manifest.sha256 = bundle_checksum(&bundle)?;
+        validate_bundle(&bundle)?;
+        transaction.commit()?;
         Ok(bundle)
     }
 
     pub fn import_data(&self, bundle: ExportBundle, replace: bool) -> AppResult<ImportSummary> {
         validate_bundle(&bundle)?;
+        let summary = ImportSummary {
+            replaced: replace,
+            counts: bundle.manifest.counts.clone(),
+            totals: bundle.manifest.totals.clone(),
+            sha256: bundle.manifest.sha256.clone(),
+        };
+        let serialized_summary = serde_json::to_string(&summary)?;
         let mut connection = self.connect()?;
         let transaction = connection.transaction()?;
 
@@ -278,15 +301,12 @@ impl Database {
                  ELSE NULL
              END;",
         )?;
+        write_setting(&transaction, "last_import", &serialized_summary)?;
+        write_setting(&transaction, "onboarding_complete", "true")?;
         mark_modified(&transaction)?;
         transaction.commit()?;
 
-        Ok(ImportSummary {
-            replaced: replace,
-            counts: bundle.manifest.counts,
-            totals: bundle.manifest.totals,
-            sha256: bundle.manifest.sha256,
-        })
+        Ok(summary)
     }
 
     pub fn export_data_file(&self, path: &Path, overwrite: bool) -> AppResult<ExportSummary> {
@@ -345,29 +365,55 @@ impl Database {
         self.import_data(bundle, replace)
     }
 
-    pub fn status(&self) -> AppResult<DatabaseStatus> {
-        let connection = self.connect()?;
-        let schema_version =
-            connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        let journal_mode = connection.pragma_query_value(None, "journal_mode", |row| row.get(0))?;
-        let integrity_check =
-            connection.pragma_query_value(None, "integrity_check", |row| row.get(0))?;
-        let last_modified_at = connection
-            .query_row(
-                "SELECT value FROM settings WHERE key = 'last_modified_at'",
-                [],
-                |row| row.get(0),
-            )
-            .optional()?;
+    pub fn acknowledge_empty_start(&self) -> AppResult<()> {
+        let mut connection = self.connect()?;
+        let transaction = connection.transaction()?;
+        write_setting(&transaction, "onboarding_complete", "true")?;
+        mark_modified(&transaction)?;
+        transaction.commit()?;
+        Ok(())
+    }
 
-        Ok(DatabaseStatus {
+    pub fn status(&self) -> AppResult<DatabaseStatus> {
+        let mut connection = self.connect()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let schema_version =
+            transaction.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        let journal_mode =
+            transaction.pragma_query_value(None, "journal_mode", |row| row.get(0))?;
+        let integrity_check =
+            transaction.pragma_query_value(None, "integrity_check", |row| row.get(0))?;
+        let database_id = read_required_setting(&transaction, "database_id")?;
+        Uuid::parse_str(&database_id)
+            .map_err(|_| AppError::user("Veritabanı kimliği geçersiz."))?;
+        let onboarding_complete = parse_setting_bool(
+            &read_required_setting(&transaction, "onboarding_complete")?,
+            "onboarding_complete",
+        )?;
+        let last_modified_at = read_optional_setting(&transaction, "last_modified_at")?;
+        let last_import = read_optional_setting(&transaction, "last_import")?
+            .map(|value| serde_json::from_str::<ImportSummary>(&value))
+            .transpose()?;
+        if let Some(summary) = &last_import {
+            validate_import_summary(summary)?;
+        }
+        let counts = counts_from_database(&transaction)?;
+        let totals = totals_from_database(&transaction)?;
+
+        let status = DatabaseStatus {
             path: self.path.to_string_lossy().into_owned(),
+            database_id,
             schema_version,
             journal_mode,
             integrity_check,
             last_modified_at,
-            counts: counts_from_database(&connection)?,
-        })
+            onboarding_complete,
+            last_import,
+            counts,
+            totals,
+        };
+        transaction.commit()?;
+        Ok(status)
     }
 }
 
@@ -416,21 +462,88 @@ fn migrate(connection: &mut Connection) -> AppResult<()> {
     Ok(())
 }
 
-fn ensure_database_identity(connection: &Connection) -> AppResult<()> {
+fn ensure_database_settings(connection: &mut Connection) -> AppResult<()> {
+    let transaction = connection.transaction()?;
+    let database_id = read_optional_setting(&transaction, "database_id")?;
+    match database_id {
+        Some(value) => {
+            Uuid::parse_str(&value).map_err(|_| AppError::user("Veritabanı kimliği geçersiz."))?;
+        }
+        None => write_setting(&transaction, "database_id", &Uuid::new_v4().to_string())?,
+    }
+
+    let onboarding = read_optional_setting(&transaction, "onboarding_complete")?;
+    match onboarding {
+        Some(value) => {
+            parse_setting_bool(&value, "onboarding_complete")?;
+        }
+        None => {
+            let initialized = database_has_user_data(&transaction)?;
+            write_setting(
+                &transaction,
+                "onboarding_complete",
+                if initialized { "true" } else { "false" },
+            )?;
+        }
+    }
+    transaction.commit()?;
+    Ok(())
+}
+
+fn database_has_user_data(connection: &Connection) -> AppResult<bool> {
+    let initialized: i64 = connection.query_row(
+        "SELECT
+            EXISTS(SELECT 1 FROM customers LIMIT 1)
+            OR EXISTS(SELECT 1 FROM contacts LIMIT 1)
+            OR EXISTS(SELECT 1 FROM sales LIMIT 1)
+            OR EXISTS(SELECT 1 FROM installments LIMIT 1)
+            OR EXISTS(SELECT 1 FROM installment_payments LIMIT 1)
+            OR EXISTS(
+                SELECT 1 FROM business_profile
+                WHERE id = 1 AND (
+                    trim(name) <> '' OR trim(address) <> '' OR trim(phone) <> ''
+                    OR trim(website) <> '' OR trim(footer_sub) <> ''
+                )
+                LIMIT 1
+            )",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(initialized != 0)
+}
+
+fn read_optional_setting(connection: &Connection, key: &str) -> AppResult<Option<String>> {
+    Ok(connection
+        .query_row("SELECT value FROM settings WHERE key = ?", [key], |row| {
+            row.get(0)
+        })
+        .optional()?)
+}
+
+fn read_required_setting(connection: &Connection, key: &str) -> AppResult<String> {
+    read_optional_setting(connection, key)?
+        .ok_or_else(|| AppError::user(format!("Zorunlu veritabanı ayarı eksik: {key}.")))
+}
+
+fn write_setting(connection: &Connection, key: &str, value: &str) -> AppResult<()> {
     connection.execute(
-        "INSERT OR IGNORE INTO settings(key, value) VALUES ('database_id', ?)",
-        [Uuid::new_v4().to_string()],
+        "INSERT INTO settings(key, value) VALUES (?, ?)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![key, value],
     )?;
     Ok(())
 }
 
+fn parse_setting_bool(value: &str, key: &str) -> AppResult<bool> {
+    match value {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        _ => Err(AppError::user(format!("Veritabanı ayarı geçersiz: {key}."))),
+    }
+}
+
 pub(crate) fn mark_modified(connection: &Connection) -> AppResult<()> {
-    connection.execute(
-        "INSERT INTO settings(key, value) VALUES ('last_modified_at', ?)
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        [Local::now().to_rfc3339()],
-    )?;
-    Ok(())
+    write_setting(connection, "last_modified_at", &Local::now().to_rfc3339())
 }
 
 pub(crate) fn read_business_profile(connection: &Connection) -> AppResult<BusinessProfile> {
@@ -500,11 +613,35 @@ fn counts_from_database(connection: &Connection) -> AppResult<RecordCounts> {
     })
 }
 
+fn totals_from_database(connection: &Connection) -> AppResult<FinancialTotals> {
+    let totals = FinancialTotals {
+        sales_kurus: connection.query_row(
+            "SELECT COALESCE(SUM(total_kurus), 0) FROM sales",
+            [],
+            |row| row.get(0),
+        )?,
+        installments_kurus: connection.query_row(
+            "SELECT COALESCE(SUM(amount_kurus), 0) FROM installments",
+            [],
+            |row| row.get(0),
+        )?,
+        payments_kurus: connection.query_row(
+            "SELECT COALESCE(SUM(amount_kurus), 0) FROM installment_payments",
+            [],
+            |row| row.get(0),
+        )?,
+    };
+    validate_safe_totals(&totals)?;
+    Ok(totals)
+}
+
 fn checked_sum(mut values: impl Iterator<Item = i64>) -> AppResult<i64> {
-    values.try_fold(0_i64, |sum, value| {
+    let total = values.try_fold(0_i64, |sum, value| {
         sum.checked_add(value)
             .ok_or_else(|| AppError::user("Para toplamı desteklenen aralığı aşıyor."))
-    })
+    })?;
+    validate_safe_integer(total, "Para toplamı")?;
+    Ok(total)
 }
 
 fn calculate_totals(
@@ -517,6 +654,34 @@ fn calculate_totals(
         installments_kurus: checked_sum(installments.iter().map(|row| row.amount_kurus))?,
         payments_kurus: checked_sum(payments.iter().map(|row| row.amount_kurus))?,
     })
+}
+
+fn validate_safe_integer(value: i64, label: &str) -> AppResult<()> {
+    if value.unsigned_abs() > MAX_SAFE_JS_INTEGER as u64 {
+        return Err(AppError::user(format!(
+            "{label} güvenli uygulama aralığını aşıyor."
+        )));
+    }
+    Ok(())
+}
+
+fn validate_safe_totals(totals: &FinancialTotals) -> AppResult<()> {
+    validate_safe_integer(totals.sales_kurus, "Satış toplamı")?;
+    validate_safe_integer(totals.installments_kurus, "Taksit toplamı")?;
+    validate_safe_integer(totals.payments_kurus, "Ödeme toplamı")?;
+    Ok(())
+}
+
+fn validate_import_summary(summary: &ImportSummary) -> AppResult<()> {
+    if summary.sha256.len() != 64
+        || !summary
+            .sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(AppError::user("Son içe aktarma özeti geçersiz."));
+    }
+    validate_safe_totals(&summary.totals)
 }
 
 pub fn bundle_checksum(bundle: &ExportBundle) -> AppResult<String> {
@@ -567,6 +732,7 @@ fn validate_bundle(bundle: &ExportBundle) -> AppResult<()> {
     if expected_totals != bundle.manifest.totals {
         return Err(AppError::user("Aktarım para toplamları eşleşmiyor."));
     }
+    validate_safe_totals(&bundle.manifest.totals)?;
 
     validate_profile(&bundle.business_profile)?;
 
@@ -601,8 +767,10 @@ fn validate_bundle(bundle: &ExportBundle) -> AppResult<()> {
             )));
         }
         validate_iso_date(&row.date, "Satış tarihi")?;
-        if row.total_kurus < 0 {
-            return Err(AppError::user("Satış tutarı negatif olamaz."));
+        if row.total_kurus < 0 || row.total_kurus > MAX_SAFE_JS_INTEGER {
+            return Err(AppError::user(
+                "Satış tutarı güvenli uygulama aralığında olmalıdır.",
+            ));
         }
         if let Some(key) = row.request_key.as_deref() {
             if key.len() > 64 || !request_keys.insert(key.to_owned()) {
@@ -629,8 +797,10 @@ fn validate_bundle(bundle: &ExportBundle) -> AppResult<()> {
         if let Some(date) = row.paid_date.as_deref() {
             validate_iso_date(date, "Taksit ödeme tarihi")?;
         }
-        if row.amount_kurus < 0 {
-            return Err(AppError::user("Taksit tutarı negatif olamaz."));
+        if row.amount_kurus < 0 || row.amount_kurus > MAX_SAFE_JS_INTEGER {
+            return Err(AppError::user(
+                "Taksit tutarı güvenli uygulama aralığında olmalıdır.",
+            ));
         }
         installment_amounts.insert(row.id, row.amount_kurus);
     }
@@ -645,8 +815,10 @@ fn validate_bundle(bundle: &ExportBundle) -> AppResult<()> {
                 row.id
             )));
         }
-        if row.amount_kurus <= 0 {
-            return Err(AppError::user("Ödeme tutarı sıfırdan büyük olmalıdır."));
+        if row.amount_kurus <= 0 || row.amount_kurus > MAX_SAFE_JS_INTEGER {
+            return Err(AppError::user(
+                "Ödeme tutarı güvenli uygulama aralığında olmalıdır.",
+            ));
         }
         validate_iso_date(&row.payment_date, "Ödeme tarihi")?;
         if NaiveDateTime::parse_from_str(&row.created_at, "%Y-%m-%d %H:%M:%S").is_err()
@@ -671,7 +843,7 @@ fn validate_bundle(bundle: &ExportBundle) -> AppResult<()> {
 }
 
 fn require_unique_positive_id(id: i64, ids: &mut HashSet<i64>, record_name: &str) -> AppResult<()> {
-    if id <= 0 || !ids.insert(id) {
+    if id <= 0 || id > MAX_SAFE_JS_INTEGER || !ids.insert(id) {
         return Err(AppError::user(format!(
             "Geçersiz veya yinelenen {record_name} numarası: {id}."
         )));
@@ -712,6 +884,8 @@ pub(crate) fn validate_profile(profile: &BusinessProfile) -> AppResult<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::{sync::mpsc, thread};
+
     use tempfile::TempDir;
 
     use super::*;
@@ -729,6 +903,11 @@ mod tests {
         assert_eq!(status.schema_version, SCHEMA_VERSION);
         assert_eq!(status.journal_mode.to_ascii_lowercase(), "wal");
         assert_eq!(status.integrity_check, "ok");
+        assert!(Uuid::parse_str(&status.database_id).is_ok());
+        assert!(!status.onboarding_complete);
+        assert_eq!(status.last_import, None);
+        assert_eq!(status.counts, RecordCounts::default());
+        assert_eq!(status.totals, FinancialTotals::default());
 
         let connection = database.connect().unwrap();
         let foreign_keys: i32 = connection
@@ -749,5 +928,169 @@ mod tests {
 
         let error = Database::initialize(path).unwrap_err().to_string();
         assert!(error.contains("daha yeni"));
+    }
+
+    #[test]
+    fn persists_identity_onboarding_and_import_summary() {
+        let (_source_directory, source) = test_database();
+        let source_connection = source.connect().unwrap();
+        source_connection
+            .execute(
+                "INSERT INTO customers(id, name, registration_date) VALUES (7, 'Aktarım', '2026-07-14')",
+                [],
+            )
+            .unwrap();
+        source_connection
+            .execute(
+                "INSERT INTO sales(id, customer_id, date, total_kurus, description) VALUES (11, 7, '2026-07-14', 12345, '')",
+                [],
+            )
+            .unwrap();
+        drop(source_connection);
+        let bundle = source.export_data().unwrap();
+
+        let (target_directory, target) = test_database();
+        let database_id = target.status().unwrap().database_id;
+        let summary = target.import_data(bundle, false).unwrap();
+        let status = target.status().unwrap();
+        assert!(status.onboarding_complete);
+        assert_eq!(status.last_import, Some(summary.clone()));
+        assert_eq!(status.totals, summary.totals);
+
+        let reopened =
+            Database::initialize(target_directory.path().join("pusula.sqlite3")).unwrap();
+        let reopened_status = reopened.status().unwrap();
+        assert_eq!(reopened_status.database_id, database_id);
+        assert!(reopened_status.onboarding_complete);
+        assert_eq!(reopened_status.last_import, Some(summary));
+    }
+
+    #[test]
+    fn empty_start_and_preexisting_data_initialize_onboarding_safely() {
+        let (empty_directory, empty) = test_database();
+        empty.acknowledge_empty_start().unwrap();
+        let reopened_empty =
+            Database::initialize(empty_directory.path().join("pusula.sqlite3")).unwrap();
+        assert!(reopened_empty.status().unwrap().onboarding_complete);
+
+        let (legacy_directory, legacy) = test_database();
+        let connection = legacy.connect().unwrap();
+        connection
+            .execute(
+                "INSERT INTO customers(id, name, registration_date) VALUES (9, 'Mevcut', '2026-07-14')",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute("DELETE FROM settings WHERE key = 'onboarding_complete'", [])
+            .unwrap();
+        drop(connection);
+
+        let reopened_legacy =
+            Database::initialize(legacy_directory.path().join("pusula.sqlite3")).unwrap();
+        assert!(reopened_legacy.status().unwrap().onboarding_complete);
+    }
+
+    #[test]
+    fn import_settings_roll_back_with_failed_database_write() {
+        let (_source_directory, source) = test_database();
+        let source_connection = source.connect().unwrap();
+        source_connection
+            .execute(
+                "INSERT INTO customers(id, name, registration_date) VALUES (5, 'Kaynak', '2026-07-14')",
+                [],
+            )
+            .unwrap();
+        drop(source_connection);
+        let bundle = source.export_data().unwrap();
+
+        let (_target_directory, target) = test_database();
+        let target_connection = target.connect().unwrap();
+        target_connection
+            .execute(
+                "INSERT INTO customers(id, name, registration_date) VALUES (5, 'Çakışma', '2026-07-14')",
+                [],
+            )
+            .unwrap();
+        drop(target_connection);
+        assert!(target.import_data(bundle, false).is_err());
+        let status = target.status().unwrap();
+        assert!(!status.onboarding_complete);
+        assert_eq!(status.last_import, None);
+    }
+
+    #[test]
+    fn rejects_exports_and_import_ids_outside_javascript_safe_range() {
+        let (_source_directory, source) = test_database();
+        let source_connection = source.connect().unwrap();
+        source_connection
+            .execute(
+                "INSERT INTO customers(id, name, registration_date) VALUES (1, 'Sınır', '2026-07-14')",
+                [],
+            )
+            .unwrap();
+        source_connection
+            .execute(
+                "INSERT INTO sales(id, customer_id, date, total_kurus, description) VALUES (1, 1, '2026-07-14', 100, '')",
+                [],
+            )
+            .unwrap();
+        drop(source_connection);
+        let mut bundle = source.export_data().unwrap();
+        bundle.customers[0].id = MAX_SAFE_JS_INTEGER + 1;
+        bundle.sales[0].customer_id = MAX_SAFE_JS_INTEGER + 1;
+        bundle.manifest.sha256 = bundle_checksum(&bundle).unwrap();
+
+        let (_target_directory, target) = test_database();
+        assert!(target.import_data(bundle, false).is_err());
+
+        let unsafe_connection = target.connect().unwrap();
+        unsafe_connection
+            .execute(
+                "INSERT INTO customers(id, name, registration_date) VALUES (2, 'Eski', '2026-07-14')",
+                [],
+            )
+            .unwrap();
+        unsafe_connection
+            .execute(
+                "INSERT INTO sales(id, customer_id, date, total_kurus, description) VALUES (2, 2, '2026-07-14', ?, '')",
+                [MAX_SAFE_JS_INTEGER + 1],
+            )
+            .unwrap();
+        drop(unsafe_connection);
+        assert!(target.status().is_err());
+        assert!(target.export_data().is_err());
+    }
+
+    #[test]
+    fn export_uses_one_snapshot_across_concurrent_commit() {
+        let (_directory, database) = test_database();
+        let writer_database = database.clone();
+        let (start_writer, writer_started) = mpsc::channel();
+        let (writer_done, wait_for_writer) = mpsc::channel();
+        let writer = thread::spawn(move || {
+            writer_started.recv().unwrap();
+            let connection = writer_database.connect().unwrap();
+            connection
+                .execute(
+                    "INSERT INTO customers(id, name, registration_date) VALUES (1, 'Yeni', '2026-07-14')",
+                    [],
+                )
+                .unwrap();
+            writer_done.send(()).unwrap();
+        });
+
+        let bundle = database
+            .export_data_with_hook(|| {
+                start_writer.send(()).unwrap();
+                wait_for_writer.recv().unwrap();
+            })
+            .unwrap();
+        writer.join().unwrap();
+
+        assert!(bundle.customers.is_empty());
+        assert_eq!(bundle.manifest.counts.customers, 0);
+        assert_eq!(bundle.manifest.sha256, bundle_checksum(&bundle).unwrap());
+        assert_eq!(database.status().unwrap().counts.customers, 1);
     }
 }

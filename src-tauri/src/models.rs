@@ -140,9 +140,13 @@ pub struct ExportSummary {
 #[derive(Debug, Clone, Deserialize, PartialEq, Serialize)]
 pub struct DatabaseStatus {
     pub path: String,
+    pub database_id: String,
     pub schema_version: i32,
     pub journal_mode: String,
     pub integrity_check: String,
     pub last_modified_at: Option<String>,
+    pub onboarding_complete: bool,
+    pub last_import: Option<ImportSummary>,
     pub counts: RecordCounts,
+    pub totals: FinancialTotals,
 }

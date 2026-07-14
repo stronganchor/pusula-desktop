@@ -3,7 +3,8 @@ param(
     [Parameter(Mandatory = $true)][string] $ExpectedVersion,
     [Parameter(Mandatory = $true)][string] $Repository,
     [Parameter(Mandatory = $true)][string] $ExpectedCommit,
-    [Parameter(Mandatory = $true)][ValidateSet('true', 'false')][string] $Prerelease
+    [Parameter(Mandatory = $true)][string] $CandidateTag,
+    [switch] $RequireRepositoryImmutability
 )
 
 Set-StrictMode -Version Latest
@@ -12,16 +13,21 @@ $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'Release-SemVer.ps1')
 $candidate = ConvertTo-StrictSemVer -Version $ExpectedVersion
 
+if ($null -ne $candidate.Prerelease) {
+    throw 'An acceptance candidate must use the final SemVer without a prerelease suffix; GitHub prerelease state carries the candidate status.'
+}
 if ($Repository -notmatch '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$') {
     throw "Invalid GitHub repository name: $Repository"
 }
 if ($ExpectedCommit -notmatch '^[0-9a-fA-F]{40}$') {
     throw 'Expected release commit must be a full 40-character Git SHA.'
 }
-if ($Prerelease -eq 'false' -and $null -ne $candidate.Prerelease) {
-    throw 'A stable GitHub release cannot use a prerelease SemVer suffix.'
+$normalizedCommit = $ExpectedCommit.ToLowerInvariant()
+$expectedCandidateTag = Get-ReleaseCandidateTag -Version $ExpectedVersion -Commit $normalizedCommit
+if ($CandidateTag -cne $expectedCandidateTag) {
+    throw "Candidate tag must exactly equal $expectedCandidateTag."
 }
-if ($env:GITHUB_REF -and $env:GITHUB_REF -ne 'refs/heads/main') {
+if ($env:GITHUB_REF -and $env:GITHUB_REF -cne 'refs/heads/main') {
     throw "Release workflows must be dispatched from main, not $($env:GITHUB_REF)."
 }
 
@@ -32,7 +38,7 @@ foreach ($command in 'git', 'gh') {
 }
 
 $head = (& git rev-parse HEAD).Trim()
-if ($LASTEXITCODE -ne 0 -or $head -ne $ExpectedCommit) {
+if ($LASTEXITCODE -ne 0 -or $head -cne $ExpectedCommit) {
     throw "Checked-out commit $head does not match immutable workflow commit $ExpectedCommit."
 }
 
@@ -41,15 +47,35 @@ if ($LASTEXITCODE -ne 0 -or $head -ne $ExpectedCommit) {
 $mainResponse = & gh api "repos/$Repository/git/ref/heads/main"
 if ($LASTEXITCODE -ne 0) { throw 'Could not verify the current main branch through GitHub.' }
 $mainCommit = [string](($mainResponse | ConvertFrom-Json).object.sha)
-if ($mainCommit -ne $ExpectedCommit) {
+if ($mainCommit -cne $ExpectedCommit) {
     throw "main moved to $mainCommit after workflow dispatch; refusing to release $ExpectedCommit."
+}
+
+if ($RequireRepositoryImmutability) {
+    $immutabilityResponse = & gh api `
+        -H 'X-GitHub-Api-Version: 2026-03-10' `
+        "repos/$Repository/immutable-releases"
+    if ($LASTEXITCODE -ne 0) {
+        throw 'Could not verify repository release immutability through GitHub.'
+    }
+    $immutability = $immutabilityResponse | ConvertFrom-Json
+    if (-not [bool]$immutability.enabled) {
+        throw 'Repository release immutability must be enabled before privileged release work begins.'
+    }
 }
 
 $matchingTagsResponse = & gh api "repos/$Repository/git/matching-refs/tags/v$ExpectedVersion"
 if ($LASTEXITCODE -ne 0) { throw 'Could not verify existing Git tags through GitHub.' }
-$matchingTags = @($matchingTagsResponse | ConvertFrom-Json)
-if ($matchingTags.Count -ne 0) {
-    throw "Tag v$ExpectedVersion already exists. Releases are immutable and cannot be overwritten."
+$parsedMatchingTags = $matchingTagsResponse | ConvertFrom-Json
+$matchingTags = @($parsedMatchingTags)
+$stableRef = "refs/tags/v$ExpectedVersion"
+$candidateRefPrefix = "refs/tags/v$ExpectedVersion-candidate."
+$conflictingRefs = @($matchingTags | Where-Object {
+        [string]$_.ref -ceq $stableRef -or
+        ([string]$_.ref).StartsWith($candidateRefPrefix, [StringComparison]::Ordinal)
+    })
+if ($conflictingRefs.Count -ne 0) {
+    throw "A stable or candidate tag already exists for version $ExpectedVersion. Use a strictly greater version."
 }
 
 $releaseRows = @(& gh api --paginate "repos/$Repository/releases?per_page=100" --jq '.[] | [.tag_name, .draft] | @tsv')
@@ -61,8 +87,9 @@ foreach ($row in $releaseRows) {
     $columns = @($row -split "`t", 2)
     $tag = $columns[0]
     $draft = $columns.Count -gt 1 -and $columns[1] -eq 'true'
-    if ($tag -eq "v$ExpectedVersion") {
-        throw "GitHub release v$ExpectedVersion already exists. Inspect or remove the failed draft manually."
+    if ($tag -ceq "v$ExpectedVersion" -or
+        $tag.StartsWith("v$ExpectedVersion-candidate.", [StringComparison]::Ordinal)) {
+        throw "A stable or candidate GitHub release already exists for version $ExpectedVersion. Inspect any draft or use a strictly greater version."
     }
     if ($draft -or -not $tag.StartsWith('v', [StringComparison]::Ordinal)) { continue }
 
@@ -85,4 +112,4 @@ if ($null -ne $highestPublished -and
     throw "Release version $ExpectedVersion must be greater than published version $highestPublished."
 }
 
-Write-Output "Release identity verified: v$ExpectedVersion at $ExpectedCommit (prerelease=$Prerelease)"
+Write-Output "Release candidate identity verified: $CandidateTag at $ExpectedCommit"

@@ -1,10 +1,14 @@
-name: Promote Accepted Windows Release
+name: Publish Accepted Windows Release
 
 on:
   workflow_dispatch:
     inputs:
       version:
         description: Accepted final SemVer without the v prefix
+        required: true
+        type: string
+      candidate_tag:
+        description: Exact immutable v<version>-candidate.<40-character SHA> tag
         required: true
         type: string
       acceptance_evidence_sha256:
@@ -25,13 +29,14 @@ concurrency:
 
 env:
   RELEASE_VERSION: ${{ inputs.version }}
+  RELEASE_CANDIDATE_TAG: ${{ inputs.candidate_tag }}
   ACCEPTANCE_EVIDENCE_SHA256: ${{ inputs.acceptance_evidence_sha256 }}
   PROMOTION_CONFIRMATION: ${{ inputs.confirmation }}
   RELEASE_COMMIT: ${{ github.sha }}
   RELEASE_REPOSITORY: ${{ github.repository }}
 
 jobs:
-  promote:
+  publish-stable:
     runs-on: windows-latest
     environment: windows-release
     steps:
@@ -40,27 +45,264 @@ jobs:
           ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
-      - name: Revalidate candidate artifacts and acceptance attestation
+      - name: Install pinned Minisign verifier
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
+          $archive = Join-Path $env:RUNNER_TEMP 'minisign-0.12-win64.zip'
+          $root = Join-Path $env:RUNNER_TEMP 'minisign-0.12'
+          Invoke-WebRequest `
+            -Uri 'https://github.com/jedisct1/minisign/releases/download/0.12/minisign-0.12-win64.zip' `
+            -OutFile $archive
+          $expectedHash = '37b600344e20c19314b2e82813db2bfdcc408b77b876f7727889dbd46d539479'
+          $actualHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $archive).Hash.ToLowerInvariant()
+          if ($actualHash -cne $expectedHash) { throw 'Pinned Minisign archive SHA-256 verification failed.' }
+          Expand-Archive -LiteralPath $archive -DestinationPath $root
+          Remove-Item -LiteralPath $archive -Force
+          $path = Join-Path $root 'minisign-win64\x86_64\minisign.exe'
+          if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw 'minisign.exe was not installed.' }
+          "MINISIGN_PATH=$path" >> $env:GITHUB_ENV
+      - name: Revalidate immutable candidate, signatures, and acceptance attestation
         shell: pwsh
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.RELEASE_ADMIN_READ_TOKEN }}
+          EXPECTED_WINDOWS_PUBLISHER: ${{ vars.EXPECTED_WINDOWS_PUBLISHER }}
         run: |
           .\scripts\Test-CandidatePromotion.ps1 `
             -Version $env:RELEASE_VERSION `
+            -CandidateTag $env:RELEASE_CANDIDATE_TAG `
             -Repository $env:RELEASE_REPOSITORY `
             -WorkflowCommit $env:RELEASE_COMMIT `
             -AcceptanceEvidenceSha256 $env:ACCEPTANCE_EVIDENCE_SHA256 `
             -Confirmation $env:PROMOTION_CONFIRMATION `
-            -DownloadDirectory (Join-Path $env:RUNNER_TEMP 'candidate-assets')
-      - name: Promote the exact accepted candidate
+            -DownloadDirectory (Join-Path $env:RUNNER_TEMP 'candidate-assets') `
+            -ExpectedWindowsPublisher $env:EXPECTED_WINDOWS_PUBLISHER `
+            -MinisignPath $env:MINISIGN_PATH
+      - name: Create exact stable tag and upload a private draft
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           $ErrorActionPreference = 'Stop'
-          $tag = "v$($env:RELEASE_VERSION)"
-          gh release edit $tag --repo $env:RELEASE_REPOSITORY --prerelease=false --latest
-          if ($LASTEXITCODE -ne 0) { throw 'Candidate promotion failed.' }
+          $stableTag = "v$($env:RELEASE_VERSION)"
+          $candidatePattern = '^v' + [regex]::Escape($env:RELEASE_VERSION) + '-candidate\.(?<commit>[0-9a-f]{40})$'
+          if ($env:RELEASE_CANDIDATE_TAG -cnotmatch $candidatePattern) {
+            throw 'Candidate tag changed after validation.'
+          }
+          $candidateCommit = [string]$Matches.commit
+          if ($candidateCommit -cne $env:RELEASE_COMMIT) {
+            throw 'Candidate commit changed after validation.'
+          }
+
+          $refArgs = @(
+            'api', '--method', 'POST',
+            "repos/$($env:RELEASE_REPOSITORY)/git/refs",
+            '-f', "ref=refs/tags/$stableTag",
+            '-f', "sha=$candidateCommit"
+          )
+          $createdRefJson = gh @refArgs
+          if ($LASTEXITCODE -ne 0) {
+            throw 'Could not exclusively create the stable Git tag at the accepted candidate commit.'
+          }
+          $createdRef = $createdRefJson | ConvertFrom-Json
+          if ([string]$createdRef.ref -cne "refs/tags/$stableTag" -or
+              [string]$createdRef.object.type -cne 'commit' -or
+              [string]$createdRef.object.sha -cne $candidateCommit) {
+            throw 'Created stable Git tag is not a lightweight tag at the accepted candidate commit.'
+          }
+
+          $releaseArgs = @(
+            'release', 'create', $stableTag,
+            '--repo', $env:RELEASE_REPOSITORY,
+            '--target', $candidateCommit,
+            '--title', "Pusula $($env:RELEASE_VERSION)",
+            '--generate-notes',
+            '--draft'
+          )
+          gh @releaseArgs
+          if ($LASTEXITCODE -ne 0) { throw 'Could not create the stable draft GitHub release.' }
+
+          $assetDirectory = Join-Path $env:RUNNER_TEMP 'candidate-assets'
+          $assets = @(Get-ChildItem -LiteralPath $assetDirectory -File | Sort-Object Name)
+          $uploadArgs = @('release', 'upload', $stableTag, '--repo', $env:RELEASE_REPOSITORY) + @($assets.FullName)
+          gh @uploadArgs
+          if ($LASTEXITCODE -ne 0) { throw 'Stable asset upload failed; the release remains a draft.' }
+
+          $draftJson = gh api "repos/$($env:RELEASE_REPOSITORY)/releases/tags/$stableTag"
+          if ($LASTEXITCODE -ne 0) { throw 'Could not read the uploaded stable draft through the GitHub API.' }
+          $draft = $draftJson | ConvertFrom-Json
+          if (-not $draft.draft -or [bool]$draft.prerelease) { throw 'Stable draft state is incorrect.' }
+          if ([string]$draft.target_commitish -cne $candidateCommit) { throw 'Stable draft target differs from the accepted candidate commit.' }
+
+          $localAssets = @($assets | ForEach-Object {
+            [pscustomobject][ordered]@{
+              name = $_.Name
+              size = [long]$_.Length
+              digest = "sha256:$((Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName).Hash.ToLowerInvariant())"
+            }
+          } | Sort-Object name)
+          $remoteAssets = @($draft.assets | ForEach-Object {
+            if ([string]::IsNullOrWhiteSpace([string]$_.digest)) {
+              throw "GitHub did not return a digest for uploaded stable asset $($_.name)."
+            }
+            [pscustomobject][ordered]@{
+              name = [string]$_.name
+              size = [long]$_.size
+              digest = ([string]$_.digest).ToLowerInvariant()
+            }
+          } | Sort-Object name)
+          if (($localAssets | ConvertTo-Json -Compress) -cne ($remoteAssets | ConvertTo-Json -Compress)) {
+            throw 'Stable release bytes do not exactly match the accepted immutable candidate.'
+          }
+
+          $draftRefJson = gh api "repos/$($env:RELEASE_REPOSITORY)/git/ref/tags/$stableTag"
+          if ($LASTEXITCODE -ne 0) { throw 'Could not read back the stable tag after draft creation.' }
+          $draftRef = $draftRefJson | ConvertFrom-Json
+          if ([string]$draftRef.object.type -cne 'commit' -or [string]$draftRef.object.sha -cne $candidateCommit) {
+            throw 'Stable tag moved away from the accepted candidate commit after draft creation.'
+          }
+
+      - name: Recheck immutable policy, candidate, exact stable tag, and draft bytes immediately before publication
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_ADMIN_READ_TOKEN }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $stableTag = "v$($env:RELEASE_VERSION)"
+          $candidatePattern = '^v' + [regex]::Escape($env:RELEASE_VERSION) + '-candidate\.(?<commit>[0-9a-f]{40})$'
+          if ($env:RELEASE_CANDIDATE_TAG -cnotmatch $candidatePattern) {
+            throw 'Candidate tag changed after stable draft creation.'
+          }
+          $candidateCommit = [string]$Matches.commit
+          if ($candidateCommit -cne $env:RELEASE_COMMIT) {
+            throw 'Candidate commit changed after stable draft creation.'
+          }
+          $head = (& git rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0 -or $head -cne $candidateCommit) {
+            throw 'Stable publication checkout changed after draft creation.'
+          }
+          $mainJson = gh api "repos/$($env:RELEASE_REPOSITORY)/git/ref/heads/main"
+          if ($LASTEXITCODE -ne 0 -or [string](($mainJson | ConvertFrom-Json).object.sha) -cne $candidateCommit) {
+            throw 'main moved after the stable draft was created.'
+          }
+          $immutabilityJson = gh api `
+            -H 'X-GitHub-Api-Version: 2026-03-10' `
+            "repos/$($env:RELEASE_REPOSITORY)/immutable-releases"
+          if ($LASTEXITCODE -ne 0 -or -not [bool](($immutabilityJson | ConvertFrom-Json).enabled)) {
+            throw 'Repository release immutability is not enabled immediately before stable publication.'
+          }
+
+          $candidateJson = gh release view $env:RELEASE_CANDIDATE_TAG --repo $env:RELEASE_REPOSITORY --json tagName,isDraft,isImmutable,isPrerelease,targetCommitish
+          if ($LASTEXITCODE -ne 0) { throw 'Could not revalidate the accepted candidate immediately before stable publication.' }
+          $candidate = $candidateJson | ConvertFrom-Json
+          if ([string]$candidate.tagName -cne $env:RELEASE_CANDIDATE_TAG -or
+              $candidate.isDraft -or -not $candidate.isPrerelease -or -not $candidate.isImmutable -or
+              [string]$candidate.targetCommitish -cne $candidateCommit) {
+            throw 'Accepted candidate identity or immutable state changed before stable publication.'
+          }
+          $candidateRefJson = gh api "repos/$($env:RELEASE_REPOSITORY)/git/ref/tags/$($env:RELEASE_CANDIDATE_TAG)"
+          if ($LASTEXITCODE -ne 0) { throw 'Could not revalidate the accepted candidate tag.' }
+          $candidateRef = $candidateRefJson | ConvertFrom-Json
+          if ([string]$candidateRef.object.type -cne 'commit' -or [string]$candidateRef.object.sha -cne $candidateCommit) {
+            throw 'Accepted candidate tag is not pinned to its accepted commit.'
+          }
+          $stableRefJson = gh api "repos/$($env:RELEASE_REPOSITORY)/git/ref/tags/$stableTag"
+          if ($LASTEXITCODE -ne 0) { throw 'Could not verify the stable tag immediately before publication.' }
+          $stableRef = $stableRefJson | ConvertFrom-Json
+          if ([string]$stableRef.object.type -cne 'commit' -or [string]$stableRef.object.sha -cne $candidateCommit) {
+            throw 'Stable tag does not point directly to the accepted candidate commit immediately before publication.'
+          }
+
+          $draftJson = gh api "repos/$($env:RELEASE_REPOSITORY)/releases/tags/$stableTag"
+          if ($LASTEXITCODE -ne 0) { throw 'Could not revalidate the uploaded stable draft.' }
+          $draft = $draftJson | ConvertFrom-Json
+          if (-not $draft.draft -or [bool]$draft.prerelease) { throw 'Stable draft state changed before publication.' }
+          if ([string]$draft.target_commitish -cne $candidateCommit) { throw 'Stable draft target changed before publication.' }
+          $assetDirectory = Join-Path $env:RUNNER_TEMP 'candidate-assets'
+          $assets = @(Get-ChildItem -LiteralPath $assetDirectory -File | Sort-Object Name)
+          $localAssets = @($assets | ForEach-Object {
+            [pscustomobject][ordered]@{
+              name = $_.Name
+              size = [long]$_.Length
+              digest = "sha256:$((Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName).Hash.ToLowerInvariant())"
+            }
+          } | Sort-Object name)
+          $remoteAssets = @($draft.assets | ForEach-Object {
+            if ([string]::IsNullOrWhiteSpace([string]$_.digest)) {
+              throw "GitHub did not return a digest for stable draft asset $($_.name)."
+            }
+            [pscustomobject][ordered]@{
+              name = [string]$_.name
+              size = [long]$_.size
+              digest = ([string]$_.digest).ToLowerInvariant()
+            }
+          } | Sort-Object name)
+          if (($localAssets | ConvertTo-Json -Compress) -cne ($remoteAssets | ConvertTo-Json -Compress)) {
+            throw 'Stable draft bytes changed after upload.'
+          }
+
+      - name: Publish the revalidated stable release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $stableTag = "v$($env:RELEASE_VERSION)"
+          $candidatePattern = '^v' + [regex]::Escape($env:RELEASE_VERSION) + '-candidate\.(?<commit>[0-9a-f]{40})$'
+          if ($env:RELEASE_CANDIDATE_TAG -cnotmatch $candidatePattern) {
+            throw 'Candidate tag changed at stable publication time.'
+          }
+          $candidateCommit = [string]$Matches.commit
+          $stableRefJson = gh api "repos/$($env:RELEASE_REPOSITORY)/git/ref/tags/$stableTag"
+          if ($LASTEXITCODE -ne 0) { throw 'Could not verify the stable tag at publication time.' }
+          $stableRef = $stableRefJson | ConvertFrom-Json
+          if ([string]$stableRef.object.type -cne 'commit' -or [string]$stableRef.object.sha -cne $candidateCommit) {
+            throw 'Stable tag changed before publication.'
+          }
+
+          gh release edit $stableTag --repo $env:RELEASE_REPOSITORY --draft=false --latest
+          if ($LASTEXITCODE -ne 0) { throw 'Validated stable release could not be published; it remains a draft.' }
+          $publishedJson = gh release view $stableTag --repo $env:RELEASE_REPOSITORY --json tagName,isDraft,isImmutable,isPrerelease,targetCommitish
+          if ($LASTEXITCODE -ne 0) { throw 'Published stable release could not be read back.' }
+          $published = $publishedJson | ConvertFrom-Json
+          if ([string]$published.tagName -cne $stableTag -or $published.isDraft -or $published.isPrerelease -or -not $published.isImmutable) {
+            throw 'Published stable release did not enter the required immutable stable state.'
+          }
+          if ([string]$published.targetCommitish -cne $candidateCommit) {
+            throw 'Published stable release target differs from the accepted candidate commit.'
+          }
+          $publishedRefJson = gh api "repos/$($env:RELEASE_REPOSITORY)/git/ref/tags/$stableTag"
+          if ($LASTEXITCODE -ne 0) { throw 'Published stable tag could not be read back.' }
+          $publishedRef = $publishedRefJson | ConvertFrom-Json
+          if ([string]$publishedRef.object.type -cne 'commit' -or [string]$publishedRef.object.sha -cne $candidateCommit) {
+            throw 'Published immutable stable tag is not pinned to the accepted candidate commit.'
+          }
+          $publishedApiJson = gh api "repos/$($env:RELEASE_REPOSITORY)/releases/tags/$stableTag"
+          if ($LASTEXITCODE -ne 0) { throw 'Published stable assets could not be read back.' }
+          $publishedApi = $publishedApiJson | ConvertFrom-Json
+          $assetDirectory = Join-Path $env:RUNNER_TEMP 'candidate-assets'
+          $assets = @(Get-ChildItem -LiteralPath $assetDirectory -File | Sort-Object Name)
+          $localAssets = @($assets | ForEach-Object {
+            [pscustomobject][ordered]@{
+              name = $_.Name
+              size = [long]$_.Length
+              digest = "sha256:$((Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName).Hash.ToLowerInvariant())"
+            }
+          } | Sort-Object name)
+          $publishedAssets = @($publishedApi.assets | ForEach-Object {
+            if ([string]::IsNullOrWhiteSpace([string]$_.digest)) {
+              throw "GitHub did not return a digest for published stable asset $($_.name)."
+            }
+            [pscustomobject][ordered]@{
+              name = [string]$_.name
+              size = [long]$_.size
+              digest = ([string]$_.digest).ToLowerInvariant()
+            }
+          } | Sort-Object name)
+          if (($localAssets | ConvertTo-Json -Compress) -cne ($publishedAssets | ConvertTo-Json -Compress)) {
+            throw 'Published immutable stable bytes differ from the accepted candidate.'
+          }
           $latest = gh api "repos/$($env:RELEASE_REPOSITORY)/releases/latest" --jq '.tag_name'
-          if ($LASTEXITCODE -ne 0 -or $latest -ne $tag) { throw 'Promoted release is not the repository latest release.' }
-          "Promoted $tag with acceptance evidence SHA-256 $($env:ACCEPTANCE_EVIDENCE_SHA256.ToLowerInvariant())" >> $env:GITHUB_STEP_SUMMARY
+          if ($LASTEXITCODE -ne 0 -or $latest -cne $stableTag) { throw 'Published stable release is not the repository latest release.' }
+          "Published $stableTag from immutable candidate $($env:RELEASE_CANDIDATE_TAG) with acceptance evidence SHA-256 $($env:ACCEPTANCE_EVIDENCE_SHA256.ToLowerInvariant())" >> $env:GITHUB_STEP_SUMMARY

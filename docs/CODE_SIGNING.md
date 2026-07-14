@@ -27,11 +27,18 @@ Do not create an Entra client secret for this workflow. GitHub obtains a short-l
 
 Public Trust enrollment is currently available to organizations in the United States, Canada, the European Union, and the United Kingdom, and to individual developers in the United States and Canada. Microsoft documents a normal identity-validation window of 1 to 20 business days, potentially longer when more documentation is required.
 
+As of 2026-07-14, Microsoft lists the Basic tier at USD 9.99 per month for up
+to 5,000 signatures, bills the full monthly amount rather than prorating it,
+and starts billing when the Artifact Signing account is created. Obtain the
+publisher's explicit spending approval immediately before creating the Azure
+resource, and re-check the live pricing page because these terms can change.
+
 Microsoft's setup documentation:
 
 - <https://learn.microsoft.com/azure/artifact-signing/quickstart>
 - <https://learn.microsoft.com/azure/artifact-signing/tutorial-assign-roles>
 - <https://learn.microsoft.com/azure/developer/github/connect-from-azure-openid-connect>
+- <https://azure.microsoft.com/pricing/details/artifact-signing/>
 
 ## GitHub release environment
 
@@ -56,14 +63,19 @@ Configure these environment secrets:
 | `TAURI_SIGNING_PRIVATE_KEY` | Tauri updater private key |
 | `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` | Password for the updater private key |
 | `ACCEPTANCE_BASELINE_ARCHIVE_PASSWORD` | One-time 24+ character password retained by the acceptance operator; required only when building the initial private baseline |
+| `RELEASE_ADMIN_READ_TOKEN` | Fine-grained token restricted to this repository with Administration read and Contents read; used only to prove immutable releases are enabled and inspect the candidate |
 
-The obsolete `WINDOWS_CODESIGN_PFX_BASE64` and `WINDOWS_CODESIGN_PASSWORD` secrets must not be configured or used.
+Give `RELEASE_ADMIN_READ_TOKEN` an expiration, rotate it before expiry, and do
+not grant write permission. The obsolete `WINDOWS_CODESIGN_PFX_BASE64` and
+`WINDOWS_CODESIGN_PASSWORD` secrets must not be configured or used.
 
 ## Release behavior
 
 The workflow first validates and compiles the immutable `main` commit without
-Azure access, updater secrets, or a write-capable GitHub token. The signing job
-then downloads the official Microsoft Artifact Signing Client Tools MSI,
+Azure access, updater secrets, or a write-capable GitHub token. Before signing,
+the protected read-only administration token proves repository release
+immutability is enabled. The signing job then downloads the official Microsoft
+Artifact Signing Client Tools MSI,
 verifies Microsoft's Authenticode signature, and installs it noninteractively
 before logging in with `azure/login` and GitHub OIDC. The updater private key is
 available only to the preflight validation and candidate bundle steps. Tauri
@@ -84,11 +96,17 @@ candidate update; that proves the inner application extracted from the signed
 NSIS package has the expected publisher and timestamp.
 
 Verified artifacts cross into a separate publication job without the updater
-private key or Azure session. That job creates a draft, uploads only the
-allowlisted artifacts and SHA-256 manifest, verifies their remote names/sizes,
-requires GitHub's remote SHA-256 digest for every upload to match the local
-asset, and publishes atomically. The release remains blocked until Azure identity
-validation is complete, the Public Trust profile exists, the expected publisher
-value is configured, the GitHub environment is protected, and a workflow run
-proves every signature valid. Candidate testing and promotion are defined in
-`RELEASE_RUNBOOK.md`.
+private key or Azure session. That job exclusively creates a lightweight
+candidate tag derived from the final version and full commit SHA, creates a
+draft, and uploads only the allowlisted artifacts and SHA-256 manifest. A
+read-only admin token then rechecks repository immutability, `main`, the exact
+tag ref, draft state, and case-sensitive remote names/sizes/digests immediately
+before the isolated write-token step publishes it. The job requires the tag,
+release state, and exact bytes to read back correctly after the candidate is
+immutable. After acceptance, the stable-publication workflow applies the same
+gates while copying those exact files under a new immutable `v<version>` stable
+release; it never edits the immutable candidate. The release remains blocked
+until Azure identity validation is complete, the Public Trust profile exists,
+the expected publisher value is configured, the GitHub environment is
+protected, and a workflow run proves every signature valid. Candidate testing
+and stable publication are defined in `RELEASE_RUNBOOK.md`.

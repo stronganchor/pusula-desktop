@@ -61,6 +61,12 @@ to the internet, leave Pusula open, and approve the update prompt. If the
 in-app route is unavailable, the signed offline installer can be run over the
 existing installation; take and verify a backup first.
 
+The Windows installer refuses to replace Pusula with an older version. SQLite
+schema migrations move forward, so an older retained installer must never be
+used as an application rollback against a database opened by a newer release.
+Recover records through the documented backup/restore procedure and install a
+same-or-newer signed version instead.
+
 ## Before repair, replacement, or uninstall
 
 1. Open **VERİ VE YEDEK** and require a fresh verified remote backup.

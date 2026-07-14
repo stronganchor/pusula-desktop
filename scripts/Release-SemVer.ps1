@@ -88,3 +88,21 @@ function Compare-StrictSemVer {
 
     return 0
 }
+
+function Get-ReleaseCandidateTag {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string] $Version,
+        [Parameter(Mandatory = $true)][string] $Commit
+    )
+
+    $parsed = ConvertTo-StrictSemVer -Version $Version
+    if ($null -ne $parsed.Prerelease) {
+        throw 'A release candidate tag must be based on the final SemVer without a prerelease suffix.'
+    }
+    if ($Commit -cnotmatch '^[0-9a-f]{40}$') {
+        throw 'A release candidate tag requires a lowercase full 40-character Git SHA.'
+    }
+
+    return "v$Version-candidate.$Commit"
+}

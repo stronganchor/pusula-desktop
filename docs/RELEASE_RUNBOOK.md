@@ -2,8 +2,8 @@
 
 Pusula releases are built from one immutable `main` commit. The Windows
 installer is Authenticode signed, the updater archive is signed with the Tauri
-key embedded in the application, and the exact candidate assets are promoted
-without rebuilding them after acceptance.
+key embedded in the application, and the exact candidate assets are published
+again under a new stable tag without rebuilding them after acceptance.
 
 ## Repository and environment gates
 
@@ -15,9 +15,11 @@ Before any release:
    self-review, and disable administrator bypass where the GitHub plan allows.
 3. Restrict that environment to `main` and configure all values listed in
    `CODE_SIGNING.md`, including `EXPECTED_WINDOWS_PUBLISHER`.
-4. Enable immutable GitHub Releases for the repository. If that setting is not
-   available, preserve the published tag and assets and treat any replacement
-   as a new version.
+4. Enable immutable GitHub Releases for the repository before creating any
+   candidate. Configure the read-only `RELEASE_ADMIN_READ_TOKEN` described in
+   `CODE_SIGNING.md`; the signed-release and stable-publication workflows use it
+   to check the live repository setting before privileged work. Both workflows
+   also require each published release to read back as immutable.
 5. Keep a recoverable administrator copy of the Tauri updater signing key. The
    public key in `src-tauri/tauri.conf.json` must match it; the release workflow
    verifies that relationship before publishing.
@@ -32,7 +34,9 @@ Before any release:
 
 1. Bump the same strict SemVer in `package.json`, `package-lock.json`,
    `src-tauri/tauri.conf.json`, `src-tauri/Cargo.toml`, and
-   `src-tauri/Cargo.lock`.
+   `src-tauri/Cargo.lock`. Keep NSIS downgrades disabled because Pusula's SQLite
+   migrations are forward-only; the release-policy test also enforces the
+   current-user and offline-WebView installer modes.
 2. Run:
 
    ```powershell
@@ -44,19 +48,27 @@ Before any release:
    cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
    cargo test --manifest-path src-tauri/Cargo.toml
    powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\restore-harness.tests.ps1
+   powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\release-policy.tests.ps1
    npm run tauri -- build --no-bundle --ci
    npm run tauri -- bundle --bundles nsis --no-sign --ci
    ```
 
 3. Merge through the protected branch and require both CI jobs green.
 4. From the `main` branch in GitHub Actions, run **Signed Windows Release** with
-   the final version and `prerelease=true`. For the initial `0.1.0` release,
-   also set `build_initial_acceptance_baseline=true` and
+   the final version. The workflow can publish only a GitHub prerelease
+   candidate under the deterministic tag
+   `v<version>-candidate.<full-40-character-main-SHA>`; it rejects SemVer
+   prerelease suffixes and cannot publish a stable or latest release directly.
+   For the initial `0.1.0` release, also set
+   `build_initial_acceptance_baseline=true` and
    `acceptance_baseline_version=0.0.9`. The workflow refuses a moving branch,
    duplicate/non-monotonic version, missing signing value, unexpected
    publisher, invalid updater signature, incomplete asset set, remote asset
-   digest mismatch, or partial publication. It publishes these exact candidate
-   assets:
+   digest mismatch, tag conflict, disabled release immutability, or partial
+   publication. It creates the lightweight candidate tag only if that exact ref
+   is absent, uploads a private draft, and rechecks the tag, `main`, immutable
+   policy, and case-sensitive remote bytes before publication. It publishes
+   these exact candidate assets:
 
    ```text
    Pusula_<version>_x64_offline-setup.exe
@@ -81,15 +93,15 @@ do not see a candidate before it is accepted. The candidate's immutable manifest
 is nevertheless available at:
 
 ```text
-https://github.com/stronganchor/pusula-desktop/releases/download/v<version>/latest.json
+https://github.com/stronganchor/pusula-desktop/releases/download/v<version>-candidate.<full-40-character-main-SHA>/latest.json
 ```
 
 The first release has no prior signed production build, so its private baseline
 must be built during the same protected workflow run. The workflow freshly
 compiles `0.0.9` before Azure authentication with the embedded updater version
-and the direct `v0.1.0` manifest endpoint. It then signs and bundles that
-baseline with the same Tauri public key and Authenticode publisher as the
-candidate. It does not rename or rebundle the `0.1.0` executable.
+and that exact immutable candidate-tag manifest endpoint. It then signs and
+bundles that baseline with the same Tauri public key and Authenticode publisher
+as the candidate. It does not rename or rebundle the `0.1.0` executable.
 
 For initial-release acceptance:
 
@@ -136,7 +148,7 @@ For initial-release acceptance:
 5. Confirm its updater request resolves only to:
 
    ```text
-   https://github.com/stronganchor/pusula-desktop/releases/download/v0.1.0/latest.json
+   https://github.com/stronganchor/pusula-desktop/releases/download/v0.1.0-candidate.<full-40-character-main-SHA>/latest.json
    ```
 
 6. Complete every item in `OFFLINE_ACCEPTANCE_TEST.md`, including:
@@ -160,6 +172,7 @@ When a controlled override is needed, generate it outside the repository:
 ```powershell
 .\scripts\New-CandidateUpdaterConfig.ps1 `
   -CandidateVersion '0.2.0' `
+  -CandidateTag 'v0.2.0-candidate.<full-40-character-main-SHA>' `
   -OutputPath "$env:TEMP\pusula-0.2.0-candidate.json" `
   -Force
 ```
@@ -176,20 +189,35 @@ outside the repository and calculate:
 Get-FileHash -Algorithm SHA256 -LiteralPath 'C:\secure\pusula-acceptance-evidence.json'
 ```
 
-## Promote without rebuilding
+## Publish stable without rebuilding
 
-After every acceptance item passes, run **Promote Accepted Windows Release**
-from `main` with:
+Do not merge another commit while a candidate is under acceptance. After every
+acceptance item passes, run **Publish Accepted Windows Release** from the exact
+candidate commit on `main` with:
 
 - the exact candidate version;
+- its exact immutable `v<version>-candidate.<40-character-SHA>` tag;
 - the acceptance evidence SHA-256;
 - confirmation `PROMOTE v<version>`.
 
-The promotion workflow downloads and revalidates the candidate's exact asset
-allowlist and hashes, confirms the candidate commit is in `main`, and changes
-that same prerelease into the stable/latest release. It does not rebuild or
-resign anything. Production applications then discover the already accepted
-`latest.json` through their normal updater endpoint.
+The workflow requires immutable releases to be enabled, requires the candidate
+itself to report `isImmutable=true`, and proves its tag and release target equal
+the current `main` commit. It downloads the candidate, revalidates the exact
+asset allowlist, SHA-256 values, Tauri updater signature, Authenticode
+publisher, and timestamps, then creates a new draft stable tag `v<version>` at
+that same commit. The tag is created exclusively as a lightweight ref, so a
+concurrent or pre-existing tag fails closed. It uploads the six accepted files
+byte-for-byte, then uses the read-only admin token to recheck immutable policy,
+candidate identity, both exact refs, and case-sensitive remote digests before
+the isolated write-token step publishes stable as latest. The workflow reads
+back the immutable release, tag, and exact bytes after publication. It does not
+rebuild, resign, or edit the immutable candidate.
+
+The copied stable `latest.json` intentionally keeps its updater URL pointed at
+the immutable candidate tag. The stable release serves that same manifest
+through `/releases/latest`, while the signed updater payload remains anchored to
+the exact candidate bytes exercised during acceptance. Keep both immutable
+releases permanently.
 
 If acceptance fails, leave the candidate as a prerelease, diagnose it, and
 release a strictly greater version. Never replace a published candidate asset.

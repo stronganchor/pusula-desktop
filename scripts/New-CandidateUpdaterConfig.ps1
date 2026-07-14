@@ -1,6 +1,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)][Alias('Version')][string] $CandidateVersion,
+    [Parameter(Mandatory = $true)][string] $CandidateTag,
     [string] $ApplicationVersion,
     [string] $Repository = 'stronganchor/pusula-desktop',
     [Parameter(Mandatory = $true)][string] $OutputPath,
@@ -27,11 +28,15 @@ if (-not [string]::IsNullOrWhiteSpace($ApplicationVersion)) {
 if ($Repository -notmatch '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$') {
     throw "Invalid GitHub repository name: $Repository"
 }
+$candidateTagPattern = '^v' + [regex]::Escape($CandidateVersion) + '-candidate\.[0-9a-f]{40}$'
+if ($CandidateTag -cnotmatch $candidateTagPattern) {
+    throw "Candidate tag must match v$CandidateVersion-candidate.<lowercase full Git SHA>."
+}
 if ((Test-Path -LiteralPath $OutputPath) -and -not $Force) {
     throw "Candidate updater config already exists: $OutputPath"
 }
 
-$endpoint = "https://github.com/$Repository/releases/download/v$CandidateVersion/latest.json"
+$endpoint = "https://github.com/$Repository/releases/download/$CandidateTag/latest.json"
 $config = [ordered]@{
     plugins = [ordered]@{
         updater = [ordered]@{

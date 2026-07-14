@@ -8,6 +8,10 @@ $repoRoot = Split-Path $PSScriptRoot -Parent
 $harnessScript = Join-Path $repoRoot 'scripts\Test-InvalidTauriUpdaterAcceptance.ps1'
 $runtimeHelper = Join-Path $repoRoot 'scripts\Invoke-InvalidUpdaterRuntime.mjs'
 $fixtureRoot = Join-Path $env:TEMP ('pusula-invalid-updater-test-' + [Guid]::NewGuid().ToString('N'))
+$sourceCommit = (& git -C $repoRoot rev-parse --verify HEAD).Trim().ToLowerInvariant()
+if ($LASTEXITCODE -ne 0 -or $sourceCommit -cnotmatch '^[0-9a-f]{40}$') {
+    throw 'Could not determine the exact repository source commit for harness tests.'
+}
 
 function Assert-ThrowsLike {
     param(
@@ -31,6 +35,79 @@ try {
     $node = (Get-Command node -ErrorAction Stop).Source
     & $node --check $runtimeHelper
     if ($LASTEXITCODE -ne 0) { throw 'Invalid updater runtime helper did not pass Node syntax checking.' }
+
+    $tokens = $null
+    $parseErrors = $null
+    $harnessAst = [Management.Automation.Language.Parser]::ParseFile(
+        $harnessScript,
+        [ref]$tokens,
+        [ref]$parseErrors
+    )
+    if ($parseErrors.Count -ne 0) { throw 'Invalid updater harness did not parse as PowerShell.' }
+    $harnessText = Get-Content -Raw -LiteralPath $harnessScript
+    $cleanupIndex = $harnessText.LastIndexOf("finally {", [StringComparison]::Ordinal)
+    $passEvidenceWriteIndex = $harnessText.IndexOf(
+        'Write-JsonFile -Value $evidence -Path $evidencePath',
+        [StringComparison]::Ordinal
+    )
+    if ($cleanupIndex -lt 0 -or $passEvidenceWriteIndex -le $cleanupIndex) {
+        throw 'Runtime pass evidence must be written only after fail-closed cleanup completes.'
+    }
+    foreach ($functionName in @('Stop-ExactProcess', 'Wait-LoopbackPortClosed')) {
+        $functionAst = $harnessAst.Find({
+                param($node)
+                $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+                $node.Name -ceq $functionName
+            }, $true)
+        if ($null -eq $functionAst) { throw "Harness function is missing: $functionName" }
+        . ([ScriptBlock]::Create($functionAst.Extent.Text))
+    }
+
+    $sleepProcess = Start-Process -FilePath 'powershell.exe' `
+        -ArgumentList @('-NoProfile', '-Command', 'Start-Sleep -Seconds 30') `
+        -WindowStyle Hidden `
+        -PassThru
+    try {
+        $stopProblem = Stop-ExactProcess -Process $sleepProcess -Label 'test child'
+        if ($stopProblem) { throw "Exact-process cleanup unexpectedly failed: $stopProblem" }
+        $sleepProcess.Refresh()
+        if (-not $sleepProcess.HasExited) { throw 'Exact-process cleanup returned success for a live process.' }
+    }
+    finally {
+        if (-not $sleepProcess.HasExited) { Stop-Process -Id $sleepProcess.Id -Force -ErrorAction SilentlyContinue }
+        $sleepProcess.Dispose()
+    }
+
+    $disposedProcess = Start-Process -FilePath 'powershell.exe' `
+        -ArgumentList @('-NoProfile', '-Command', 'Start-Sleep -Seconds 30') `
+        -WindowStyle Hidden `
+        -PassThru
+    $disposedProcessId = $disposedProcess.Id
+    try {
+        $disposedProcess.Dispose()
+        $stopProblem = Stop-ExactProcess -Process $disposedProcess -Label 'disposed test child'
+        if ([string]::IsNullOrWhiteSpace([string]$stopProblem)) {
+            throw 'Exact-process cleanup suppressed a process-inspection failure.'
+        }
+    }
+    finally {
+        Stop-Process -Id $disposedProcessId -Force -ErrorAction SilentlyContinue
+    }
+
+    $portListener = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, 0)
+    $portListener.Start()
+    $occupiedPort = ([Net.IPEndPoint]$portListener.LocalEndpoint).Port
+    try {
+        if (-not (Wait-LoopbackPortClosed -Port $occupiedPort -AttemptCount 1 -DelayMilliseconds 1)) {
+            throw 'Loopback-port cleanup check returned success while the port was listening.'
+        }
+    }
+    finally {
+        $portListener.Stop()
+    }
+    if (Wait-LoopbackPortClosed -Port $occupiedPort -AttemptCount 2 -DelayMilliseconds 1) {
+        throw 'Loopback-port cleanup check did not accept a closed port.'
+    }
 
     [IO.Directory]::CreateDirectory($fixtureRoot) | Out-Null
     $artifactPath = Join-Path $fixtureRoot 'Pusula_0.1.0_x64-setup.exe'
@@ -77,6 +154,7 @@ exit /b 0
         -SignaturePath $signaturePath `
         -CandidateVersion '0.1.0' `
         -HarnessVersion '0.0.9' `
+        -ExpectedSourceCommit $sourceCommit `
         -MinisignPath $fakeMinisignPath `
         -OutputDirectory $outputPath `
         -TauriConfigPath $configPath `
@@ -116,6 +194,11 @@ exit /b 0
     if ([string]$evidence.result -cne 'preparation-only' -or [bool]$evidence.runtime_executed) {
         throw 'Preparation-only evidence must not claim a runtime acceptance pass.'
     }
+    if ([string]$evidence.source_commit -cne $sourceCommit -or
+        [string]$evidence.expected_source_commit -cne $sourceCommit -or
+        [string]$evidence.source_clean_check -cne 'runtime-only') {
+        throw 'Preparation evidence is not bound to the expected repository source commit.'
+    }
     if (-not [bool]$evidence.candidate_unchanged -or
         -not [bool]$evidence.signature_unchanged -or
         [string]$evidence.original_signature_verification -cne 'accepted' -or
@@ -135,6 +218,7 @@ exit /b 0
             -SignaturePath $signaturePath `
             -CandidateVersion '0.1.0' `
             -HarnessVersion '0.0.9' `
+            -ExpectedSourceCommit $sourceCommit `
             -MinisignPath $fakeMinisignPath `
             -OutputDirectory $insideRepoOutput `
             -TauriConfigPath $configPath `
@@ -150,6 +234,7 @@ exit /b 0
             -SignaturePath $signaturePath `
             -CandidateVersion '0.1.0' `
             -HarnessVersion '0.1.0' `
+            -ExpectedSourceCommit $sourceCommit `
             -MinisignPath $fakeMinisignPath `
             -OutputDirectory (Join-Path $fixtureRoot 'bad-version') `
             -TauriConfigPath $configPath `
@@ -162,9 +247,24 @@ exit /b 0
             -SignaturePath $signaturePath `
             -CandidateVersion '0.1.0' `
             -HarnessVersion '0.0.9' `
+            -ExpectedSourceCommit $sourceCommit `
             -MinisignPath $fakeMinisignPath `
             -OutputDirectory (Join-Path $fixtureRoot 'custom-runtime-config') `
             -TauriConfigPath $configPath
+    }
+
+    $wrongSourceCommit = '0000000000000000000000000000000000000000'
+    Assert-ThrowsLike -Pattern '*does not match expected source commit*' -Action {
+        & $harnessScript `
+            -ArtifactPath $artifactPath `
+            -SignaturePath $signaturePath `
+            -CandidateVersion '0.1.0' `
+            -HarnessVersion '0.0.9' `
+            -ExpectedSourceCommit $wrongSourceCommit `
+            -MinisignPath $fakeMinisignPath `
+            -OutputDirectory (Join-Path $fixtureRoot 'wrong-source') `
+            -TauriConfigPath $configPath `
+            -PreparationOnly
     }
 }
 finally {

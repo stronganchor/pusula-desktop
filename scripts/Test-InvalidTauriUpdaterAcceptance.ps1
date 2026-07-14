@@ -4,6 +4,9 @@ param(
     [Parameter(Mandatory = $true)][string] $SignaturePath,
     [Parameter(Mandatory = $true)][string] $CandidateVersion,
     [Parameter(Mandatory = $true)][string] $HarnessVersion,
+    [Parameter(Mandatory = $true)]
+    [ValidatePattern('^[0-9a-fA-F]{40}$')]
+    [string] $ExpectedSourceCommit,
     [Parameter(Mandatory = $true)][string] $MinisignPath,
     [Parameter(Mandatory = $true)][string] $OutputDirectory,
     [string] $TauriConfigPath,
@@ -36,17 +39,79 @@ function Get-AvailableLoopbackPort {
 }
 
 function Stop-ExactProcess {
-    param([Diagnostics.Process] $Process)
-    if ($null -eq $Process) { return }
+    param(
+        [Diagnostics.Process] $Process,
+        [Parameter(Mandatory = $true)][string] $Label
+    )
+    if ($null -eq $Process) { return $null }
     try {
+        $processId = $Process.Id
+        $Process.Refresh()
         if (-not $Process.HasExited) {
             $Process.Kill()
-            $Process.WaitForExit(10000) | Out-Null
+            if (-not $Process.WaitForExit(10000)) {
+                return "$Label process $processId did not exit within 10 seconds after termination."
+            }
         }
+        $Process.Refresh()
+        if (-not $Process.HasExited) {
+            return "$Label process $processId is still running after termination."
+        }
+        return $null
     }
     catch {
-        Write-Warning "Could not stop isolated harness process $($Process.Id): $($_.Exception.Message)"
+        return "$Label process could not be confirmed stopped: $($_.Exception.Message)"
     }
+}
+
+function Wait-LoopbackPortClosed {
+    param(
+        [Parameter(Mandatory = $true)][ValidateRange(1, 65535)][int] $Port,
+        [ValidateRange(1, 100)][int] $AttemptCount = 50,
+        [ValidateRange(1, 1000)][int] $DelayMilliseconds = 100
+    )
+
+    for ($attempt = 0; $attempt -lt $AttemptCount; $attempt += 1) {
+        try {
+            $listenerStillOpen = @(
+                [Net.NetworkInformation.IPGlobalProperties]::GetIPGlobalProperties().GetActiveTcpListeners() |
+                    Where-Object { $_.Port -eq $Port }
+            ).Count -gt 0
+        }
+        catch {
+            return "Could not verify that loopback port $Port closed: $($_.Exception.Message)"
+        }
+        if (-not $listenerStillOpen) { return $null }
+        Start-Sleep -Milliseconds $DelayMilliseconds
+    }
+    return "Loopback port $Port remained open after harness process cleanup."
+}
+
+function Invoke-GitRead {
+    param([Parameter(Mandatory = $true)][string[]] $ArgumentList)
+
+    $output = @(& git -C $repoRoot @ArgumentList 2>&1)
+    if ($LASTEXITCODE -ne 0) {
+        throw "Git source verification failed: $($output -join ' ')"
+    }
+    return (($output -join "`n").Trim())
+}
+
+function Assert-ExpectedCleanSource {
+    param(
+        [Parameter(Mandatory = $true)][string] $ExpectedCommit,
+        [Parameter(Mandatory = $true)][string] $Phase
+    )
+
+    $actualCommit = (Invoke-GitRead -ArgumentList @('rev-parse', '--verify', 'HEAD')).ToLowerInvariant()
+    if ($actualCommit -cne $ExpectedCommit.ToLowerInvariant()) {
+        throw "Repository HEAD $actualCommit does not match expected source commit $ExpectedCommit during $Phase."
+    }
+    $status = Invoke-GitRead -ArgumentList @('status', '--porcelain=v1', '--untracked-files=all')
+    if (-not [string]::IsNullOrWhiteSpace($status)) {
+        throw "Repository source is not clean during $Phase.`n$status"
+    }
+    return $actualCommit
 }
 
 function Start-ArgumentProcess {
@@ -111,6 +176,12 @@ if ($null -ne $parsedCandidate.Prerelease -or $null -ne $parsedHarness.Prereleas
 if ((Compare-StrictSemVer -Left $HarnessVersion -Right $CandidateVersion) -ge 0) {
     throw 'The isolated harness version must be lower than the candidate so the updater offers it.'
 }
+$ExpectedSourceCommit = $ExpectedSourceCommit.ToLowerInvariant()
+$sourceCommit = (Invoke-GitRead -ArgumentList @('rev-parse', '--verify', 'HEAD')).ToLowerInvariant()
+if ($sourceCommit -cne $ExpectedSourceCommit) {
+    throw "Repository HEAD $sourceCommit does not match expected source commit $ExpectedSourceCommit."
+}
+& (Join-Path $PSScriptRoot 'Test-VersionConsistency.ps1') -ExpectedVersion $CandidateVersion | Out-Host
 
 $artifact = (Resolve-Path -LiteralPath $ArtifactPath -ErrorAction Stop).Path
 $signature = (Resolve-Path -LiteralPath $SignaturePath -ErrorAction Stop).Path
@@ -302,6 +373,9 @@ try {
             schema_version = 1
             result = 'preparation-only'
             runtime_executed = $false
+            source_commit = $sourceCommit
+            expected_source_commit = $ExpectedSourceCommit
+            source_clean_check = 'runtime-only'
             candidate_version = $CandidateVersion
             harness_version = $HarnessVersion
             candidate_artifact = $expectedArtifactName
@@ -327,6 +401,9 @@ try {
 
     $node = (Get-Command node -ErrorAction Stop).Source
     $npm = (Get-Command npm.cmd -ErrorAction Stop).Source
+    $sourceCommit = Assert-ExpectedCleanSource `
+        -ExpectedCommit $ExpectedSourceCommit `
+        -Phase 'before the isolated runtime build'
     $oldCargoTarget = $env:CARGO_TARGET_DIR
     try {
         $env:CARGO_TARGET_DIR = $cargoTarget
@@ -410,12 +487,21 @@ try {
     if ((Get-FileHash -Algorithm SHA256 -LiteralPath $tauriConfig).Hash.ToLowerInvariant() -cne $tauriConfigHash) {
         throw 'The production Tauri configuration changed during the runtime rejection test.'
     }
+    $sourceCommitAfterRuntime = Assert-ExpectedCleanSource `
+        -ExpectedCommit $ExpectedSourceCommit `
+        -Phase 'after the isolated runtime test'
+    if ($sourceCommitAfterRuntime -cne $sourceCommit) {
+        throw 'The repository source commit changed during the runtime rejection test.'
+    }
 
     $evidence = [ordered]@{
         schema_version = 1
         test = 'tauri-invalid-signature-rejection'
         result = 'pass'
         completed_at_utc = [DateTimeOffset]::UtcNow.ToString('o')
+        source_commit = $sourceCommit
+        expected_source_commit = $ExpectedSourceCommit
+        source_clean = $true
         candidate_version = $CandidateVersion
         harness_version = $HarnessVersion
         candidate_artifact = $expectedArtifactName
@@ -438,18 +524,23 @@ try {
         production_configuration_modified = $false
         installer_created_or_run = $false
     }
-    Write-JsonFile -Value $evidence -Path $evidencePath
-    $evidenceHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $evidencePath).Hash.ToLowerInvariant()
     $completed = $true
-    Write-Output "Invalid Tauri updater signature rejected before confirmation."
-    Write-Output "Evidence: $evidencePath"
-    Write-Output "Evidence SHA-256: $evidenceHash"
 }
 finally {
-    Stop-ExactProcess -Process $appProcess
-    Stop-ExactProcess -Process $serverProcess
-
     $cleanupProblems = @()
+
+    if ($null -ne $appProcess) {
+        $cleanupProblem = Stop-ExactProcess -Process $appProcess -Label 'isolated app'
+        if ($cleanupProblem) { $cleanupProblems += $cleanupProblem }
+        $cleanupProblem = Wait-LoopbackPortClosed -Port $DebugPort
+        if ($cleanupProblem) { $cleanupProblems += $cleanupProblem }
+    }
+    if ($null -ne $serverProcess) {
+        $cleanupProblem = Stop-ExactProcess -Process $serverProcess -Label 'loopback updater server'
+        if ($cleanupProblem) { $cleanupProblems += $cleanupProblem }
+        $cleanupProblem = Wait-LoopbackPortClosed -Port $Port
+        if ($cleanupProblem) { $cleanupProblems += $cleanupProblem }
+    }
 
     if ($identifier.StartsWith('com.stronganchor.pusula.invalid-signature-test.', [StringComparison]::Ordinal) -and
         (Test-Path -LiteralPath $isolatedDataPath)) {
@@ -476,16 +567,23 @@ finally {
         if ($cleanupProblem) { $cleanupProblems += $cleanupProblem }
     }
     if ($cleanupProblems.Count -gt 0) {
-        if ($completed) {
-            Remove-Item -LiteralPath $evidencePath -Force -ErrorAction SilentlyContinue
+        if ($completed -and (Test-Path -LiteralPath $output)) {
             $cleanupFailurePath = Join-Path $output 'invalid-signature-cleanup-failure.txt'
             [IO.File]::WriteAllText(
                 $cleanupFailurePath,
                 "INVALID-SIGNATURE HARNESS DID NOT PASS CLEANUP`r`n$($cleanupProblems -join "`r`n")`r`n",
                 [Text.UTF8Encoding]::new($false)
             )
-            throw "The invalid-signature test reached rejection but could not remove all non-distributable files: $($cleanupProblems -join '; ')"
         }
-        Write-Warning "Invalid-signature harness cleanup was incomplete: $($cleanupProblems -join '; ')"
+        $completed = $false
+        throw "Invalid-signature harness cleanup failed: $($cleanupProblems -join '; ')"
     }
+}
+
+if ($completed) {
+    Write-JsonFile -Value $evidence -Path $evidencePath
+    $evidenceHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $evidencePath).Hash.ToLowerInvariant()
+    Write-Output 'Invalid Tauri updater signature rejected before confirmation.'
+    Write-Output "Evidence: $evidencePath"
+    Write-Output "Evidence SHA-256: $evidenceHash"
 }

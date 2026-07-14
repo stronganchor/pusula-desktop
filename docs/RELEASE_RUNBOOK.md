@@ -202,6 +202,12 @@ updater public key, enables an insecure production transport option, installs
 the changed executable, or writes to an external service. The generated app,
 payload, local manifest, and isolated app data are deleted automatically; keep
 and hash only `invalid-signature-evidence.json`.
+The harness requires the candidate's full 40-character source commit, verifies
+that exact clean `HEAD` before and after the runtime test, and records it in the
+pass evidence. Its unique application identifier also gives it a separate
+Windows Credential Manager service, so it cannot reuse the production backup
+token. Process cleanup and both loopback ports are fail-closed: cleanup failure
+prevents pass evidence from being written.
 
 Record only non-sensitive evidence. Save its final evidence JSON or worksheet
 outside the repository and calculate:

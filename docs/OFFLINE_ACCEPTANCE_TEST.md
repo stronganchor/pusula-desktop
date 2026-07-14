@@ -52,6 +52,10 @@ Disable Wi-Fi and Ethernet and confirm Windows has no route to the internet.
   be replayed.
 - [ ] Reconnect the network; the desktop uploads ciphertext directly through a
   short-lived single-object URL and reports server confirmation.
+- [ ] On a network where the direct B2 TLS connection fails before any HTTP
+  response, the desktop retries the same backup ID through the authenticated
+  gateway relay; B2 receives only the existing `.age` ciphertext, the gateway
+  spool is empty afterward, and a B2 HTTP rejection does not trigger the relay.
 - [ ] The gateway and B2 metadata agree on ciphertext size and SHA-256.
 - [ ] Restore that object into a clean test profile using the recovery runbook;
   SQLite integrity, row counts, and financial totals match the source.
@@ -76,6 +80,7 @@ For the initial `0.0.9` to `0.1.0` acceptance test:
 
 ```powershell
 $assetDirectory = 'C:\secure\pusula-0.1.0-candidate'
+$expectedSourceCommit = '<full-40-character-candidate-source-SHA>'
 $harnessOutput = Join-Path $env:TEMP `
   ('pusula-invalid-signature-' + [Guid]::NewGuid().ToString('N'))
 
@@ -84,6 +89,7 @@ $harnessOutput = Join-Path $env:TEMP `
   -SignaturePath (Join-Path $assetDirectory 'Pusula_0.1.0_x64-setup.exe.sig') `
   -CandidateVersion '0.1.0' `
   -HarnessVersion '0.0.9' `
+  -ExpectedSourceCommit $expectedSourceCommit `
   -MinisignPath 'C:\secure\minisign-0.12\minisign.exe' `
   -OutputDirectory $harnessOutput
 ```
@@ -95,6 +101,9 @@ builds a no-bundle debug app with a unique application identifier, inheriting
 the production updater public key. The only override is a generated loopback
 manifest endpoint. Debug mode permits that local HTTP endpoint without adding
 any dangerous transport or certificate option to production configuration.
+The unique identifier also selects a unique Windows Credential Manager service
+named `<isolated-identifier>.backup`, so the harness cannot load the production
+backup token or contact the backup gateway as an enrolled device.
 
 The isolated app fetches the local manifest and changed payload. The drill
 passes only when the real app updater reports failure during its
@@ -105,6 +114,8 @@ debug build, manifest, and executable copy, and leaves only
 
 ```text
 result: pass
+source_commit: <full-40-character-candidate-source-SHA>
+source_clean: true
 candidate_unchanged: true
 signature_unchanged: true
 original_signature_verification: accepted

@@ -56,6 +56,7 @@ try {
     foreach ($functionName in @(
             'Stop-ExactProcess',
             'Wait-LoopbackPortClosed',
+            'Start-ArgumentProcess',
             'Invoke-GitRead',
             'Invoke-GitQuietDiff',
             'Resolve-RequiredExecutable',
@@ -114,6 +115,24 @@ try {
     }
     if (Wait-LoopbackPortClosed -Port $occupiedPort -AttemptCount 2 -DelayMilliseconds 1) {
         throw 'Loopback-port cleanup check did not accept a closed port.'
+    }
+
+    $noArgumentProcess = Start-ArgumentProcess `
+        -FilePath (Get-Command 'whoami.exe' -ErrorAction Stop).Source `
+        -ArgumentList @() `
+        -WorkingDirectory $repoRoot
+    try {
+        if (-not $noArgumentProcess.WaitForExit(10000)) {
+            throw 'Zero-argument child-process regression fixture did not exit.'
+        }
+        if ($noArgumentProcess.ExitCode -ne 0) {
+            throw "Zero-argument child-process regression fixture exited $($noArgumentProcess.ExitCode)."
+        }
+    }
+    finally {
+        $stopProblem = Stop-ExactProcess -Process $noArgumentProcess -Label 'zero-argument test child'
+        if ($stopProblem) { throw "Zero-argument child cleanup failed: $stopProblem" }
+        $noArgumentProcess.Dispose()
     }
 
     $preferredCargo = Join-Path $env:USERPROFILE '.cargo\bin\cargo.exe'

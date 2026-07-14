@@ -158,7 +158,7 @@ function Assert-ExpectedCleanSource {
 function Start-ArgumentProcess {
     param(
         [Parameter(Mandatory = $true)][string] $FilePath,
-        [Parameter(Mandatory = $true)][string[]] $ArgumentList,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]] $ArgumentList,
         [string] $WorkingDirectory,
         [hashtable] $Environment = @{}
     )

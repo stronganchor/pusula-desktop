@@ -8,8 +8,9 @@ use url::Url;
 
 use crate::{
     db::{
-        mark_modified, read_business_profile, validate_iso_date, validate_profile,
-        write_business_profile, Database, MAX_SAFE_JS_INTEGER,
+        contact_text_is_empty, mark_modified, normalize_sale_request_key, read_business_profile,
+        validate_contact_text, validate_customer_text, validate_iso_date, validate_profile,
+        validate_sale_description, write_business_profile, Database, MAX_SAFE_JS_INTEGER,
     },
     error::{AppError, AppResult},
     models::BusinessProfile,
@@ -363,15 +364,11 @@ impl Database {
     fn create_customer(&self, body: &Value) -> AppResult<Value> {
         let body = object(body)?;
         let name = text_field(body, "name").unwrap_or_default();
-        if name.is_empty() {
-            return Err(AppError::user("Müşteri adı zorunludur."));
-        }
-        validate_text_length("Müşteri adı", &name, 120)?;
         let phone = text_field(body, "phone").unwrap_or_default();
         let address = text_field(body, "address").unwrap_or_default();
         let work_address = text_field(body, "work_address").unwrap_or_default();
         let notes = text_field(body, "notes").unwrap_or_default();
-        validate_customer_text(&phone, &address, &work_address, &notes)?;
+        validate_customer_text(&name, &phone, &address, &work_address, &notes)?;
         let registration_date = require_date(
             text_field(body, "registration_date"),
             true,
@@ -454,11 +451,7 @@ impl Database {
         let address = text_field(body, "address").unwrap_or(current.2);
         let work_address = text_field(body, "work_address").unwrap_or(current.3);
         let notes = text_field(body, "notes").unwrap_or(current.4);
-        if name.is_empty() {
-            return Err(AppError::user("Müşteri adı zorunludur."));
-        }
-        validate_text_length("Müşteri adı", &name, 120)?;
-        validate_customer_text(&phone, &address, &work_address, &notes)?;
+        validate_customer_text(&name, &phone, &address, &work_address, &notes)?;
 
         transaction.execute(
             "UPDATE customers SET name = ?, phone = ?, address = ?, work_address = ?, notes = ? WHERE id = ?",
@@ -686,25 +679,6 @@ fn ensure_customer_exists(connection: &Connection, customer_id: i64) -> AppResul
     Ok(())
 }
 
-fn validate_text_length(label: &str, value: &str, max: usize) -> AppResult<()> {
-    if value.chars().count() > max {
-        return Err(AppError::user(format!("{label} çok uzun.")));
-    }
-    Ok(())
-}
-
-fn validate_customer_text(
-    phone: &str,
-    address: &str,
-    work_address: &str,
-    notes: &str,
-) -> AppResult<()> {
-    validate_text_length("Telefon", phone, 30)?;
-    validate_text_length("Adres", address, 255)?;
-    validate_text_length("İş adresi", work_address, 255)?;
-    validate_text_length("Notlar", notes, 10_000)
-}
-
 fn normalize_contacts(value: &Value) -> AppResult<Vec<ContactInput>> {
     let rows = value
         .as_array()
@@ -727,11 +701,12 @@ fn normalize_contact(value: &Value) -> AppResult<Option<ContactInput>> {
     contact.home_address = contact.home_address.trim().to_owned();
     contact.work_address = contact.work_address.trim().to_owned();
     validate_contact(&contact)?;
-    if contact.name.is_empty()
-        && contact.phone.is_empty()
-        && contact.home_address.is_empty()
-        && contact.work_address.is_empty()
-    {
+    if contact_text_is_empty(
+        &contact.name,
+        &contact.phone,
+        &contact.home_address,
+        &contact.work_address,
+    ) {
         Ok(None)
     } else {
         Ok(Some(contact))
@@ -739,10 +714,12 @@ fn normalize_contact(value: &Value) -> AppResult<Option<ContactInput>> {
 }
 
 fn validate_contact(contact: &ContactInput) -> AppResult<()> {
-    validate_text_length("İletişim adı", &contact.name, 120)?;
-    validate_text_length("İletişim telefonu", &contact.phone, 30)?;
-    validate_text_length("Ev adresi", &contact.home_address, 255)?;
-    validate_text_length("İş adresi", &contact.work_address, 255)
+    validate_contact_text(
+        &contact.name,
+        &contact.phone,
+        &contact.home_address,
+        &contact.work_address,
+    )
 }
 
 fn replace_contacts_tx(
@@ -847,10 +824,9 @@ impl Database {
             return Err(AppError::user("Satış tutarı sıfırdan büyük olmalıdır."));
         }
         let description = text_field(body, "description").unwrap_or_default();
-        validate_text_length("Satış açıklaması", &description, 10_000)?;
-        let request_key = text_field(body, "request_key")
-            .map(|value| sanitize_request_key(&value))
-            .filter(|value| !value.is_empty());
+        validate_sale_description(&description)?;
+        let request_key =
+            text_field(body, "request_key").and_then(|value| normalize_sale_request_key(&value));
         let bundled = body.contains_key("installments");
         let installments = prepare_sale_installments(body, total_kurus)?;
 
@@ -921,7 +897,7 @@ impl Database {
             ));
         }
         let description = text_field(body, "description").unwrap_or(current.3);
-        validate_text_length("Satış açıklaması", &description, 10_000)?;
+        validate_sale_description(&description)?;
 
         transaction.execute(
             "UPDATE sales SET customer_id = ?, date = ?, total_kurus = ?, description = ? WHERE id = ?",
@@ -1013,14 +989,6 @@ fn sum_json_money(rows: &[Value], key: &str) -> AppResult<i64> {
         sum.checked_add(amount)
             .ok_or_else(|| AppError::user("Para toplamı desteklenen aralığı aşıyor."))
     })
-}
-
-fn sanitize_request_key(value: &str) -> String {
-    value
-        .chars()
-        .filter(|character| character.is_ascii_alphanumeric() || "_.:-".contains(*character))
-        .take(64)
-        .collect()
 }
 
 fn prepare_sale_installments(

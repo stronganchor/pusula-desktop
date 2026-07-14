@@ -23,6 +23,72 @@ pub const SCHEMA_VERSION: i32 = 1;
 pub const EXPORT_FORMAT_VERSION: u32 = 1;
 pub(crate) const MAX_SAFE_JS_INTEGER: i64 = 9_007_199_254_740_991;
 
+const CUSTOMER_NAME_MAX_CHARS: usize = 120;
+const PHONE_MAX_CHARS: usize = 30;
+const ADDRESS_MAX_CHARS: usize = 255;
+const NOTES_MAX_CHARS: usize = 10_000;
+const SALE_DESCRIPTION_MAX_CHARS: usize = 10_000;
+const SALE_REQUEST_KEY_MAX_CHARS: usize = 64;
+
+fn validate_text_length(label: &str, value: &str, max: usize) -> AppResult<()> {
+    if value.chars().count() > max {
+        return Err(AppError::user(format!("{label} çok uzun.")));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_customer_text(
+    name: &str,
+    phone: &str,
+    address: &str,
+    work_address: &str,
+    notes: &str,
+) -> AppResult<()> {
+    if name.is_empty() {
+        return Err(AppError::user("Müşteri adı zorunludur."));
+    }
+    validate_text_length("Müşteri adı", name, CUSTOMER_NAME_MAX_CHARS)?;
+    validate_text_length("Telefon", phone, PHONE_MAX_CHARS)?;
+    validate_text_length("Adres", address, ADDRESS_MAX_CHARS)?;
+    validate_text_length("İş adresi", work_address, ADDRESS_MAX_CHARS)?;
+    validate_text_length("Notlar", notes, NOTES_MAX_CHARS)
+}
+
+pub(crate) fn validate_contact_text(
+    name: &str,
+    phone: &str,
+    home_address: &str,
+    work_address: &str,
+) -> AppResult<()> {
+    validate_text_length("İletişim adı", name, CUSTOMER_NAME_MAX_CHARS)?;
+    validate_text_length("İletişim telefonu", phone, PHONE_MAX_CHARS)?;
+    validate_text_length("Ev adresi", home_address, ADDRESS_MAX_CHARS)?;
+    validate_text_length("İş adresi", work_address, ADDRESS_MAX_CHARS)
+}
+
+pub(crate) fn contact_text_is_empty(
+    name: &str,
+    phone: &str,
+    home_address: &str,
+    work_address: &str,
+) -> bool {
+    name.is_empty() && phone.is_empty() && home_address.is_empty() && work_address.is_empty()
+}
+
+pub(crate) fn validate_sale_description(description: &str) -> AppResult<()> {
+    validate_text_length("Satış açıklaması", description, SALE_DESCRIPTION_MAX_CHARS)
+}
+
+pub(crate) fn normalize_sale_request_key(value: &str) -> Option<String> {
+    let normalized: String = value
+        .trim()
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric() || "_.:-".contains(*character))
+        .take(SALE_REQUEST_KEY_MAX_CHARS)
+        .collect();
+    (!normalized.is_empty()).then_some(normalized)
+}
+
 const MIGRATION_1: &str = r#"
 CREATE TABLE business_profile (
     id              INTEGER PRIMARY KEY CHECK (id = 1),
@@ -242,7 +308,7 @@ impl Database {
         Ok(bundle)
     }
 
-    pub fn import_data(&self, bundle: ExportBundle, replace: bool) -> AppResult<ImportSummary> {
+    pub fn import_data(&self, mut bundle: ExportBundle, replace: bool) -> AppResult<ImportSummary> {
         validate_bundle(&bundle)?;
         let summary = ImportSummary {
             replaced: replace,
@@ -250,6 +316,7 @@ impl Database {
             totals: bundle.manifest.totals.clone(),
             sha256: bundle.manifest.sha256.clone(),
         };
+        normalize_import_text(&mut bundle);
         let serialized_summary = serde_json::to_string(&summary)?;
         let mut connection = self.connect()?;
         let transaction = connection.transaction()?;
@@ -739,9 +806,13 @@ fn validate_bundle(bundle: &ExportBundle) -> AppResult<()> {
     let mut customer_ids = HashSet::new();
     for row in &bundle.customers {
         require_unique_positive_id(row.id, &mut customer_ids, "müşteri")?;
-        if row.name.trim().is_empty() {
-            return Err(AppError::user("Aktarımda adı boş müşteri var."));
-        }
+        validate_customer_text(
+            row.name.trim(),
+            row.phone.trim(),
+            row.address.trim(),
+            row.work_address.trim(),
+            row.notes.trim(),
+        )?;
         validate_iso_date(&row.registration_date, "Müşteri kayıt tarihi")?;
     }
 
@@ -753,6 +824,14 @@ fn validate_bundle(bundle: &ExportBundle) -> AppResult<()> {
                 "İletişim kaydı {} bilinmeyen müşteriye bağlı.",
                 row.id
             )));
+        }
+        let name = row.name.trim();
+        let phone = row.phone.trim();
+        let home_address = row.home_address.trim();
+        let work_address = row.work_address.trim();
+        validate_contact_text(name, phone, home_address, work_address)?;
+        if contact_text_is_empty(name, phone, home_address, work_address) {
+            return Err(AppError::user("Boş iletişim kaydı oluşturulamaz."));
         }
     }
 
@@ -772,8 +851,13 @@ fn validate_bundle(bundle: &ExportBundle) -> AppResult<()> {
                 "Satış tutarı güvenli uygulama aralığında olmalıdır.",
             ));
         }
-        if let Some(key) = row.request_key.as_deref() {
-            if key.len() > 64 || !request_keys.insert(key.to_owned()) {
+        validate_sale_description(row.description.trim())?;
+        if let Some(key) = row
+            .request_key
+            .as_deref()
+            .and_then(normalize_sale_request_key)
+        {
+            if !request_keys.insert(key) {
                 return Err(AppError::user(
                     "Geçersiz veya yinelenen satış istek anahtarı.",
                 ));
@@ -842,6 +926,33 @@ fn validate_bundle(bundle: &ExportBundle) -> AppResult<()> {
     Ok(())
 }
 
+fn normalize_import_text(bundle: &mut ExportBundle) {
+    fn trim(value: &mut String) {
+        *value = value.trim().to_owned();
+    }
+
+    for row in &mut bundle.customers {
+        trim(&mut row.name);
+        trim(&mut row.phone);
+        trim(&mut row.address);
+        trim(&mut row.work_address);
+        trim(&mut row.notes);
+    }
+    for row in &mut bundle.contacts {
+        trim(&mut row.name);
+        trim(&mut row.phone);
+        trim(&mut row.home_address);
+        trim(&mut row.work_address);
+    }
+    for row in &mut bundle.sales {
+        trim(&mut row.description);
+        row.request_key = row
+            .request_key
+            .as_deref()
+            .and_then(normalize_sale_request_key);
+    }
+}
+
 fn require_unique_positive_id(id: i64, ids: &mut HashSet<i64>, record_name: &str) -> AppResult<()> {
     if id <= 0 || id > MAX_SAFE_JS_INTEGER || !ids.insert(id) {
         return Err(AppError::user(format!(
@@ -896,6 +1007,86 @@ mod tests {
         (directory, database)
     }
 
+    fn wordpress_fixture() -> ExportBundle {
+        serde_json::from_str(include_str!("../../tests/fixtures/pusula-lite-v1.json")).unwrap()
+    }
+
+    fn refresh_checksum(bundle: &mut ExportBundle) {
+        bundle.manifest.sha256 = bundle_checksum(bundle).unwrap();
+    }
+
+    struct ImportedTextCase {
+        name: &'static str,
+        max_chars: usize,
+        expected_error: &'static str,
+        set: fn(&mut ExportBundle, String),
+    }
+
+    fn imported_text_cases() -> Vec<ImportedTextCase> {
+        vec![
+            ImportedTextCase {
+                name: "customer name",
+                max_chars: CUSTOMER_NAME_MAX_CHARS,
+                expected_error: "Müşteri adı çok uzun.",
+                set: |bundle, value| bundle.customers[0].name = value,
+            },
+            ImportedTextCase {
+                name: "customer phone",
+                max_chars: PHONE_MAX_CHARS,
+                expected_error: "Telefon çok uzun.",
+                set: |bundle, value| bundle.customers[0].phone = value,
+            },
+            ImportedTextCase {
+                name: "customer address",
+                max_chars: ADDRESS_MAX_CHARS,
+                expected_error: "Adres çok uzun.",
+                set: |bundle, value| bundle.customers[0].address = value,
+            },
+            ImportedTextCase {
+                name: "customer work address",
+                max_chars: ADDRESS_MAX_CHARS,
+                expected_error: "İş adresi çok uzun.",
+                set: |bundle, value| bundle.customers[0].work_address = value,
+            },
+            ImportedTextCase {
+                name: "customer notes",
+                max_chars: NOTES_MAX_CHARS,
+                expected_error: "Notlar çok uzun.",
+                set: |bundle, value| bundle.customers[0].notes = value,
+            },
+            ImportedTextCase {
+                name: "contact name",
+                max_chars: CUSTOMER_NAME_MAX_CHARS,
+                expected_error: "İletişim adı çok uzun.",
+                set: |bundle, value| bundle.contacts[0].name = value,
+            },
+            ImportedTextCase {
+                name: "contact phone",
+                max_chars: PHONE_MAX_CHARS,
+                expected_error: "İletişim telefonu çok uzun.",
+                set: |bundle, value| bundle.contacts[0].phone = value,
+            },
+            ImportedTextCase {
+                name: "contact home address",
+                max_chars: ADDRESS_MAX_CHARS,
+                expected_error: "Ev adresi çok uzun.",
+                set: |bundle, value| bundle.contacts[0].home_address = value,
+            },
+            ImportedTextCase {
+                name: "contact work address",
+                max_chars: ADDRESS_MAX_CHARS,
+                expected_error: "İş adresi çok uzun.",
+                set: |bundle, value| bundle.contacts[0].work_address = value,
+            },
+            ImportedTextCase {
+                name: "sale description",
+                max_chars: SALE_DESCRIPTION_MAX_CHARS,
+                expected_error: "Satış açıklaması çok uzun.",
+                set: |bundle, value| bundle.sales[0].description = value,
+            },
+        ]
+    }
+
     #[test]
     fn initializes_schema_with_integrity_guards() {
         let (_directory, database) = test_database();
@@ -914,6 +1105,126 @@ mod tests {
             .pragma_query_value(None, "foreign_keys", |row| row.get(0))
             .unwrap();
         assert_eq!(foreign_keys, 1);
+    }
+
+    #[test]
+    fn imported_text_accepts_api_boundaries_and_rejects_every_over_limit_field() {
+        for case in imported_text_cases() {
+            let mut boundary = wordpress_fixture();
+            (case.set)(&mut boundary, "ş".repeat(case.max_chars));
+            refresh_checksum(&mut boundary);
+            assert!(
+                validate_bundle(&boundary).is_ok(),
+                "{} should accept exactly {} characters",
+                case.name,
+                case.max_chars
+            );
+
+            let mut over_limit = wordpress_fixture();
+            (case.set)(&mut over_limit, "ş".repeat(case.max_chars + 1));
+            refresh_checksum(&mut over_limit);
+            let error = validate_bundle(&over_limit).unwrap_err().to_string();
+            assert_eq!(error, case.expected_error, "{}", case.name);
+        }
+    }
+
+    #[test]
+    fn import_normalizes_free_text_and_request_keys_like_api_writes() {
+        let mut bundle = wordpress_fixture();
+        let customer_id = bundle.customers[0].id;
+        let contact_id = bundle.contacts[0].id;
+        let sale_id = bundle.sales[0].id;
+        bundle.customers[0].name = "  Müşteri  ".to_owned();
+        bundle.customers[0].phone = "  555  ".to_owned();
+        bundle.customers[0].address = "  Ev  ".to_owned();
+        bundle.customers[0].work_address = "  İş  ".to_owned();
+        bundle.customers[0].notes = "  Not  ".to_owned();
+        bundle.contacts[0].name = "  Yakın  ".to_owned();
+        bundle.contacts[0].phone = "  123  ".to_owned();
+        bundle.contacts[0].home_address = "  Ev  ".to_owned();
+        bundle.contacts[0].work_address = "  Ofis  ".to_owned();
+        bundle.sales[0].description = "  Açıklama  ".to_owned();
+        bundle.sales[0].request_key = Some("  request key!?  ".to_owned());
+        refresh_checksum(&mut bundle);
+
+        let (_directory, database) = test_database();
+        database.import_data(bundle, false).unwrap();
+        let exported = database.export_data().unwrap();
+        let customer = exported
+            .customers
+            .iter()
+            .find(|row| row.id == customer_id)
+            .unwrap();
+        assert_eq!(customer.name, "Müşteri");
+        assert_eq!(customer.phone, "555");
+        assert_eq!(customer.address, "Ev");
+        assert_eq!(customer.work_address, "İş");
+        assert_eq!(customer.notes, "Not");
+        let contact = exported
+            .contacts
+            .iter()
+            .find(|row| row.id == contact_id)
+            .unwrap();
+        assert_eq!(contact.name, "Yakın");
+        assert_eq!(contact.phone, "123");
+        assert_eq!(contact.home_address, "Ev");
+        assert_eq!(contact.work_address, "Ofis");
+        let sale = exported.sales.iter().find(|row| row.id == sale_id).unwrap();
+        assert_eq!(sale.description, "Açıklama");
+        assert_eq!(sale.request_key.as_deref(), Some("requestkey"));
+    }
+
+    #[test]
+    fn import_rejects_semantically_empty_customer_and_contact_rows() {
+        let mut empty_customer = wordpress_fixture();
+        empty_customer.customers[0].name = " \t ".to_owned();
+        refresh_checksum(&mut empty_customer);
+        assert_eq!(
+            validate_bundle(&empty_customer).unwrap_err().to_string(),
+            "Müşteri adı zorunludur."
+        );
+
+        let mut empty_contact = wordpress_fixture();
+        empty_contact.contacts[0].name = " \t ".to_owned();
+        empty_contact.contacts[0].phone = "  ".to_owned();
+        empty_contact.contacts[0].home_address = "\n".to_owned();
+        empty_contact.contacts[0].work_address = "  ".to_owned();
+        refresh_checksum(&mut empty_contact);
+        assert_eq!(
+            validate_bundle(&empty_contact).unwrap_err().to_string(),
+            "Boş iletişim kaydı oluşturulamaz."
+        );
+    }
+
+    #[test]
+    fn imported_request_keys_use_api_sanitizing_length_and_uniqueness() {
+        let mut over_limit = wordpress_fixture();
+        let sale_id = over_limit.sales[0].id;
+        over_limit.sales[0].request_key = Some("a".repeat(SALE_REQUEST_KEY_MAX_CHARS + 1));
+        refresh_checksum(&mut over_limit);
+        let (_directory, database) = test_database();
+        database.import_data(over_limit, false).unwrap();
+        let exported = database.export_data().unwrap();
+        assert_eq!(
+            exported
+                .sales
+                .iter()
+                .find(|row| row.id == sale_id)
+                .and_then(|row| row.request_key.as_deref())
+                .unwrap()
+                .chars()
+                .count(),
+            SALE_REQUEST_KEY_MAX_CHARS
+        );
+
+        let mut duplicate = wordpress_fixture();
+        duplicate.sales[0].request_key = Some("same!".to_owned());
+        duplicate.sales[1].request_key = Some("same?".to_owned());
+        refresh_checksum(&mut duplicate);
+        assert_eq!(
+            validate_bundle(&duplicate).unwrap_err().to_string(),
+            "Geçersiz veya yinelenen satış istek anahtarı."
+        );
     }
 
     #[test]

@@ -34,10 +34,16 @@ absent.
   `https://s3.us-west-004.backblazeb2.com`, bucket
   `stronganchor-pusula-desktop-backups`, and object prefix `backups/`; creating
   the bucket in another region will make the desktop reject every upload URL.
-- [ ] Add lifecycle rules for `backups/rolling/` (14 days),
-  `backups/daily/` (60 days), and `backups/monthly/` (400 days).
+- [ ] Add lifecycle rules with `daysFromUploadingToHiding` set to 14 for
+  `backups/rolling/`, 60 for `backups/daily/`, and 400 for
+  `backups/monthly/`, plus `daysFromHidingToDeleting` set to 1 on every rule.
+  Gateway object names are unique, so a hidden-version-only rule would never
+  retire these current objects. Read the three exact prefixes and values back
+  before activation.
 - [ ] Create a `backups/`-restricted runtime key with only `listBuckets`,
-  `listFiles`, `readFiles`, and `writeFiles`.
+  `listFiles`, `readFiles`, and `writeFiles`. If the web console cannot express
+  that exact set, use the Native API; verify the resulting key metadata does
+  not include `deleteFiles`, `listAllBucketNames`, or bucket-management access.
 - [ ] Confirm at least two secure, off-device copies of the age recovery
   identity. The identity must not be stored on the gateway.
 - [x] Create and audit the cPanel domain for

@@ -10,6 +10,7 @@ $promotionScript = Join-Path $repoRoot 'scripts\Test-CandidatePromotion.ps1'
 $candidateConfigScript = Join-Path $repoRoot 'scripts\New-CandidateUpdaterConfig.ps1'
 $manifestScript = Join-Path $repoRoot 'scripts\New-UpdateManifest.ps1'
 $assetScript = Join-Path $repoRoot 'scripts\Test-ReleaseAssets.ps1'
+& (Join-Path $repoRoot 'tests\invalid-updater-signature-harness.tests.ps1') | Out-Host
 $package = Get-Content -Raw -LiteralPath (Join-Path $repoRoot 'package.json') | ConvertFrom-Json
 $version = [string]$package.version
 $commit = (& git -C $repoRoot rev-parse HEAD).Trim()

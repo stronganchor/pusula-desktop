@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import "./pusula-app.css";
 import "./styles.css";
+import { startApplicationUpdater } from "./updater";
 
 type DesktopRequestOptions = {
   method?: string;
@@ -83,6 +84,7 @@ async function bootstrap(): Promise<void> {
   }
 
   await import("./pusula-app.js");
+  startApplicationUpdater();
 }
 
 void bootstrap();

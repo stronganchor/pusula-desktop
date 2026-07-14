@@ -16,3 +16,25 @@
     display: none !important;
   }
 }
+
+.pusula-system-status {
+  position: fixed;
+  right: 14px;
+  bottom: 10px;
+  z-index: 9000;
+  max-width: min(520px, calc(100vw - 28px));
+  color: #8fb8c8;
+  background: rgb(15 20 30 / 92%);
+  border-radius: 4px;
+  padding: 4px 8px;
+  font: 500 12px/1.4 "Segoe UI", sans-serif;
+  pointer-events: none;
+}
+
+.pusula-system-status:empty {
+  display: none;
+}
+
+.pusula-system-status.is-error {
+  color: #f0a7a7;
+}

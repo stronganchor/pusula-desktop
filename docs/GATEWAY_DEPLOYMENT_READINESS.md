@@ -22,23 +22,31 @@ gateway failure must never prevent SQLite business writes.
   non-login `pusula-backup` account and mode `0700`.
 
 The service is intentionally disabled and inactive. The production environment
-file is absent and TCP 12741 has no listener. No DNS, cPanel domain, Apache
-proxy, Backblaze resource, enrollment code, or device token was created during
-staging.
+file is absent and TCP 12741 has no listener. The audited cPanel subdomain,
+authoritative/public DNS, and exact-host AutoSSL certificate are complete. The
+Apache proxy, Backblaze resource, enrollment code, and device token remain
+absent.
 
 ## Outstanding production gates
 
-- [ ] Create the private B2 bucket with SSE-B2.
+- [ ] Create the private B2 bucket with SSE-B2 in Backblaze region
+  `us-west-004`. The current desktop upload allow-list requires endpoint
+  `https://s3.us-west-004.backblazeb2.com`, bucket
+  `stronganchor-pusula-desktop-backups`, and object prefix `backups/`; creating
+  the bucket in another region will make the desktop reject every upload URL.
 - [ ] Add lifecycle rules for `backups/rolling/` (14 days),
   `backups/daily/` (60 days), and `backups/monthly/` (400 days).
 - [ ] Create a `backups/`-restricted runtime key with only `listBuckets`,
   `listFiles`, `readFiles`, and `writeFiles`.
 - [ ] Confirm at least two secure, off-device copies of the age recovery
   identity. The identity must not be stored on the gateway.
-- [ ] Create and audit the cPanel domain for
-  `pusula-backup.stronganchortech.com`.
-- [ ] Add and verify authoritative/public DNS, then issue AutoSSL for the exact
-  public host.
+- [x] Create and audit the cPanel domain for
+  `pusula-backup.stronganchortech.com`. It is isolated under cPanel user
+  `satbiz5` with the exact public server name.
+- [x] Add and verify authoritative/public DNS, then issue AutoSSL for the exact
+  public host. Authoritative, Google, and Cloudflare resolvers return
+  `69.167.167.14`; the publicly verified certificate covers only the exact
+  gateway host and is valid through 2026-10-12.
 - [ ] Create `/etc/pusula-backup-gateway.env` as `root:root 0600` without
   printing or logging its values.
 - [ ] Start the service and prove that only `127.0.0.1:12741` is listening.

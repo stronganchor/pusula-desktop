@@ -9,6 +9,8 @@ test("first-run state belongs to SQLite and integrity failure blocks startup", (
   assert.match(source, /status\.integrity_check !== "ok"/);
   assert.match(source, /invoke\("acknowledge_empty_start"\)/);
   assert.match(source, /!status\.onboarding_complete/);
+  assert.match(source, /applicationVersion = await getVersion\(\)/);
+  assert.match(source, /\["Pusula sürümü", applicationVersion\]/);
 });
 
 test("destructive import delegates its atomic recovery gate to the backend", () => {

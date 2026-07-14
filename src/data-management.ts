@@ -1,3 +1,4 @@
+import { getVersion } from "@tauri-apps/api/app";
 import { invoke } from "@tauri-apps/api/core";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { checkForApplicationUpdate } from "./updater";
@@ -77,6 +78,7 @@ type BackupStatusReport = {
 
 type ModalMode = "first-run" | "maintenance";
 const IMPORT_STATUS_ATTEMPTS = 3;
+let applicationVersion = "Bilinmiyor";
 
 const byId = <T extends HTMLElement>(id: string): T => {
   const element = document.getElementById(id);
@@ -185,6 +187,7 @@ function replaceDescriptionList(id: string, rows: Array<[string, string]>): void
 
 function renderStatus(status: DatabaseStatus, importSummary = status.last_import): void {
   const rows: Array<[string, string]> = [
+    ["Pusula sürümü", applicationVersion],
     ["Müşteriler", String(status.counts.customers)],
     ["Yakınlar", String(status.counts.contacts)],
     ["Satışlar", String(status.counts.sales)],
@@ -538,6 +541,11 @@ async function showMaintenance(): Promise<void> {
 }
 
 export async function initializeDataManagement(): Promise<void> {
+  try {
+    applicationVersion = await getVersion();
+  } catch (error) {
+    console.warn("Pusula application version could not be read", error);
+  }
   byId<HTMLButtonElement>("pusula-data-tools-button").onclick = () => void showMaintenance();
   const status = await readStatus();
   if (status.integrity_check !== "ok") {

@@ -1,0 +1,38 @@
+[package]
+name = "pusula-backup-gateway"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+description = "Credential-hiding backup gateway for Pusula Desktop"
+license = "UNLICENSED"
+publish = false
+
+[dependencies]
+axum = { version = "0.8", features = ["json"] }
+base64 = "0.22"
+chrono = { version = "0.4", features = ["clock", "serde"] }
+clap = { version = "4.5", features = ["derive", "env"] }
+getrandom = "0.3"
+hex = "0.4"
+hmac = "0.12"
+http = "1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+url = "2"
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[dev-dependencies]
+tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

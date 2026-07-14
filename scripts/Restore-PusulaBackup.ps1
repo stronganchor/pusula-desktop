@@ -414,20 +414,51 @@ function Invoke-External {
         [switch]$CaptureOutput
     )
 
-    $global:LASTEXITCODE = 0
-    $output = @(& $Executable @Arguments 2>&1)
-    $nativeSucceeded = $?
-    $exitCode = $LASTEXITCODE
-    if (-not $nativeSucceeded) {
-        if ($exitCode -eq 0) {
-            $exitCode = 1
+    $quotedArguments = foreach ($argument in $Arguments) {
+        if ($argument -notmatch '[\s"]') {
+            $argument
+            continue
         }
+
+        # Apply the CommandLineToArgvW-compatible quoting rules used by native
+        # Windows programs: escape quotes and double trailing backslashes
+        # inside a quoted argument.
+        $escaped = [regex]::Replace($argument, '(\\*)"', '$1$1\"')
+        $escaped = [regex]::Replace($escaped, '(\\*)$', '$1$1')
+        '"' + $escaped + '"'
+    }
+
+    $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+    $startInfo.FileName = $Executable
+    $startInfo.Arguments = $quotedArguments -join ' '
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+
+    $process = New-Object System.Diagnostics.Process
+    $process.StartInfo = $startInfo
+    try {
+        if (-not $process.Start()) {
+            throw "$FailureMessage (process did not start)."
+        }
+        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+        $stderrTask = $process.StandardError.ReadToEndAsync()
+        $process.WaitForExit()
+        $output = $stdoutTask.Result
+        # Drain stderr but intentionally never return or print it: rage can
+        # include the recovery identity path in diagnostics.
+        $null = $stderrTask.Result
+        $exitCode = $process.ExitCode
+    }
+    finally {
+        $process.Dispose()
     }
     if ($exitCode -ne 0) {
         throw "$FailureMessage (exit code $exitCode)."
     }
     if ($CaptureOutput) {
-        return ($output -join [Environment]::NewLine)
+        return $output
     }
 }
 

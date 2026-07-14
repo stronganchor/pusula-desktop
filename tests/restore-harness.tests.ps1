@@ -55,6 +55,28 @@ function Assert-Throws {
     throw "ASSERTION FAILED: $Message. Expected an exception containing '$Pattern'."
 }
 
+function Assert-ThrowsRedacted {
+    param(
+        [Parameter(Mandatory = $true)][scriptblock]$Action,
+        [Parameter(Mandatory = $true)][string]$RequiredPattern,
+        [Parameter(Mandatory = $true)][string]$ForbiddenPattern,
+        [Parameter(Mandatory = $true)][string]$Message
+    )
+
+    try {
+        & $Action
+    }
+    catch {
+        $errorMessage = $_.Exception.Message
+        if ($errorMessage -notlike "*$RequiredPattern*" -or
+            $errorMessage -like "*$ForbiddenPattern*") {
+            throw "ASSERTION FAILED: $Message. Unexpected error: $errorMessage"
+        }
+        return
+    }
+    throw "ASSERTION FAILED: $Message. Expected a redacted exception."
+}
+
 function Invoke-RestoreJson {
     param([Parameter(Mandatory = $true)][hashtable]$Parameters)
 
@@ -169,31 +191,47 @@ connection.close()
 '@
 
 $fakeRage = @'
-$outputIndex = -1
-for ($index = 0; $index -lt $args.Count; $index += 1) {
-    if ($args[$index] -eq '--output') {
-        $outputIndex = $index + 1
-        break
+using System;
+using System.IO;
+
+public static class FakeRage
+{
+    public static int Main(string[] args)
+    {
+        if (Environment.GetEnvironmentVariable("PUSULA_TEST_RAGE_FAIL") == "1")
+        {
+            Console.Error.WriteLine("SENSITIVE-RAGE-DIAGNOSTIC " + string.Join(" ", args));
+            return 9;
+        }
+
+        string output = null;
+        for (int index = 0; index < args.Length; index += 1)
+        {
+            if (args[index] == "--output" && index + 1 < args.Length)
+            {
+                output = args[index + 1];
+            }
+        }
+        if (output == null || args.Length == 0)
+        {
+            return 2;
+        }
+        File.Copy(args[args.Length - 1], output, true);
+        return 0;
     }
 }
-if ($outputIndex -lt 0 -or $outputIndex -ge $args.Count) {
-    $global:LASTEXITCODE = 2
-    throw 'missing --output'
-}
-Copy-Item -LiteralPath $args[$args.Count - 1] -Destination $args[$outputIndex] -Force
-$global:LASTEXITCODE = 0
 '@
 
 try {
     [System.IO.Directory]::CreateDirectory($testRoot) | Out-Null
     $factoryPath = Join-Path $testRoot 'create-test-database.py'
-    $fakeRagePath = Join-Path $testRoot 'fake-rage.ps1'
+    $fakeRagePath = Join-Path $testRoot 'fake-rage.exe'
     $identityPath = Join-Path $testRoot 'test-recovery.agekey'
     $backupPath = Join-Path $testRoot 'backup.sqlite3.age'
     $targetPath = Join-Path $testRoot 'live\pusula.sqlite3'
     $evidencePath = Join-Path $testRoot 'restore-evidence.json'
     [System.IO.File]::WriteAllText($factoryPath, $databaseFactory, (New-Object System.Text.UTF8Encoding($false)))
-    [System.IO.File]::WriteAllText($fakeRagePath, $fakeRage, (New-Object System.Text.UTF8Encoding($false)))
+    Add-Type -TypeDefinition $fakeRage -OutputAssembly $fakeRagePath -OutputType ConsoleApplication
     [System.IO.File]::WriteAllText($identityPath, 'test-only identity', (New-Object System.Text.UTF8Encoding($false)))
 
     & $python $factoryPath $backupPath 'new' 'delete'
@@ -289,6 +327,20 @@ try {
     $corruptParameters = @{} + $common
     $corruptParameters.CiphertextPath = $corruptBackup
     Assert-Throws { & $restoreScript @corruptParameters | Out-Null } 'too short' 'invalid decrypted database must be rejected'
+    Assert-StagingEmpty
+
+    $decryptFailureParameters = @{} + $common
+    $env:PUSULA_TEST_RAGE_FAIL = '1'
+    try {
+        Assert-ThrowsRedacted `
+            -Action { & $restoreScript @decryptFailureParameters | Out-Null } `
+            -RequiredPattern 'rage could not decrypt' `
+            -ForbiddenPattern 'SENSITIVE-RAGE-DIAGNOSTIC' `
+            -Message 'native rage diagnostics and identity arguments must be redacted'
+    }
+    finally {
+        Remove-Item Env:\PUSULA_TEST_RAGE_FAIL -ErrorAction SilentlyContinue
+    }
     Assert-StagingEmpty
 
     $fakePusula = Join-Path $testRoot 'pusula-desktop.exe'

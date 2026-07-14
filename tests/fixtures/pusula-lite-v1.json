@@ -1,0 +1,94 @@
+{
+  "format_version": 1,
+  "source": "pusula-lite-wordpress",
+  "source_version": "1.3.6",
+  "exported_at": "2026-07-14T12:34:56Z",
+  "business_profile": {
+    "name": "Enes Beko",
+    "address": "Adana",
+    "phone": "0322",
+    "website": "https://example.com/pusula",
+    "footer_sub": "Kardeşler"
+  },
+  "customers": [
+    {
+      "id": 2,
+      "name": "Test Müşteri Ç",
+      "phone": "",
+      "address": "Ev",
+      "work_address": "İş",
+      "notes": "Not",
+      "registration_date": "2026-01-02"
+    },
+    {
+      "id": 7,
+      "name": "Örnek Müşteri",
+      "phone": "555",
+      "address": "",
+      "work_address": "",
+      "notes": "",
+      "registration_date": "2026-02-03"
+    }
+  ],
+  "contacts": [
+    {
+      "id": 4,
+      "customer_id": 2,
+      "name": "Yakın",
+      "phone": "123",
+      "home_address": "",
+      "work_address": "Ofis"
+    }
+  ],
+  "sales": [
+    {
+      "id": 10,
+      "customer_id": 2,
+      "date": "2026-03-04",
+      "total_kurus": 1234567890,
+      "description": "Büyük satış",
+      "request_key": null
+    },
+    {
+      "id": 11,
+      "customer_id": 7,
+      "date": "2026-03-05",
+      "total_kurus": 10,
+      "description": "",
+      "request_key": "request-11"
+    }
+  ],
+  "installments": [
+    {
+      "id": 20,
+      "sale_id": 10,
+      "due_date": null,
+      "amount_kurus": 5,
+      "paid_date": null
+    }
+  ],
+  "payments": [
+    {
+      "id": 30,
+      "installment_id": 20,
+      "amount_kurus": 1,
+      "payment_date": "2026-03-06",
+      "created_at": "2026-03-06 09:10:11"
+    }
+  ],
+  "manifest": {
+    "counts": {
+      "customers": 2,
+      "contacts": 1,
+      "sales": 2,
+      "installments": 1,
+      "payments": 1
+    },
+    "totals": {
+      "sales_kurus": 1234567900,
+      "installments_kurus": 5,
+      "payments_kurus": 1
+    },
+    "sha256": "d709a52df5147bddd57d569d1de4113f76ac10f8841405d970e4e60bdd90ade6"
+  }
+}

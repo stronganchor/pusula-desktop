@@ -38,3 +38,199 @@
 .pusula-system-status.is-error {
   color: #f0a7a7;
 }
+
+.pusula-header-tools {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: 0 0 auto;
+}
+
+.pusula-data-tools-button,
+.pusula-desktop-modal-actions button,
+.pusula-backup-panel button {
+  border: 1px solid #4d6077;
+  border-radius: 4px;
+  background: #243044;
+  color: #e6ecf3;
+  padding: 7px 10px;
+  font: 600 12px/1.2 "Segoe UI", sans-serif;
+  cursor: pointer;
+}
+
+.pusula-data-tools-button:hover,
+.pusula-desktop-modal-actions button:hover,
+.pusula-backup-panel button:hover {
+  background: #30405a;
+}
+
+.pusula-desktop-modal-actions button:disabled,
+.pusula-backup-panel button:disabled,
+.pusula-backup-panel input:disabled {
+  cursor: wait;
+  opacity: 0.55;
+}
+
+.pusula-desktop-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 9500;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: rgb(5 9 15 / 82%);
+  backdrop-filter: blur(2px);
+}
+
+.pusula-desktop-modal[hidden] {
+  display: none;
+}
+
+.pusula-desktop-modal-card {
+  width: min(760px, 100%);
+  max-height: calc(100vh - 48px);
+  overflow-y: auto;
+  border: 1px solid #445269;
+  border-radius: 8px;
+  background: #181f2c;
+  color: #e6ecf3;
+  padding: 24px;
+  box-shadow: 0 18px 60px rgb(0 0 0 / 55%);
+  font-family: "Segoe UI", sans-serif;
+}
+
+.pusula-desktop-modal-card h2 {
+  margin: 0 0 8px;
+  font-size: 21px;
+}
+
+.pusula-desktop-modal-description {
+  margin: 0 0 18px;
+  color: #c0cad8;
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+.pusula-data-status {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1px;
+  margin: 0 0 16px;
+  overflow: hidden;
+  border: 1px solid #344156;
+  border-radius: 5px;
+  background: #344156;
+}
+
+.pusula-data-status > div {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  background: #111824;
+  padding: 9px 11px;
+}
+
+.pusula-data-status dt {
+  color: #9eabba;
+}
+
+.pusula-data-status dd {
+  margin: 0;
+  text-align: right;
+}
+
+.pusula-desktop-modal-message {
+  min-height: 20px;
+  margin: 0 0 12px;
+  color: #88b7c9;
+  font-size: 13px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.pusula-desktop-modal-message.is-error {
+  color: #f0a7a7;
+}
+
+.pusula-backup-panel {
+  margin: 0 0 16px;
+  border: 1px solid #344156;
+  border-radius: 6px;
+  padding: 14px;
+  background: #111824;
+}
+
+.pusula-backup-panel[hidden] {
+  display: none;
+}
+
+.pusula-backup-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.pusula-backup-heading h3 {
+  margin: 0;
+  font-size: 16px;
+}
+
+.pusula-backup-panel > p {
+  margin: 8px 0 12px;
+  color: #9eabba;
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.pusula-backup-enrollment {
+  display: grid;
+  grid-template-columns: minmax(180px, 1fr) minmax(180px, 1fr) auto;
+  align-items: end;
+  gap: 10px;
+}
+
+.pusula-backup-enrollment[hidden] {
+  display: none;
+}
+
+.pusula-backup-enrollment label {
+  display: grid;
+  gap: 5px;
+  color: #b7c1ce;
+  font-size: 12px;
+}
+
+.pusula-backup-enrollment input {
+  min-width: 0;
+  border: 1px solid #4d6077;
+  border-radius: 4px;
+  background: #0c121c;
+  color: #e6ecf3;
+  padding: 8px 9px;
+  font: 14px/1.2 "Segoe UI", sans-serif;
+}
+
+.pusula-desktop-modal-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+@media (max-width: 760px) {
+  .pusula-data-status {
+    grid-template-columns: 1fr;
+  }
+
+  .pusula-backup-enrollment {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media print {
+  .pusula-data-tools-button,
+  .pusula-desktop-modal {
+    display: none !important;
+  }
+}

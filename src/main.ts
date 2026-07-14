@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import "./pusula-app.css";
 import "./styles.css";
+import { initializeDataManagement } from "./data-management";
 import { startApplicationUpdater } from "./updater";
 
 type DesktopRequestOptions = {
@@ -71,6 +72,7 @@ window.pusulaDesktopApi = async (path, options = {}) => {
 
 async function bootstrap(): Promise<void> {
   try {
+    await initializeDataManagement();
     const profile = await window.pusulaDesktopApi("/business-profile");
     if (profile && typeof profile === "object") {
       window.PusulaApp.business = profile as BusinessProfile;
@@ -81,6 +83,7 @@ async function bootstrap(): Promise<void> {
       startup.hidden = false;
       startup.textContent = `Veritabanı açılamadı: ${String(error)}`;
     }
+    return;
   }
 
   await import("./pusula-app.js");

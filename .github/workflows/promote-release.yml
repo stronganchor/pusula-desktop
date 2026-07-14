@@ -1,0 +1,66 @@
+name: Promote Accepted Windows Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Accepted final SemVer without the v prefix
+        required: true
+        type: string
+      acceptance_evidence_sha256:
+        description: SHA-256 of the completed non-sensitive acceptance evidence
+        required: true
+        type: string
+      confirmation:
+        description: Enter PROMOTE v followed by the exact version
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: pusula-windows-release
+  cancel-in-progress: false
+
+env:
+  RELEASE_VERSION: ${{ inputs.version }}
+  ACCEPTANCE_EVIDENCE_SHA256: ${{ inputs.acceptance_evidence_sha256 }}
+  PROMOTION_CONFIRMATION: ${{ inputs.confirmation }}
+  RELEASE_COMMIT: ${{ github.sha }}
+  RELEASE_REPOSITORY: ${{ github.repository }}
+
+jobs:
+  promote:
+    runs-on: windows-latest
+    environment: windows-release
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Revalidate candidate artifacts and acceptance attestation
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          .\scripts\Test-CandidatePromotion.ps1 `
+            -Version $env:RELEASE_VERSION `
+            -Repository $env:RELEASE_REPOSITORY `
+            -WorkflowCommit $env:RELEASE_COMMIT `
+            -AcceptanceEvidenceSha256 $env:ACCEPTANCE_EVIDENCE_SHA256 `
+            -Confirmation $env:PROMOTION_CONFIRMATION `
+            -DownloadDirectory (Join-Path $env:RUNNER_TEMP 'candidate-assets')
+      - name: Promote the exact accepted candidate
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = "v$($env:RELEASE_VERSION)"
+          gh release edit $tag --repo $env:RELEASE_REPOSITORY --prerelease=false --latest
+          if ($LASTEXITCODE -ne 0) { throw 'Candidate promotion failed.' }
+          $latest = gh api "repos/$($env:RELEASE_REPOSITORY)/releases/latest" --jq '.tag_name'
+          if ($LASTEXITCODE -ne 0 -or $latest -ne $tag) { throw 'Promoted release is not the repository latest release.' }
+          "Promoted $tag with acceptance evidence SHA-256 $($env:ACCEPTANCE_EVIDENCE_SHA256.ToLowerInvariant())" >> $env:GITHUB_STEP_SUMMARY

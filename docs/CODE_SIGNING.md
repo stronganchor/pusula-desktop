@@ -47,6 +47,7 @@ Configure these environment variables (not secrets):
 | `ARTIFACT_SIGNING_ENDPOINT` | Regional endpoint, for example `https://eus.codesigning.azure.net` |
 | `ARTIFACT_SIGNING_ACCOUNT` | Artifact Signing account name |
 | `ARTIFACT_SIGNING_PROFILE` | Public Trust certificate profile name |
+| `EXPECTED_WINDOWS_PUBLISHER` | Exact publisher name returned by the profile's Authenticode certificate |
 
 Configure these environment secrets:
 
@@ -54,19 +55,40 @@ Configure these environment secrets:
 | --- | --- |
 | `TAURI_SIGNING_PRIVATE_KEY` | Tauri updater private key |
 | `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` | Password for the updater private key |
+| `ACCEPTANCE_BASELINE_ARCHIVE_PASSWORD` | One-time 24+ character password retained by the acceptance operator; required only when building the initial private baseline |
 
 The obsolete `WINDOWS_CODESIGN_PFX_BASE64` and `WINDOWS_CODESIGN_PASSWORD` secrets must not be configured or used.
 
 ## Release behavior
 
-The workflow logs in with `azure/login` using GitHub OIDC, downloads the official Microsoft Artifact Signing Client Tools MSI, verifies Microsoft's Authenticode signature on that installer, and installs it noninteractively. Tauri then invokes `scripts/Invoke-ArtifactSigning.ps1` through its custom `signCommand` for every Windows executable it bundles.
+The workflow first validates and compiles the immutable `main` commit without
+Azure access, updater secrets, or a write-capable GitHub token. The signing job
+then downloads the official Microsoft Artifact Signing Client Tools MSI,
+verifies Microsoft's Authenticode signature, and installs it noninteractively
+before logging in with `azure/login` and GitHub OIDC. The updater private key is
+available only to the preflight validation and candidate bundle steps. Tauri
+invokes `scripts/Invoke-ArtifactSigning.ps1` through its custom `signCommand` for every
+Windows executable it bundles.
 
 The helper uses SHA-256 and Microsoft's RFC 3161 timestamp service. It authenticates only through the Azure CLI session created by `azure/login`; interactive and unrelated credential providers are explicitly disabled. A signing or verification failure stops the build.
 
-Signing happens during Tauri bundling so both the inner `pusula-desktop.exe` and each NSIS setup executable are signed before Tauri creates the updater ZIP and updater signature. The release gate verifies valid, timestamped Authenticode signatures on:
+Signing happens during Tauri bundling so both the inner `pusula-desktop.exe` and each NSIS setup executable are signed before Tauri creates the updater ZIP and updater signature. The optional initial-release acceptance baseline is freshly compiled with its own lower embedded version and direct candidate-manifest endpoint before Azure authentication, then signed separately. Because the repository is public, the workflow encrypts that installer as a header-encrypted AES-256 7-Zip archive before uploading a three-day Actions artifact and deletes the plaintext runner copies. The release gate requires the exact `EXPECTED_WINDOWS_PUBLISHER`, a valid timestamp, a Tauri signature that verifies against the public key embedded in the application, and matching lean-installer bytes inside the updater ZIP. It verifies:
 
-- `src-tauri\target\release\pusula-desktop.exe`
 - `Pusula_<version>_x64_offline-setup.exe`
 - `Pusula_<version>_x64-setup.exe`
 
-The release remains blocked until the Azure identity validation is complete, the Public Trust profile exists, the GitHub environment is protected, and a workflow run proves all three signatures valid.
+Tauri restores the unsigned build-tree executable after it packages each target,
+so that restored file is not used as signature evidence. Acceptance instead
+verifies the installed `pusula-desktop.exe` after both the baseline install and
+candidate update; that proves the inner application extracted from the signed
+NSIS package has the expected publisher and timestamp.
+
+Verified artifacts cross into a separate publication job without the updater
+private key or Azure session. That job creates a draft, uploads only the
+allowlisted artifacts and SHA-256 manifest, verifies their remote names/sizes,
+requires GitHub's remote SHA-256 digest for every upload to match the local
+asset, and publishes atomically. The release remains blocked until Azure identity
+validation is complete, the Public Trust profile exists, the expected publisher
+value is configured, the GitHub environment is protected, and a workflow run
+proves every signature valid. Candidate testing and promotion are defined in
+`RELEASE_RUNBOOK.md`.

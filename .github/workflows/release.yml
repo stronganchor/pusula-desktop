@@ -4,74 +4,181 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: SemVer without the v prefix
+        description: Strict SemVer without the v prefix or build metadata
         required: true
         type: string
       prerelease:
-        description: Publish as a prerelease
+        description: Publish as an acceptance candidate before promotion
+        required: true
+        default: true
+        type: boolean
+      build_initial_acceptance_baseline:
+        description: Privately build a signed older-version installer that updates only to this candidate
         required: true
         default: false
         type: boolean
+      acceptance_baseline_version:
+        description: Embedded version for the private initial-release acceptance baseline
+        required: true
+        default: '0.0.9'
+        type: string
 
 permissions:
-  contents: write
-  id-token: write
+  contents: read
 
 concurrency:
   group: pusula-windows-release
   cancel-in-progress: false
 
+env:
+  RELEASE_VERSION: ${{ inputs.version }}
+  RELEASE_PRERELEASE: ${{ inputs.prerelease }}
+  BUILD_INITIAL_ACCEPTANCE_BASELINE: ${{ inputs.build_initial_acceptance_baseline }}
+  ACCEPTANCE_BASELINE_VERSION: ${{ inputs.acceptance_baseline_version }}
+  RELEASE_COMMIT: ${{ github.sha }}
+  RELEASE_REPOSITORY: ${{ github.repository }}
+
 jobs:
-  release:
+  validate:
     runs-on: windows-latest
-    environment: windows-release
-    env:
-      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-      AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
-      AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
-      AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
-      ARTIFACT_SIGNING_ENDPOINT: ${{ vars.ARTIFACT_SIGNING_ENDPOINT }}
-      ARTIFACT_SIGNING_ACCOUNT: ${{ vars.ARTIFACT_SIGNING_ACCOUNT }}
-      ARTIFACT_SIGNING_PROFILE: ${{ vars.ARTIFACT_SIGNING_PROFILE }}
-      GH_TOKEN: ${{ github.token }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
-          ref: main
+          ref: ${{ github.sha }}
           fetch-depth: 0
-      - uses: actions/setup-node@v4
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
           cache: npm
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
+          toolchain: stable
           components: rustfmt, clippy
-      - uses: actions/setup-dotnet@v5
+      - name: Verify immutable release identity
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          .\scripts\Test-ReleaseIdentity.ps1 `
+            -ExpectedVersion $env:RELEASE_VERSION `
+            -Repository $env:RELEASE_REPOSITORY `
+            -ExpectedCommit $env:RELEASE_COMMIT `
+            -Prerelease $env:RELEASE_PRERELEASE
+      - run: npm ci
+      - run: npm run build
+      - run: npm run test:frontend
+      - run: cargo fmt --manifest-path src-tauri/Cargo.toml --check
+      - run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+      - run: cargo test --manifest-path src-tauri/Cargo.toml
+      - name: Test guarded Windows restore harness
+        shell: pwsh
+        run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\restore-harness.tests.ps1
+      - name: Compile release executable
+        run: npm run tauri -- build --no-bundle --ci
+      - name: Package unsigned offline NSIS installer
+        run: npm run tauri -- bundle --bundles nsis --no-sign --ci
+
+  sign:
+    needs: validate
+    runs-on: windows-latest
+    environment: windows-release
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      artifact-digest: ${{ steps.upload.outputs.artifact-digest }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5
         with:
           dotnet-version: 8.0.x
 
-      - name: Require signing credentials
+      - name: Verify immutable release identity before privileged work
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          .\scripts\Test-ReleaseIdentity.ps1 `
+            -ExpectedVersion $env:RELEASE_VERSION `
+            -Repository $env:RELEASE_REPOSITORY `
+            -ExpectedCommit $env:RELEASE_COMMIT `
+            -Prerelease $env:RELEASE_PRERELEASE
+      - run: npm ci
+      - run: npm run build
+      - run: npm run test:frontend
+      - run: cargo fmt --manifest-path src-tauri/Cargo.toml --check
+      - run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+      - run: cargo test --manifest-path src-tauri/Cargo.toml
+      - name: Test guarded Windows restore harness
+        shell: pwsh
+        run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\restore-harness.tests.ps1
+      - name: Compile the executable before Azure authentication
+        run: npm run tauri -- build --no-bundle --ci
+
+      - name: Freshly compile private initial-release acceptance baseline before Azure authentication
+        if: ${{ inputs.build_initial_acceptance_baseline }}
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          foreach ($name in 'TAURI_SIGNING_PRIVATE_KEY','TAURI_SIGNING_PRIVATE_KEY_PASSWORD','AZURE_CLIENT_ID','AZURE_TENANT_ID','AZURE_SUBSCRIPTION_ID','ARTIFACT_SIGNING_ENDPOINT','ARTIFACT_SIGNING_ACCOUNT','ARTIFACT_SIGNING_PROFILE') {
-            if ([string]::IsNullOrWhiteSpace((Get-Item "env:$name").Value)) { throw "Missing required release value: $name" }
+          if ($env:RELEASE_PRERELEASE -ne 'true') {
+            throw 'The private acceptance baseline is allowed only for a prerelease candidate.'
           }
 
-          $endpoint = [Uri]$env:ARTIFACT_SIGNING_ENDPOINT
-          if ($endpoint.Scheme -ne 'https' -or -not $endpoint.Host.EndsWith('.codesigning.azure.net', [StringComparison]::OrdinalIgnoreCase)) {
-            throw 'ARTIFACT_SIGNING_ENDPOINT must be an HTTPS Azure Artifact Signing endpoint.'
+          $targetExecutable = (Resolve-Path -LiteralPath 'src-tauri\target\release\pusula-desktop.exe').Path
+          $candidateExecutable = Join-Path $env:RUNNER_TEMP 'candidate-unsigned.exe'
+          $baselineExecutable = Join-Path $env:RUNNER_TEMP 'initial-acceptance-baseline-unsigned.exe'
+          $baselineConfig = Join-Path $env:RUNNER_TEMP 'initial-acceptance-baseline.json'
+          Copy-Item -LiteralPath $targetExecutable -Destination $candidateExecutable -Force
+
+          .\scripts\New-CandidateUpdaterConfig.ps1 `
+            -CandidateVersion $env:RELEASE_VERSION `
+            -ApplicationVersion $env:ACCEPTANCE_BASELINE_VERSION `
+            -Repository $env:RELEASE_REPOSITORY `
+            -OutputPath $baselineConfig `
+            -Force
+          npm run tauri -- build --no-bundle --ci --config $baselineConfig
+          if ($LASTEXITCODE -ne 0) { throw 'Fresh acceptance baseline compilation failed.' }
+
+          $productVersion = [Diagnostics.FileVersionInfo]::GetVersionInfo($targetExecutable).ProductVersion
+          if (-not [string]::Equals($productVersion, $env:ACCEPTANCE_BASELINE_VERSION, [StringComparison]::Ordinal)) {
+            throw "Fresh baseline executable reports ProductVersion '$productVersion', expected '$($env:ACCEPTANCE_BASELINE_VERSION)'."
           }
+          Copy-Item -LiteralPath $targetExecutable -Destination $baselineExecutable -Force
+          Copy-Item -LiteralPath $candidateExecutable -Destination $targetExecutable -Force
 
-      - name: Authenticate to Azure with GitHub OIDC
-        uses: azure/login@v3
-        with:
-          client-id: ${{ vars.AZURE_CLIENT_ID }}
-          tenant-id: ${{ vars.AZURE_TENANT_ID }}
-          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      - name: Install pinned Minisign verifier before Azure authentication
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
+          $archive = Join-Path $env:RUNNER_TEMP 'minisign-0.12-win64.zip'
+          $root = Join-Path $env:RUNNER_TEMP 'minisign-0.12'
+          Invoke-WebRequest `
+            -Uri 'https://github.com/jedisct1/minisign/releases/download/0.12/minisign-0.12-win64.zip' `
+            -OutFile $archive
+          $expectedHash = '37b600344e20c19314b2e82813db2bfdcc408b77b876f7727889dbd46d539479'
+          $actualHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $archive).Hash.ToLowerInvariant()
+          if ($actualHash -ne $expectedHash) { throw 'Pinned Minisign archive SHA-256 verification failed.' }
+          Expand-Archive -LiteralPath $archive -DestinationPath $root
+          Remove-Item -LiteralPath $archive -Force
+          $path = Join-Path $root 'minisign-win64\x86_64\minisign.exe'
+          if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw 'minisign.exe was not installed.' }
+          "MINISIGN_PATH=$path" >> $env:GITHUB_ENV
 
-      - name: Install Microsoft Artifact Signing client tools
+      - name: Install Microsoft Artifact Signing client tools before Azure authentication
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -116,16 +223,7 @@ jobs:
           "ARTIFACT_SIGNING_DLIB_PATH=$($dlib.FullName)" >> $env:GITHUB_ENV
           "SIGNTOOL_PATH=$($signTool.FullName)" >> $env:GITHUB_ENV
 
-      - run: npm ci
-      - name: Verify version metadata
-        shell: pwsh
-        run: .\scripts\Test-VersionConsistency.ps1 -ExpectedVersion '${{ inputs.version }}'
-      - run: npm run build
-      - run: cargo fmt --manifest-path src-tauri/Cargo.toml --check
-      - run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
-      - run: cargo test --manifest-path src-tauri/Cargo.toml
-
-      - name: Create build overrides
+      - name: Create deterministic bundle overrides
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -138,75 +236,386 @@ jobs:
           }
           [ordered]@{ bundle = [ordered]@{ windows = $windows } } |
             ConvertTo-Json -Depth 8 |
-            Set-Content -LiteralPath (Join-Path $env:RUNNER_TEMP 'offline-signing.json') -Encoding UTF8
+            Set-Content -LiteralPath (Join-Path $env:RUNNER_TEMP 'offline-signing.json') -Encoding utf8
           $leanWindows = [ordered]@{}
           foreach ($entry in $windows.GetEnumerator()) { $leanWindows[$entry.Key] = $entry.Value }
           $leanWindows.webviewInstallMode = [ordered]@{ type = 'skip' }
           [ordered]@{ bundle = [ordered]@{ windows = $leanWindows } } |
             ConvertTo-Json -Depth 8 |
-            Set-Content -LiteralPath (Join-Path $env:RUNNER_TEMP 'updater-signing.json') -Encoding UTF8
+            Set-Content -LiteralPath (Join-Path $env:RUNNER_TEMP 'updater-signing.json') -Encoding utf8
 
-      - name: Build signed offline installer
+          if ($env:BUILD_INITIAL_ACCEPTANCE_BASELINE -eq 'true') {
+            $baselineConfigPath = Join-Path $env:RUNNER_TEMP 'initial-acceptance-baseline.json'
+            $baselineConfig = Get-Content -LiteralPath $baselineConfigPath -Raw | ConvertFrom-Json
+            $baselineSigningConfig = [ordered]@{
+              version = [string]$baselineConfig.version
+              bundle = [ordered]@{
+                createUpdaterArtifacts = $false
+                windows = $windows
+              }
+              plugins = [ordered]@{
+                updater = [ordered]@{ endpoints = @($baselineConfig.plugins.updater.endpoints) }
+              }
+            }
+            $baselineSigningConfig |
+              ConvertTo-Json -Depth 8 |
+              Set-Content -LiteralPath (Join-Path $env:RUNNER_TEMP 'initial-baseline-signing.json') -Encoding utf8
+          }
+
+      - name: Require release signing configuration
         shell: pwsh
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          ACCEPTANCE_BASELINE_ARCHIVE_PASSWORD: ${{ secrets.ACCEPTANCE_BASELINE_ARCHIVE_PASSWORD }}
+          AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+          AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          ARTIFACT_SIGNING_ENDPOINT: ${{ vars.ARTIFACT_SIGNING_ENDPOINT }}
+          ARTIFACT_SIGNING_ACCOUNT: ${{ vars.ARTIFACT_SIGNING_ACCOUNT }}
+          ARTIFACT_SIGNING_PROFILE: ${{ vars.ARTIFACT_SIGNING_PROFILE }}
+          EXPECTED_WINDOWS_PUBLISHER: ${{ vars.EXPECTED_WINDOWS_PUBLISHER }}
         run: |
           $ErrorActionPreference = 'Stop'
-          npm run tauri -- build --bundles nsis --config (Join-Path $env:RUNNER_TEMP 'offline-signing.json')
-          $installer = Get-ChildItem -LiteralPath 'src-tauri\target\release\bundle\nsis' -Filter '*-setup.exe' | Select-Object -First 1
-          if (-not $installer) { throw 'Offline installer was not created' }
-          New-Item -ItemType Directory -Force -Path release-assets | Out-Null
-          Copy-Item -LiteralPath $installer.FullName -Destination "release-assets\Pusula_${{ inputs.version }}_x64_offline-setup.exe"
+          foreach ($name in 'TAURI_SIGNING_PRIVATE_KEY','TAURI_SIGNING_PRIVATE_KEY_PASSWORD','AZURE_CLIENT_ID','AZURE_TENANT_ID','AZURE_SUBSCRIPTION_ID','ARTIFACT_SIGNING_ENDPOINT','ARTIFACT_SIGNING_ACCOUNT','ARTIFACT_SIGNING_PROFILE','EXPECTED_WINDOWS_PUBLISHER') {
+            if ([string]::IsNullOrWhiteSpace((Get-Item "env:$name").Value)) { throw "Missing required release value: $name" }
+          }
+          if ($env:BUILD_INITIAL_ACCEPTANCE_BASELINE -eq 'true' -and
+              ([string]::IsNullOrWhiteSpace($env:ACCEPTANCE_BASELINE_ARCHIVE_PASSWORD) -or
+               $env:ACCEPTANCE_BASELINE_ARCHIVE_PASSWORD.Length -lt 24)) {
+            throw 'ACCEPTANCE_BASELINE_ARCHIVE_PASSWORD must be a one-time secret of at least 24 characters.'
+          }
+          $endpoint = [Uri]$env:ARTIFACT_SIGNING_ENDPOINT
+          if ($endpoint.Scheme -ne 'https' -or -not $endpoint.Host.EndsWith('.codesigning.azure.net', [StringComparison]::OrdinalIgnoreCase)) {
+            throw 'ARTIFACT_SIGNING_ENDPOINT must be an HTTPS Azure Artifact Signing endpoint.'
+          }
 
-      - name: Build signed lean updater
+      - name: Authenticate to Azure with GitHub OIDC
+        uses: azure/login@532459ea530d8321f2fb9bb10d1e0bcf23869a43 # v3
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Bundle signed offline installer
         shell: pwsh
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          ARTIFACT_SIGNING_ENDPOINT: ${{ vars.ARTIFACT_SIGNING_ENDPOINT }}
+          ARTIFACT_SIGNING_ACCOUNT: ${{ vars.ARTIFACT_SIGNING_ACCOUNT }}
+          ARTIFACT_SIGNING_PROFILE: ${{ vars.ARTIFACT_SIGNING_PROFILE }}
         run: |
           $ErrorActionPreference = 'Stop'
-          $bundlePath = Resolve-Path -LiteralPath 'src-tauri\target\release\bundle\nsis'
-          if (-not $bundlePath.Path.StartsWith((Resolve-Path '.').Path, [System.StringComparison]::OrdinalIgnoreCase)) { throw 'Unsafe bundle path' }
-          Remove-Item -LiteralPath $bundlePath.Path -Recurse -Force
-          npm run tauri -- build --bundles nsis --config (Join-Path $env:RUNNER_TEMP 'updater-signing.json')
           $bundleDir = 'src-tauri\target\release\bundle\nsis'
-          $installer = Get-ChildItem -LiteralPath $bundleDir -Filter '*-setup.exe' | Select-Object -First 1
-          $updater = Get-ChildItem -LiteralPath $bundleDir -Filter '*.nsis.zip' | Select-Object -First 1
-          if (-not $installer -or -not $updater -or -not (Test-Path -LiteralPath "$($updater.FullName).sig")) { throw 'Lean updater artifacts are incomplete' }
-          Copy-Item -LiteralPath $installer.FullName -Destination "release-assets\Pusula_${{ inputs.version }}_x64-setup.exe"
-          Copy-Item -LiteralPath $updater.FullName -Destination "release-assets\Pusula_${{ inputs.version }}_x64.nsis.zip"
-          Copy-Item -LiteralPath "$($updater.FullName).sig" -Destination "release-assets\Pusula_${{ inputs.version }}_x64.nsis.zip.sig"
+          Remove-Item -LiteralPath $bundleDir -Recurse -Force -ErrorAction SilentlyContinue
+          npm run tauri -- bundle --bundles nsis --ci --config (Join-Path $env:RUNNER_TEMP 'offline-signing.json')
+          $installers = @(Get-ChildItem -LiteralPath $bundleDir -Filter '*-setup.exe')
+          if ($installers.Count -ne 1) { throw "Expected one offline installer, found $($installers.Count)." }
+          New-Item -ItemType Directory -Force -Path release-assets | Out-Null
+          Copy-Item -LiteralPath $installers[0].FullName -Destination (Join-Path 'release-assets' "Pusula_$($env:RELEASE_VERSION)_x64_offline-setup.exe")
 
-      - name: Verify Authenticode signatures
+      - name: Bundle signed lean updater
         shell: pwsh
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          ARTIFACT_SIGNING_ENDPOINT: ${{ vars.ARTIFACT_SIGNING_ENDPOINT }}
+          ARTIFACT_SIGNING_ACCOUNT: ${{ vars.ARTIFACT_SIGNING_ACCOUNT }}
+          ARTIFACT_SIGNING_PROFILE: ${{ vars.ARTIFACT_SIGNING_PROFILE }}
         run: |
           $ErrorActionPreference = 'Stop'
+          $bundleDir = 'src-tauri\target\release\bundle\nsis'
+          Remove-Item -LiteralPath $bundleDir -Recurse -Force -ErrorAction Stop
+          npm run tauri -- bundle --bundles nsis --ci --config (Join-Path $env:RUNNER_TEMP 'updater-signing.json')
+          $installers = @(Get-ChildItem -LiteralPath $bundleDir -Filter '*-setup.exe')
+          $updaters = @(Get-ChildItem -LiteralPath $bundleDir -Filter '*.nsis.zip')
+          if ($installers.Count -ne 1 -or $updaters.Count -ne 1) { throw 'Lean updater artifacts are ambiguous or incomplete.' }
+          $signaturePath = "$($updaters[0].FullName).sig"
+          if (-not (Test-Path -LiteralPath $signaturePath -PathType Leaf)) { throw 'Lean updater signature is missing.' }
+          Copy-Item -LiteralPath $installers[0].FullName -Destination (Join-Path 'release-assets' "Pusula_$($env:RELEASE_VERSION)_x64-setup.exe")
+          Copy-Item -LiteralPath $updaters[0].FullName -Destination (Join-Path 'release-assets' "Pusula_$($env:RELEASE_VERSION)_x64.nsis.zip")
+          Copy-Item -LiteralPath $signaturePath -Destination (Join-Path 'release-assets' "Pusula_$($env:RELEASE_VERSION)_x64.nsis.zip.sig")
+
+      - name: Bundle separately signed private initial-release acceptance baseline
+        if: ${{ inputs.build_initial_acceptance_baseline }}
+        shell: pwsh
+        env:
+          ARTIFACT_SIGNING_ENDPOINT: ${{ vars.ARTIFACT_SIGNING_ENDPOINT }}
+          ARTIFACT_SIGNING_ACCOUNT: ${{ vars.ARTIFACT_SIGNING_ACCOUNT }}
+          ARTIFACT_SIGNING_PROFILE: ${{ vars.ARTIFACT_SIGNING_PROFILE }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $targetExecutable = (Resolve-Path -LiteralPath 'src-tauri\target\release\pusula-desktop.exe').Path
+          $baselineExecutable = Join-Path $env:RUNNER_TEMP 'initial-acceptance-baseline-unsigned.exe'
+          $candidateExecutable = Join-Path $env:RUNNER_TEMP 'candidate-unsigned.exe'
+          $bundleDir = 'src-tauri\target\release\bundle\nsis'
+          $artifactDir = 'acceptance-baseline'
+          New-Item -ItemType Directory -Force -Path $artifactDir | Out-Null
+
+          Copy-Item -LiteralPath $baselineExecutable -Destination $targetExecutable -Force
+          try {
+            Remove-Item -LiteralPath $bundleDir -Recurse -Force -ErrorAction Stop
+            npm run tauri -- bundle --bundles nsis --ci --config (Join-Path $env:RUNNER_TEMP 'initial-baseline-signing.json')
+            if ($LASTEXITCODE -ne 0) { throw 'Private acceptance baseline bundling failed.' }
+            $installers = @(Get-ChildItem -LiteralPath $bundleDir -Filter '*-setup.exe')
+            if ($installers.Count -ne 1) { throw "Expected one private baseline installer, found $($installers.Count)." }
+
+            $productVersion = [Diagnostics.FileVersionInfo]::GetVersionInfo($targetExecutable).ProductVersion
+            if (-not [string]::Equals($productVersion, $env:ACCEPTANCE_BASELINE_VERSION, [StringComparison]::Ordinal)) {
+              throw "Signed baseline executable reports ProductVersion '$productVersion', expected '$($env:ACCEPTANCE_BASELINE_VERSION)'."
+            }
+            $baselineName = "Pusula_$($env:ACCEPTANCE_BASELINE_VERSION)_to_$($env:RELEASE_VERSION)_acceptance-only_offline-setup.exe"
+            Copy-Item -LiteralPath $installers[0].FullName -Destination (Join-Path $artifactDir $baselineName)
+          } finally {
+            Copy-Item -LiteralPath $candidateExecutable -Destination $targetExecutable -Force
+          }
+
+      - name: End Azure signing session
+        shell: pwsh
+        run: |
+          az logout
+          az account clear
+
+      - name: Verify Authenticode signer, timestamp, and updater payload
+        shell: pwsh
+        env:
+          EXPECTED_WINDOWS_PUBLISHER: ${{ vars.EXPECTED_WINDOWS_PUBLISHER }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = $env:RELEASE_VERSION
+          $leanInstaller = (Resolve-Path -LiteralPath "release-assets\Pusula_${version}_x64-setup.exe").Path
+          $updater = (Resolve-Path -LiteralPath "release-assets\Pusula_${version}_x64.nsis.zip").Path
+          $extractDir = Join-Path $env:RUNNER_TEMP 'updater-payload'
+          Remove-Item -LiteralPath $extractDir -Recurse -Force -ErrorAction SilentlyContinue
+          Expand-Archive -LiteralPath $updater -DestinationPath $extractDir
+          $payloadExecutables = @(Get-ChildItem -LiteralPath $extractDir -Filter '*.exe' -File -Recurse)
+          if ($payloadExecutables.Count -ne 1) { throw "Expected one updater executable, found $($payloadExecutables.Count)." }
+          $leanHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $leanInstaller).Hash
+          $payloadHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $payloadExecutables[0].FullName).Hash
+          if ($leanHash -ne $payloadHash) { throw 'Updater ZIP does not contain the verified lean installer.' }
+
           $executables = @(
-            (Get-Item -LiteralPath 'src-tauri\target\release\pusula-desktop.exe'),
-            (Get-Item -LiteralPath "release-assets\Pusula_${{ inputs.version }}_x64_offline-setup.exe"),
-            (Get-Item -LiteralPath "release-assets\Pusula_${{ inputs.version }}_x64-setup.exe")
+            (Get-Item -LiteralPath "release-assets\Pusula_${version}_x64_offline-setup.exe"),
+            (Get-Item -LiteralPath $leanInstaller),
+            $payloadExecutables[0]
           )
           foreach ($executable in $executables) {
             $signature = Get-AuthenticodeSignature -LiteralPath $executable.FullName
             if ($signature.Status -ne 'Valid') { throw "Invalid Authenticode signature: $($executable.Name) [$($signature.Status)]" }
             if (-not $signature.TimeStamperCertificate) { throw "Missing Authenticode timestamp: $($executable.Name)" }
+            $publisher = $signature.SignerCertificate.GetNameInfo(
+              [Security.Cryptography.X509Certificates.X509NameType]::SimpleName,
+              $false
+            )
+            if (-not [string]::Equals($publisher, $env:EXPECTED_WINDOWS_PUBLISHER, [StringComparison]::Ordinal)) {
+              throw "Unexpected Authenticode publisher for $($executable.Name): $publisher"
+            }
+          }
+          Remove-Item -LiteralPath $extractDir -Recurse -Force
+
+      - name: Verify private acceptance baseline identity and Authenticode signatures
+        if: ${{ inputs.build_initial_acceptance_baseline }}
+        shell: pwsh
+        env:
+          EXPECTED_WINDOWS_PUBLISHER: ${{ vars.EXPECTED_WINDOWS_PUBLISHER }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $baselineExecutable = Get-Item -LiteralPath (Join-Path $env:RUNNER_TEMP 'initial-acceptance-baseline-unsigned.exe')
+          $baselineName = "Pusula_$($env:ACCEPTANCE_BASELINE_VERSION)_to_$($env:RELEASE_VERSION)_acceptance-only_offline-setup.exe"
+          $baselineInstaller = Get-Item -LiteralPath (Join-Path 'acceptance-baseline' $baselineName)
+          $productVersion = [Diagnostics.FileVersionInfo]::GetVersionInfo($baselineExecutable.FullName).ProductVersion
+          if (-not [string]::Equals($productVersion, $env:ACCEPTANCE_BASELINE_VERSION, [StringComparison]::Ordinal)) {
+            throw "Private baseline reports ProductVersion '$productVersion', expected '$($env:ACCEPTANCE_BASELINE_VERSION)'."
           }
 
-      - name: Create update manifest
+          foreach ($executable in @($baselineInstaller)) {
+            $signature = Get-AuthenticodeSignature -LiteralPath $executable.FullName
+            if ($signature.Status -ne 'Valid') { throw "Invalid private baseline signature: $($executable.Name) [$($signature.Status)]" }
+            if (-not $signature.TimeStamperCertificate) { throw "Missing private baseline timestamp: $($executable.Name)" }
+            $publisher = $signature.SignerCertificate.GetNameInfo(
+              [Security.Cryptography.X509Certificates.X509NameType]::SimpleName,
+              $false
+            )
+            if (-not [string]::Equals($publisher, $env:EXPECTED_WINDOWS_PUBLISHER, [StringComparison]::Ordinal)) {
+              throw "Unexpected private baseline publisher for $($executable.Name): $publisher"
+            }
+          }
+
+      - name: Encrypt private acceptance baseline before artifact upload
+        if: ${{ inputs.build_initial_acceptance_baseline }}
+        shell: pwsh
+        env:
+          ACCEPTANCE_BASELINE_ARCHIVE_PASSWORD: ${{ secrets.ACCEPTANCE_BASELINE_ARCHIVE_PASSWORD }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ([string]::IsNullOrWhiteSpace($env:ACCEPTANCE_BASELINE_ARCHIVE_PASSWORD) -or
+              $env:ACCEPTANCE_BASELINE_ARCHIVE_PASSWORD.Length -lt 24) {
+            throw 'ACCEPTANCE_BASELINE_ARCHIVE_PASSWORD must be a one-time secret of at least 24 characters.'
+          }
+          $sevenZipCommand = Get-Command '7z.exe' -ErrorAction SilentlyContinue
+          $sevenZipPath = if ($sevenZipCommand) { $sevenZipCommand.Source } else { $null }
+          if (-not $sevenZipPath) {
+            $fallback = Join-Path $env:ProgramFiles '7-Zip\7z.exe'
+            if (Test-Path -LiteralPath $fallback -PathType Leaf) { $sevenZipPath = $fallback }
+          }
+          if (-not $sevenZipPath) { throw '7-Zip is required to encrypt the private acceptance baseline.' }
+
+          $baselineName = "Pusula_$($env:ACCEPTANCE_BASELINE_VERSION)_to_$($env:RELEASE_VERSION)_acceptance-only_offline-setup.exe"
+          $baselineInstaller = (Resolve-Path -LiteralPath (Join-Path 'acceptance-baseline' $baselineName)).Path
+          $encryptedDir = 'encrypted-acceptance-baseline'
+          $archiveName = "Pusula_$($env:ACCEPTANCE_BASELINE_VERSION)_to_$($env:RELEASE_VERSION)_acceptance-only.7z"
+          $archivePath = Join-Path $encryptedDir $archiveName
+          New-Item -ItemType Directory -Force -Path $encryptedDir | Out-Null
+
+          try {
+            & $sevenZipPath a -t7z -mx=9 -mhe=on "-p$($env:ACCEPTANCE_BASELINE_ARCHIVE_PASSWORD)" $archivePath $baselineInstaller
+            if ($LASTEXITCODE -ne 0) { throw 'Encrypted private baseline archive creation failed.' }
+            & $sevenZipPath t "-p$($env:ACCEPTANCE_BASELINE_ARCHIVE_PASSWORD)" $archivePath
+            if ($LASTEXITCODE -ne 0) { throw 'Encrypted private baseline archive verification failed.' }
+            $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $archivePath).Hash.ToLowerInvariant()
+            "$hash  $archiveName" |
+              Set-Content -LiteralPath (Join-Path $encryptedDir "$archiveName.sha256") -Encoding ascii
+          } finally {
+            Remove-Item -LiteralPath 'acceptance-baseline' -Recurse -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath (Join-Path $env:RUNNER_TEMP 'initial-acceptance-baseline-unsigned.exe') -Force -ErrorAction SilentlyContinue
+          }
+
+      - name: Verify Tauri updater signature against embedded public key
         shell: pwsh
         run: |
-          .\scripts\New-UpdateManifest.ps1 `
-            -Version '${{ inputs.version }}' `
-            -SignaturePath "release-assets\Pusula_${{ inputs.version }}_x64.nsis.zip.sig" `
-            -ArtifactName "Pusula_${{ inputs.version }}_x64.nsis.zip" `
-            -Repository '${{ github.repository }}' `
-            -OutputPath 'release-assets\latest.json'
+          .\scripts\Test-TauriUpdaterSignature.ps1 `
+            -ArtifactPath "release-assets\Pusula_$($env:RELEASE_VERSION)_x64.nsis.zip" `
+            -SignaturePath "release-assets\Pusula_$($env:RELEASE_VERSION)_x64.nsis.zip.sig" `
+            -TauriConfigPath 'src-tauri\tauri.conf.json' `
+            -MinisignPath $env:MINISIGN_PATH
 
-      - name: Publish GitHub release
+      - name: Create and verify immutable release metadata
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $arguments = @(
-            'release','create',"v${{ inputs.version }}",
-            '--target','main',
-            '--title',"Pusula ${{ inputs.version }}",
-            '--generate-notes'
+          .\scripts\New-UpdateManifest.ps1 `
+            -Version $env:RELEASE_VERSION `
+            -SignaturePath "release-assets\Pusula_$($env:RELEASE_VERSION)_x64.nsis.zip.sig" `
+            -ArtifactName "Pusula_$($env:RELEASE_VERSION)_x64.nsis.zip" `
+            -Repository $env:RELEASE_REPOSITORY `
+            -OutputPath 'release-assets\latest.json'
+          Get-ChildItem -LiteralPath release-assets -File |
+            Sort-Object Name |
+            ForEach-Object {
+              $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName).Hash.ToLowerInvariant()
+              "$hash  $($_.Name)"
+            } |
+            Set-Content -LiteralPath 'release-assets\SHA256SUMS.txt' -Encoding ascii
+          .\scripts\Test-ReleaseAssets.ps1 `
+            -Directory release-assets `
+            -Version $env:RELEASE_VERSION `
+            -Repository $env:RELEASE_REPOSITORY
+
+      - name: Upload encrypted non-distributable initial acceptance baseline
+        if: ${{ inputs.build_initial_acceptance_baseline }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: pusula-encrypted-initial-acceptance-baseline-${{ github.sha }}
+          path: encrypted-acceptance-baseline
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 3
+
+      - name: Upload verified signed release assets
+        id: upload
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: pusula-signed-release-${{ github.sha }}
+          path: release-assets
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  publish:
+    needs: sign
+    runs-on: windows-latest
+    environment: windows-release
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Download verified signed release assets
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: pusula-signed-release-${{ github.sha }}
+          path: release-assets
+      - name: Revalidate release identity and asset allowlist
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          .\scripts\Test-ReleaseIdentity.ps1 `
+            -ExpectedVersion $env:RELEASE_VERSION `
+            -Repository $env:RELEASE_REPOSITORY `
+            -ExpectedCommit $env:RELEASE_COMMIT `
+            -Prerelease $env:RELEASE_PRERELEASE
+          .\scripts\Test-ReleaseAssets.ps1 `
+            -Directory release-assets `
+            -Version $env:RELEASE_VERSION `
+            -Repository $env:RELEASE_REPOSITORY
+
+      - name: Create validated draft, upload allowlisted assets, and publish atomically
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = "v$($env:RELEASE_VERSION)"
+          $releaseArgs = @(
+            'release', 'create', $tag,
+            '--repo', $env:RELEASE_REPOSITORY,
+            '--target', $env:RELEASE_COMMIT,
+            '--title', "Pusula $($env:RELEASE_VERSION)",
+            '--generate-notes',
+            '--draft'
           )
-          if ('${{ inputs.prerelease }}' -eq 'true') { $arguments += '--prerelease' }
-          $arguments += Get-ChildItem -LiteralPath release-assets | ForEach-Object { $_.FullName }
-          gh @arguments
+          if ($env:RELEASE_PRERELEASE -eq 'true') { $releaseArgs += '--prerelease' }
+          gh @releaseArgs
+          if ($LASTEXITCODE -ne 0) { throw 'Could not create the draft GitHub release.' }
+
+          $assets = @(Get-ChildItem -LiteralPath release-assets -File | Sort-Object Name)
+          $uploadArgs = @('release', 'upload', $tag, '--repo', $env:RELEASE_REPOSITORY) + @($assets.FullName)
+          gh @uploadArgs
+          if ($LASTEXITCODE -ne 0) { throw 'Release asset upload failed; the release remains a draft.' }
+
+          $releaseJson = gh api "repos/$($env:RELEASE_REPOSITORY)/releases/tags/$tag"
+          if ($LASTEXITCODE -ne 0) { throw 'Could not read the uploaded draft release through the GitHub API.' }
+          $release = $releaseJson | ConvertFrom-Json
+          if (-not $release.draft) { throw 'Release was exposed before validation completed.' }
+          if ([bool]$release.prerelease -ne ($env:RELEASE_PRERELEASE -eq 'true')) { throw 'Draft prerelease state is incorrect.' }
+          if ([string]$release.target_commitish -ne $env:RELEASE_COMMIT) { throw 'Draft release target differs from the built commit.' }
+          $localAssets = @($assets | ForEach-Object {
+            [pscustomobject][ordered]@{
+              name = $_.Name
+              size = [long]$_.Length
+              digest = "sha256:$((Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName).Hash.ToLowerInvariant())"
+            }
+          } | Sort-Object name)
+          $remoteAssets = @($release.assets | ForEach-Object {
+            if ([string]::IsNullOrWhiteSpace([string]$_.digest)) {
+              throw "GitHub did not return a digest for uploaded asset $($_.name); the draft will not be published."
+            }
+            [pscustomobject][ordered]@{
+              name = [string]$_.name
+              size = [long]$_.size
+              digest = ([string]$_.digest).ToLowerInvariant()
+            }
+          } | Sort-Object name)
+          if (($localAssets | ConvertTo-Json -Compress) -ne ($remoteAssets | ConvertTo-Json -Compress)) {
+            throw 'Remote release asset names, sizes, or SHA-256 digests do not exactly match the verified local allowlist.'
+          }
+
+          $publishArgs = @('release', 'edit', $tag, '--repo', $env:RELEASE_REPOSITORY, '--draft=false')
+          if ($env:RELEASE_PRERELEASE -eq 'false') { $publishArgs += '--latest' }
+          gh @publishArgs
+          if ($LASTEXITCODE -ne 0) { throw 'Validated release could not be published; it remains a draft.' }

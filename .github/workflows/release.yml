@@ -15,6 +15,7 @@ on:
 
 permissions:
   contents: write
+  id-token: write
 
 concurrency:
   group: pusula-windows-release
@@ -23,11 +24,16 @@ concurrency:
 jobs:
   release:
     runs-on: windows-latest
+    environment: windows-release
     env:
       TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
       TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-      WINDOWS_CODESIGN_PFX_BASE64: ${{ secrets.WINDOWS_CODESIGN_PFX_BASE64 }}
-      WINDOWS_CODESIGN_PASSWORD: ${{ secrets.WINDOWS_CODESIGN_PASSWORD }}
+      AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+      AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+      AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      ARTIFACT_SIGNING_ENDPOINT: ${{ vars.ARTIFACT_SIGNING_ENDPOINT }}
+      ARTIFACT_SIGNING_ACCOUNT: ${{ vars.ARTIFACT_SIGNING_ACCOUNT }}
+      ARTIFACT_SIGNING_PROFILE: ${{ vars.ARTIFACT_SIGNING_PROFILE }}
       GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v4
@@ -41,14 +47,74 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 8.0.x
 
       - name: Require signing credentials
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          foreach ($name in 'TAURI_SIGNING_PRIVATE_KEY','TAURI_SIGNING_PRIVATE_KEY_PASSWORD','WINDOWS_CODESIGN_PFX_BASE64','WINDOWS_CODESIGN_PASSWORD') {
-            if ([string]::IsNullOrWhiteSpace((Get-Item "env:$name").Value)) { throw "Missing required release secret: $name" }
+          foreach ($name in 'TAURI_SIGNING_PRIVATE_KEY','TAURI_SIGNING_PRIVATE_KEY_PASSWORD','AZURE_CLIENT_ID','AZURE_TENANT_ID','AZURE_SUBSCRIPTION_ID','ARTIFACT_SIGNING_ENDPOINT','ARTIFACT_SIGNING_ACCOUNT','ARTIFACT_SIGNING_PROFILE') {
+            if ([string]::IsNullOrWhiteSpace((Get-Item "env:$name").Value)) { throw "Missing required release value: $name" }
           }
+
+          $endpoint = [Uri]$env:ARTIFACT_SIGNING_ENDPOINT
+          if ($endpoint.Scheme -ne 'https' -or -not $endpoint.Host.EndsWith('.codesigning.azure.net', [StringComparison]::OrdinalIgnoreCase)) {
+            throw 'ARTIFACT_SIGNING_ENDPOINT must be an HTTPS Azure Artifact Signing endpoint.'
+          }
+
+      - name: Authenticate to Azure with GitHub OIDC
+        uses: azure/login@v3
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Install Microsoft Artifact Signing client tools
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
+          $msiPath = Join-Path $env:RUNNER_TEMP 'ArtifactSigningClientTools.msi'
+          $clientToolsUri = 'https://download.microsoft.com/download/70ad2c3b-761f-4aa9-a9de-e7405aa2b4c1/ArtifactSigningClientTools.msi'
+
+          try {
+            Invoke-WebRequest -Uri $clientToolsUri -OutFile $msiPath
+            $signature = Get-AuthenticodeSignature -LiteralPath $msiPath
+            if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notmatch 'O=Microsoft Corporation') {
+              throw "Artifact Signing client installer signature is not valid Microsoft code: $($signature.Status)"
+            }
+
+            $install = Start-Process msiexec.exe -ArgumentList @('/i', $msiPath, '/quiet', '/norestart') -Wait -PassThru
+            if ($install.ExitCode -notin 0, 3010) {
+              throw "Artifact Signing client installer failed with exit code $($install.ExitCode)."
+            }
+          } finally {
+            Remove-Item -LiteralPath $msiPath -Force -ErrorAction SilentlyContinue
+          }
+
+          $dlibRoots = @(
+            (Join-Path $env:LOCALAPPDATA 'Microsoft\ArtifactSigningTools'),
+            (Join-Path ${env:ProgramFiles(x86)} 'Microsoft\ArtifactSigningClientTools'),
+            (Join-Path $env:ProgramFiles 'Microsoft\ArtifactSigningClientTools')
+          ) | Where-Object { $_ -and (Test-Path -LiteralPath $_) }
+          $dlib = $dlibRoots |
+            ForEach-Object { Get-ChildItem -LiteralPath $_ -Filter 'Azure.CodeSigning.Dlib.dll' -Recurse -ErrorAction SilentlyContinue } |
+            Select-Object -First 1
+          if (-not $dlib) { throw 'Azure.CodeSigning.Dlib.dll was not installed.' }
+
+          $signTool = Get-ChildItem -Path "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" -ErrorAction SilentlyContinue |
+            Sort-Object { try { [Version]$_.Directory.Parent.Name } catch { [Version]'0.0' } } -Descending |
+            Select-Object -First 1
+          if (-not $signTool) { throw 'A supported x64 signtool.exe was not found.' }
+          $signToolVersion = [Version]$signTool.Directory.Parent.Name
+          if ($signToolVersion -lt [Version]'10.0.22621.0') {
+            throw "signtool.exe $signToolVersion is older than the minimum supported version 10.0.22621.0."
+          }
+
+          "ARTIFACT_SIGNING_DLIB_PATH=$($dlib.FullName)" >> $env:GITHUB_ENV
+          "SIGNTOOL_PATH=$($signTool.FullName)" >> $env:GITHUB_ENV
 
       - run: npm ci
       - name: Verify version metadata
@@ -59,27 +125,16 @@ jobs:
       - run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
       - run: cargo test --manifest-path src-tauri/Cargo.toml
 
-      - name: Import Authenticode certificate
-        id: certificate
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $pfxPath = Join-Path $env:RUNNER_TEMP 'pusula-codesign.pfx'
-          [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:WINDOWS_CODESIGN_PFX_BASE64))
-          $securePassword = ConvertTo-SecureString $env:WINDOWS_CODESIGN_PASSWORD -AsPlainText -Force
-          $certificate = Import-PfxCertificate -FilePath $pfxPath -CertStoreLocation Cert:\CurrentUser\My -Password $securePassword
-          if (-not $certificate.HasPrivateKey) { throw 'Imported certificate has no private key' }
-          "thumbprint=$($certificate.Thumbprint)" >> $env:GITHUB_OUTPUT
-          Remove-Item -LiteralPath $pfxPath -Force
-
       - name: Create build overrides
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
+          $signingScript = (Resolve-Path -LiteralPath '.\scripts\Invoke-ArtifactSigning.ps1').Path
           $windows = [ordered]@{
-            certificateThumbprint = '${{ steps.certificate.outputs.thumbprint }}'
-            digestAlgorithm = 'sha256'
-            timestampUrl = 'http://timestamp.digicert.com'
+            signCommand = [ordered]@{
+              cmd = 'pwsh'
+              args = @('-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', $signingScript, '%1')
+            }
           }
           [ordered]@{ bundle = [ordered]@{ windows = $windows } } |
             ConvertTo-Json -Depth 8 |
@@ -121,9 +176,15 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          foreach ($installer in Get-ChildItem -LiteralPath release-assets -Filter '*.exe') {
-            $signature = Get-AuthenticodeSignature -LiteralPath $installer.FullName
-            if ($signature.Status -ne 'Valid') { throw "Invalid Authenticode signature: $($installer.Name) [$($signature.Status)]" }
+          $executables = @(
+            (Get-Item -LiteralPath 'src-tauri\target\release\pusula-desktop.exe'),
+            (Get-Item -LiteralPath "release-assets\Pusula_${{ inputs.version }}_x64_offline-setup.exe"),
+            (Get-Item -LiteralPath "release-assets\Pusula_${{ inputs.version }}_x64-setup.exe")
+          )
+          foreach ($executable in $executables) {
+            $signature = Get-AuthenticodeSignature -LiteralPath $executable.FullName
+            if ($signature.Status -ne 'Valid') { throw "Invalid Authenticode signature: $($executable.Name) [$($signature.Status)]" }
+            if (-not $signature.TimeStamperCertificate) { throw "Missing Authenticode timestamp: $($executable.Name)" }
           }
 
       - name: Create update manifest
@@ -149,9 +210,3 @@ jobs:
           if ('${{ inputs.prerelease }}' -eq 'true') { $arguments += '--prerelease' }
           $arguments += Get-ChildItem -LiteralPath release-assets | ForEach-Object { $_.FullName }
           gh @arguments
-
-      - name: Remove imported certificate
-        if: always() && steps.certificate.outputs.thumbprint != ''
-        shell: pwsh
-        run: Remove-Item -LiteralPath "Cert:\CurrentUser\My\${{ steps.certificate.outputs.thumbprint }}" -Force -ErrorAction SilentlyContinue
-

@@ -7,28 +7,40 @@ shared support folder.
 
 ## Backup design
 
-Pusula creates a consistent SQLite online-backup snapshot in a temporary file
-and encrypts it with the fixed age X25519 recovery recipient before anything
-enters the persistent queue or is sent to the network. The temporary plaintext
-snapshot is removed when encryption finishes. The Windows queue is:
+Pusula creates a consistent SQLite online-backup snapshot in an in-memory
+SQLite connection, verifies it, and streams its serialized bytes directly into
+age encryption. No plaintext snapshot is written to a filesystem temporary
+file. Only the encrypted result enters the persistent queue or network. The
+Windows queue is:
 
 ```text
 %LOCALAPPDATA%\com.stronganchor.pusula\backup-queue\
   backup-YYYYMMDDTHHMMSSZ-<uuid>-<rolling|daily|monthly>.sqlite3.age
   backup-YYYYMMDDTHHMMSSZ-<uuid>-<rolling|daily|monthly>.sqlite3.age.json
+  backup-YYYYMMDDTHHMMSSZ-<uuid>-local-recovery.sqlite3.age
+  backup-YYYYMMDDTHHMMSSZ-<uuid>-local-recovery.sqlite3.age.json
 ```
 
 The JSON sidecar is nonsecret bookkeeping: format version, timestamp,
 retention class, ciphertext size/SHA-256, and optional upload stage/backup ID.
 It contains no token, presigned URL, object key, customer data, or local path.
 
-The desktop creates rolling backups for pre-operation and manual protection and
+The desktop creates rolling backups for manual and pre-update protection and
 uses daily/monthly retention classes for scheduled protection. While offline,
 the local queue keeps at most 14 rolling, eight daily, and four monthly pending
-artifacts. A local artifact is removed only after the gateway verifies its
-remote object. The scheduler wakes every six hours and retries queued
-ciphertext on the next due pass after reconnection. Backblaze and the gateway
-never possess the age private identity and cannot decrypt a backup.
+artifacts. A normal queued artifact is removed only after the gateway verifies
+its remote object. A destructive import creates a separate `local-recovery`
+artifact that is never uploaded or removed by queue flushing; the newest three
+are retained on the PC for rollback. The scheduler wakes every six hours and
+retries normal queued ciphertext on the next due pass after reconnection.
+Backblaze and the gateway never possess the age private identity and cannot
+decrypt a backup.
+
+Malformed sidecars are isolated under `backup-queue\quarantine` and rebuilt
+when safe; ciphertext whose recorded size or SHA-256 no longer matches is also
+quarantined. The maintenance screen reports this degraded state. Do not delete
+quarantined evidence until an administrator has investigated and obtained a
+new verified backup.
 
 ## Recovery prerequisites
 

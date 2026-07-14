@@ -24,8 +24,13 @@ Fast validation:
 
 ```powershell
 npm run build
+npm run test:frontend
 cargo fmt --manifest-path src-tauri/Cargo.toml --check
+cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 cargo test --manifest-path src-tauri/Cargo.toml
+cargo fmt --manifest-path gateway/Cargo.toml --check
+cargo clippy --manifest-path gateway/Cargo.toml --all-targets -- -D warnings
+cargo test --manifest-path gateway/Cargo.toml
 ```
 
 An unsigned local installer can be built for testing with:

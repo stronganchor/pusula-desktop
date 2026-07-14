@@ -29,3 +29,12 @@ test("update failures are reported according to their actual phase", () => {
   assert.match(updateFailureMessage("installing", false), /kurulamadı/);
   assert.match(updateFailureMessage("relaunching", false), /kapatıp yeniden açın/);
 });
+
+test("declined and failed downloads always release their native update resources", () => {
+  assert.match(source, /let update: Update \| null = null/);
+  const decline = source.indexOf("if (!installNow) return");
+  const finallyBlock = source.indexOf("} finally {");
+  const close = source.indexOf("await update.close()", finallyBlock);
+  assert.ok(decline >= 0 && finallyBlock > decline && close > finallyBlock);
+  assert.equal((source.match(/await update\.close\(\)/g) || []).length, 1);
+});

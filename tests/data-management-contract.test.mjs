@@ -29,6 +29,17 @@ test("import completion evidence is retained and rendered", () => {
   assert.match(source, /sameTotals\(status\.totals, summary\.totals\)/);
   assert.match(source, /await readStatusWithRetry\(\)/);
   assert.match(source, /return false;[\s\S]*const verificationError/);
+  assert.match(source, /blockAfterCommittedImport\(/);
+  assert.match(source, /modal\.dataset\.fatal = "committed-import-unverified"/);
+  assert.match(source, /setBusy\(true\)/);
+  assert.match(source, /importVerificationError\(status, status\.last_import\)/);
+  assert.match(source, /Son içe aktarma açılış denetimini geçemedi/);
+
+  const committedFailure = source.slice(
+    source.indexOf("let status: DatabaseStatus"),
+    source.indexOf("renderStatus(status, summary)"),
+  );
+  assert.equal(committedFailure.includes("setBusy(false)"), false);
 });
 
 test("backup queue degradation and retained local recovery are visible", () => {

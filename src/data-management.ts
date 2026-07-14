@@ -276,6 +276,20 @@ function setBusy(busy: boolean): void {
   byId<HTMLInputElement>("pusula-device-name").disabled = busy;
 }
 
+function blockAfterCommittedImport(message: string): void {
+  // The database transaction completed, but the renderer could not prove what
+  // is now on disk. Keep both first-run and maintenance controls unavailable
+  // so stale pre-import state can never be used over the replacement DB.
+  const modal = byId("pusula-data-modal");
+  modal.dataset.fatal = "committed-import-unverified";
+  modal.setAttribute("aria-busy", "true");
+  setBusy(true);
+  setMessage(
+    `${message} Pusula iş ekranı açılmadı. Uygulamayı tamamen kapatıp yeniden açın; açılış denetimi yine başarısız olursa destek alın.`,
+    true,
+  );
+}
+
 async function chooseImportPath(): Promise<string | null> {
   const path = await open({
     title: "Pusula veri dosyasını seçin",
@@ -320,21 +334,17 @@ async function importFile(mode: ModalMode): Promise<boolean> {
   try {
     status = await readStatusWithRetry();
   } catch (error) {
-    setMessage(
-      `İçe aktarma veritabanına kaydedildi (SHA-256: ${summary.sha256}), ancak üç durum okuması da başarısız oldu. Pusula iş ekranı açılmadı; uygulamayı kapatmadan destek alın. ${String(error)}`,
-      true,
+    blockAfterCommittedImport(
+      `İçe aktarma veritabanına kaydedildi (SHA-256: ${summary.sha256}), ancak üç durum okuması da başarısız oldu. ${String(error)}`,
     );
-    setBusy(false);
     return false;
   }
 
   const verificationError = importVerificationError(status, summary);
   if (verificationError) {
-    setMessage(
-      `İçe aktarma veritabanına kaydedildi ancak doğrulama başarısız: ${verificationError}. Pusula iş ekranı açılmadı; destek alın.`,
-      true,
+    blockAfterCommittedImport(
+      `İçe aktarma veritabanına kaydedildi ancak doğrulama başarısız: ${verificationError}.`,
     );
-    setBusy(false);
     return false;
   }
 
@@ -534,6 +544,14 @@ export async function initializeDataManagement(): Promise<void> {
     throw new Error(
       `SQLite bütünlük denetimi başarısız (${status.integrity_check}). Veri girişi engellendi; kurtarma runbook'unu kullanın.`,
     );
+  }
+  if (status.last_import) {
+    const verificationError = importVerificationError(status, status.last_import);
+    if (verificationError) {
+      throw new Error(
+        `Son içe aktarma açılış denetimini geçemedi (${verificationError}). Veri girişi engellendi; destek alın.`,
+      );
+    }
   }
   if (isEmpty(status) && !status.onboarding_complete) {
     await showFirstRun(status);

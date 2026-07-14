@@ -4,7 +4,15 @@ pub mod db;
 mod error;
 pub mod models;
 
-use std::{future::Future, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    future::Future,
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 
 use backup::{
     BackupEnrollment, BackupRunReport, BackupService, BackupStatusReport, RetentionClass,
@@ -24,8 +32,65 @@ struct BackupState {
     service: BackupService,
 }
 
+const UPDATE_MAINTENANCE_LEASE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+
+struct UpdateMaintenanceLease {
+    id: u64,
+    _guard: OwnedRwLockWriteGuard<()>,
+}
+
 struct UpdateState {
-    maintenance_guard: Mutex<Option<OwnedRwLockWriteGuard<()>>>,
+    maintenance_lease: Arc<Mutex<Option<UpdateMaintenanceLease>>>,
+    next_lease_id: AtomicU64,
+}
+
+impl UpdateState {
+    fn new() -> Self {
+        Self {
+            maintenance_lease: Arc::new(Mutex::new(None)),
+            next_lease_id: AtomicU64::new(1),
+        }
+    }
+
+    async fn has_active_lease(&self) -> bool {
+        self.maintenance_lease.lock().await.is_some()
+    }
+
+    async fn retain_guard_until(
+        &self,
+        guard: OwnedRwLockWriteGuard<()>,
+        timeout: Duration,
+    ) -> Result<(), String> {
+        let lease_id = self.next_lease_id.fetch_add(1, Ordering::Relaxed);
+        {
+            let mut current = self.maintenance_lease.lock().await;
+            if current.is_some() {
+                return Err("Güncelleme hazırlığı zaten etkin.".to_owned());
+            }
+            *current = Some(UpdateMaintenanceLease {
+                id: lease_id,
+                _guard: guard,
+            });
+        }
+
+        // A renderer reload or crash cannot leave the database locked for the
+        // rest of the process lifetime. A unique lease id prevents an older
+        // watchdog from releasing a newer update attempt.
+        let maintenance_lease = self.maintenance_lease.clone();
+        let watchdog = tokio::spawn(async move {
+            tokio::time::sleep(timeout).await;
+            let mut current = maintenance_lease.lock().await;
+            if current.as_ref().map(|lease| lease.id) == Some(lease_id) {
+                current.take();
+            }
+        });
+        drop(watchdog);
+        Ok(())
+    }
+
+    async fn cancel(&self) {
+        self.maintenance_lease.lock().await.take();
+    }
 }
 
 async fn run_database_task<T, F>(operation: F) -> Result<T, String>
@@ -230,8 +295,7 @@ async fn prepare_for_update(
     backup_state: State<'_, BackupState>,
     update_state: State<'_, UpdateState>,
 ) -> Result<BackupRunReport, String> {
-    let mut prepared = update_state.maintenance_guard.lock().await;
-    if prepared.is_some() {
+    if update_state.has_active_lease().await {
         return Err("Güncelleme hazırlığı zaten etkin.".to_owned());
     }
 
@@ -248,13 +312,15 @@ async fn prepare_for_update(
     if !report.encrypted_snapshot_created || !report.safe_to_continue {
         return Err("Güncelleme öncesi şifreli yedek doğrulanamadı.".to_owned());
     }
-    *prepared = Some(maintenance_guard);
+    update_state
+        .retain_guard_until(maintenance_guard, UPDATE_MAINTENANCE_LEASE_TIMEOUT)
+        .await?;
     Ok(report)
 }
 
 #[tauri::command]
 async fn cancel_prepared_update(state: State<'_, UpdateState>) -> Result<(), String> {
-    state.maintenance_guard.lock().await.take();
+    state.cancel().await;
     Ok(())
 }
 
@@ -301,9 +367,7 @@ pub fn run() {
             app.manage(BackupState {
                 service: backup_service.clone(),
             });
-            app.manage(UpdateState {
-                maintenance_guard: Mutex::new(None),
-            });
+            app.manage(UpdateState::new());
             tauri::async_runtime::spawn(async move {
                 tokio::time::sleep(Duration::from_secs(30)).await;
                 loop {
@@ -401,10 +465,11 @@ mod tests {
     #[tokio::test]
     async fn prepared_update_blocks_database_operations_until_cancelled() {
         let gate = Arc::new(RwLock::new(()));
-        let update_state = UpdateState {
-            maintenance_guard: Mutex::new(None),
-        };
-        *update_state.maintenance_guard.lock().await = Some(gate.clone().write_owned().await);
+        let update_state = UpdateState::new();
+        update_state
+            .retain_guard_until(gate.clone().write_owned().await, Duration::from_secs(60))
+            .await
+            .unwrap();
 
         assert!(
             tokio::time::timeout(Duration::from_millis(25), gate.clone().read_owned())
@@ -412,7 +477,28 @@ mod tests {
                 .is_err()
         );
 
-        update_state.maintenance_guard.lock().await.take();
+        update_state.cancel().await;
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), gate.read_owned())
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn abandoned_update_lease_releases_database_automatically() {
+        let gate = Arc::new(RwLock::new(()));
+        let update_state = UpdateState::new();
+        update_state
+            .retain_guard_until(gate.clone().write_owned().await, Duration::from_millis(25))
+            .await
+            .unwrap();
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(5), gate.clone().read_owned())
+                .await
+                .is_err()
+        );
         assert!(
             tokio::time::timeout(Duration::from_secs(1), gate.read_owned())
                 .await

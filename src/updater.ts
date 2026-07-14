@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { relaunch } from "@tauri-apps/plugin-process";
-import { check } from "@tauri-apps/plugin-updater";
+import { check, type Update } from "@tauri-apps/plugin-updater";
 import { isSafeBackupReport, updateFailureMessage } from "./update-policy.js";
 
 const SIX_HOURS_MS = 6 * 60 * 60 * 1000;
@@ -30,26 +30,28 @@ export async function checkForApplicationUpdate(showCurrentStatus = false): Prom
   if (!import.meta.env.PROD || !("__TAURI_INTERNALS__" in window) || checkInProgress) return;
   checkInProgress = true;
   let phase: UpdatePhase = "checking";
+  let update: Update | null = null;
 
   try {
-    const update = await check();
+    update = await check();
     if (!update) {
       setSystemStatus(showCurrentStatus ? "Pusula güncel." : "");
       return;
     }
+    const version = update.version;
 
     phase = "downloading";
-    setSystemStatus(`Pusula ${update.version} indiriliyor…`);
+    setSystemStatus(`Pusula ${version} indiriliyor…`);
     await update.download((event) => {
       if (event.event === "Progress" && event.data.chunkLength) {
-        setSystemStatus(`Pusula ${update.version} indiriliyor…`);
+        setSystemStatus(`Pusula ${version} indiriliyor…`);
       }
     });
 
     phase = "awaiting-confirmation";
-    setSystemStatus(`Pusula ${update.version} kurulmaya hazır.`);
+    setSystemStatus(`Pusula ${version} kurulmaya hazır.`);
     const installNow = window.confirm(
-      `Pusula ${update.version} indirildi. Veriler yedeklenip uygulama şimdi yeniden başlatılsın mı?`,
+      `Pusula ${version} indirildi. Veriler yedeklenip uygulama şimdi yeniden başlatılsın mı?`,
     );
     if (!installNow) return;
 
@@ -80,6 +82,16 @@ export async function checkForApplicationUpdate(showCurrentStatus = false): Prom
     const message = updateFailureMessage(phase, showCurrentStatus);
     setSystemStatus(message ?? "", message !== null);
   } finally {
+    // check() and download() allocate native resources. install() consumes the
+    // byte resource, but every decline and failure path must still close the
+    // Update handle or six-hour retries can retain installer-sized buffers.
+    if (update) {
+      try {
+        await update.close();
+      } catch (closeError) {
+        console.warn("Pusula update resources could not be released", closeError);
+      }
+    }
     checkInProgress = false;
   }
 }

@@ -46,15 +46,19 @@ Pusula checks the official GitHub update manifest shortly after launch and
 every six hours while it is running. No internet connection is required until
 an update is available.
 
-Tauri downloads and verifies the updater signature before Pusula asks whether
-to install. If accepted, the Rust backend waits for active database operations,
-blocks new business writes, and creates a consistent encrypted snapshot while
-that exclusive maintenance gate remains held. Only then is the verified,
-Authenticode-signed package installed and the app relaunched. A signature,
-backup, or installer failure stops the appropriate phase; an install failure
-releases the maintenance gate so the current version can continue. The release
-workflow separately refuses to publish installers whose Windows publisher
-signature or timestamp is invalid.
+Tauri downloads the lean Authenticode-signed NSIS installer directly and
+verifies its detached `.exe.sig` updater signature before Pusula asks whether
+to install. This is the same `Pusula_<version>_x64-setup.exe` published with the
+release; it is not wrapped in or extracted from an updater ZIP. If accepted,
+the Rust backend waits for active database operations, blocks new business
+writes, and creates a consistent encrypted snapshot while that exclusive
+maintenance gate remains held. Only then is the verified installer run and the
+app relaunched. A signature, backup, or installer failure stops the appropriate
+phase; an install failure releases the maintenance gate so the current version
+can continue. The larger `Pusula_<version>_x64_offline-setup.exe` remains a
+separate disconnected-install option containing the offline WebView2 runtime.
+The release workflow separately refuses to publish installers whose Windows
+publisher signature or timestamp is invalid.
 
 For remote support, the operator normally only needs to connect the computer
 to the internet, leave Pusula open, and approve the update prompt. If the

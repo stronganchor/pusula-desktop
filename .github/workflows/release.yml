@@ -233,13 +233,26 @@ jobs:
               args = @('-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', $signingScript, '%1')
             }
           }
-          [ordered]@{ bundle = [ordered]@{ windows = $windows } } |
+          [ordered]@{
+            bundle = [ordered]@{
+              createUpdaterArtifacts = $false
+              windows = $windows
+            }
+          } |
             ConvertTo-Json -Depth 8 |
             Set-Content -LiteralPath (Join-Path $env:RUNNER_TEMP 'offline-signing.json') -Encoding utf8
           $leanWindows = [ordered]@{}
           foreach ($entry in $windows.GetEnumerator()) { $leanWindows[$entry.Key] = $entry.Value }
-          $leanWindows.webviewInstallMode = [ordered]@{ type = 'skip' }
-          [ordered]@{ bundle = [ordered]@{ windows = $leanWindows } } |
+          $leanWindows.webviewInstallMode = [ordered]@{
+            type = 'downloadBootstrapper'
+            silent = $true
+          }
+          [ordered]@{
+            bundle = [ordered]@{
+              createUpdaterArtifacts = $true
+              windows = $leanWindows
+            }
+          } |
             ConvertTo-Json -Depth 8 |
             Set-Content -LiteralPath (Join-Path $env:RUNNER_TEMP 'updater-signing.json') -Encoding utf8
 
@@ -328,13 +341,11 @@ jobs:
           Remove-Item -LiteralPath $bundleDir -Recurse -Force -ErrorAction Stop
           npm run tauri -- bundle --bundles nsis --ci --config (Join-Path $env:RUNNER_TEMP 'updater-signing.json')
           $installers = @(Get-ChildItem -LiteralPath $bundleDir -Filter '*-setup.exe')
-          $updaters = @(Get-ChildItem -LiteralPath $bundleDir -Filter '*.nsis.zip')
-          if ($installers.Count -ne 1 -or $updaters.Count -ne 1) { throw 'Lean updater artifacts are ambiguous or incomplete.' }
-          $signaturePath = "$($updaters[0].FullName).sig"
+          if ($installers.Count -ne 1) { throw 'Lean updater installer is ambiguous or incomplete.' }
+          $signaturePath = "$($installers[0].FullName).sig"
           if (-not (Test-Path -LiteralPath $signaturePath -PathType Leaf)) { throw 'Lean updater signature is missing.' }
           Copy-Item -LiteralPath $installers[0].FullName -Destination (Join-Path 'release-assets' "Pusula_$($env:RELEASE_VERSION)_x64-setup.exe")
-          Copy-Item -LiteralPath $updaters[0].FullName -Destination (Join-Path 'release-assets' "Pusula_$($env:RELEASE_VERSION)_x64.nsis.zip")
-          Copy-Item -LiteralPath $signaturePath -Destination (Join-Path 'release-assets' "Pusula_$($env:RELEASE_VERSION)_x64.nsis.zip.sig")
+          Copy-Item -LiteralPath $signaturePath -Destination (Join-Path 'release-assets' "Pusula_$($env:RELEASE_VERSION)_x64-setup.exe.sig")
 
       - name: Bundle separately signed private initial-release acceptance baseline
         if: ${{ inputs.build_initial_acceptance_baseline }}
@@ -384,20 +395,10 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $version = $env:RELEASE_VERSION
           $leanInstaller = (Resolve-Path -LiteralPath "release-assets\Pusula_${version}_x64-setup.exe").Path
-          $updater = (Resolve-Path -LiteralPath "release-assets\Pusula_${version}_x64.nsis.zip").Path
-          $extractDir = Join-Path $env:RUNNER_TEMP 'updater-payload'
-          Remove-Item -LiteralPath $extractDir -Recurse -Force -ErrorAction SilentlyContinue
-          Expand-Archive -LiteralPath $updater -DestinationPath $extractDir
-          $payloadExecutables = @(Get-ChildItem -LiteralPath $extractDir -Filter '*.exe' -File -Recurse)
-          if ($payloadExecutables.Count -ne 1) { throw "Expected one updater executable, found $($payloadExecutables.Count)." }
-          $leanHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $leanInstaller).Hash
-          $payloadHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $payloadExecutables[0].FullName).Hash
-          if ($leanHash -cne $payloadHash) { throw 'Updater ZIP does not contain the verified lean installer.' }
 
           $executables = @(
             (Get-Item -LiteralPath "release-assets\Pusula_${version}_x64_offline-setup.exe"),
-            (Get-Item -LiteralPath $leanInstaller),
-            $payloadExecutables[0]
+            (Get-Item -LiteralPath $leanInstaller)
           )
           foreach ($executable in $executables) {
             $signature = Get-AuthenticodeSignature -LiteralPath $executable.FullName
@@ -411,7 +412,6 @@ jobs:
               throw "Unexpected Authenticode publisher for $($executable.Name): $publisher"
             }
           }
-          Remove-Item -LiteralPath $extractDir -Recurse -Force
 
       - name: Verify private acceptance baseline identity and Authenticode signatures
         if: ${{ inputs.build_initial_acceptance_baseline }}
@@ -484,8 +484,8 @@ jobs:
         shell: pwsh
         run: |
           .\scripts\Test-TauriUpdaterSignature.ps1 `
-            -ArtifactPath "release-assets\Pusula_$($env:RELEASE_VERSION)_x64.nsis.zip" `
-            -SignaturePath "release-assets\Pusula_$($env:RELEASE_VERSION)_x64.nsis.zip.sig" `
+            -ArtifactPath "release-assets\Pusula_$($env:RELEASE_VERSION)_x64-setup.exe" `
+            -SignaturePath "release-assets\Pusula_$($env:RELEASE_VERSION)_x64-setup.exe.sig" `
             -TauriConfigPath 'src-tauri\tauri.conf.json' `
             -MinisignPath $env:MINISIGN_PATH
 
@@ -496,8 +496,8 @@ jobs:
           .\scripts\New-UpdateManifest.ps1 `
             -Version $env:RELEASE_VERSION `
             -ReleaseTag $env:RELEASE_CANDIDATE_TAG `
-            -SignaturePath "release-assets\Pusula_$($env:RELEASE_VERSION)_x64.nsis.zip.sig" `
-            -ArtifactName "Pusula_$($env:RELEASE_VERSION)_x64.nsis.zip" `
+            -SignaturePath "release-assets\Pusula_$($env:RELEASE_VERSION)_x64-setup.exe.sig" `
+            -ArtifactName "Pusula_$($env:RELEASE_VERSION)_x64-setup.exe" `
             -Repository $env:RELEASE_REPOSITORY `
             -OutputPath 'release-assets\latest.json'
           Get-ChildItem -LiteralPath release-assets -File |

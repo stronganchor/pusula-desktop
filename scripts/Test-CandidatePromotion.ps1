@@ -117,7 +117,7 @@ if ($LASTEXITCODE -ne 0) { throw 'Could not download candidate release assets fo
     -Repository $Repository | Out-Host
 
 $minisign = (Resolve-Path -LiteralPath $MinisignPath -ErrorAction Stop).Path
-$updaterName = "Pusula_${Version}_x64.nsis.zip"
+$updaterName = "Pusula_${Version}_x64-setup.exe"
 & (Join-Path $PSScriptRoot 'Test-TauriUpdaterSignature.ps1') `
     -ArtifactPath (Join-Path $DownloadDirectory $updaterName) `
     -SignaturePath (Join-Path $DownloadDirectory "$updaterName.sig") `
@@ -126,39 +126,21 @@ $updaterName = "Pusula_${Version}_x64.nsis.zip"
 
 $offlineInstaller = Get-Item -LiteralPath (Join-Path $DownloadDirectory "Pusula_${Version}_x64_offline-setup.exe")
 $leanInstaller = Get-Item -LiteralPath (Join-Path $DownloadDirectory "Pusula_${Version}_x64-setup.exe")
-$updaterArchive = Get-Item -LiteralPath (Join-Path $DownloadDirectory $updaterName)
-$extractDirectory = Join-Path ([IO.Path]::GetTempPath()) ('pusula-promotion-payload-' + [Guid]::NewGuid().ToString('N'))
-try {
-    Expand-Archive -LiteralPath $updaterArchive.FullName -DestinationPath $extractDirectory
-    $payloadExecutables = @(Get-ChildItem -LiteralPath $extractDirectory -Filter '*.exe' -File -Recurse)
-    if ($payloadExecutables.Count -ne 1) {
-        throw "Expected one updater executable, found $($payloadExecutables.Count)."
+foreach ($executable in @($offlineInstaller, $leanInstaller)) {
+    $signature = Get-AuthenticodeSignature -LiteralPath $executable.FullName
+    if ($signature.Status -ne 'Valid') {
+        throw "Invalid Authenticode signature: $($executable.Name) [$($signature.Status)]"
     }
-    $leanHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $leanInstaller.FullName).Hash
-    $payloadHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $payloadExecutables[0].FullName).Hash
-    if ($leanHash -cne $payloadHash) {
-        throw 'Updater ZIP does not contain the verified lean installer.'
+    if (-not $signature.TimeStamperCertificate) {
+        throw "Missing Authenticode timestamp: $($executable.Name)"
     }
-
-    foreach ($executable in @($offlineInstaller, $leanInstaller, $payloadExecutables[0])) {
-        $signature = Get-AuthenticodeSignature -LiteralPath $executable.FullName
-        if ($signature.Status -ne 'Valid') {
-            throw "Invalid Authenticode signature: $($executable.Name) [$($signature.Status)]"
-        }
-        if (-not $signature.TimeStamperCertificate) {
-            throw "Missing Authenticode timestamp: $($executable.Name)"
-        }
-        $publisher = $signature.SignerCertificate.GetNameInfo(
-            [Security.Cryptography.X509Certificates.X509NameType]::SimpleName,
-            $false
-        )
-        if (-not [string]::Equals($publisher, $ExpectedWindowsPublisher, [StringComparison]::Ordinal)) {
-            throw "Unexpected Authenticode publisher for $($executable.Name): $publisher"
-        }
+    $publisher = $signature.SignerCertificate.GetNameInfo(
+        [Security.Cryptography.X509Certificates.X509NameType]::SimpleName,
+        $false
+    )
+    if (-not [string]::Equals($publisher, $ExpectedWindowsPublisher, [StringComparison]::Ordinal)) {
+        throw "Unexpected Authenticode publisher for $($executable.Name): $publisher"
     }
-}
-finally {
-    Remove-Item -LiteralPath $extractDirectory -Recurse -Force -ErrorAction SilentlyContinue
 }
 
 Write-Output "Immutable candidate $CandidateTag is eligible for stable publication; acceptance evidence SHA-256: $($AcceptanceEvidenceSha256.ToLowerInvariant())"

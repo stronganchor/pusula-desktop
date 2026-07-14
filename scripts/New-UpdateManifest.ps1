@@ -22,7 +22,7 @@ if ($ReleaseTag -cne $stableTag -and $ReleaseTag -cnotmatch $candidateTagPattern
 if ($Repository -notmatch '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$') {
     throw "Invalid GitHub repository name: $Repository"
 }
-$expectedArtifactName = "Pusula_${Version}_x64.nsis.zip"
+$expectedArtifactName = "Pusula_${Version}_x64-setup.exe"
 if ($ArtifactName -cne $expectedArtifactName) {
     throw "Updater artifact name must exactly equal $expectedArtifactName."
 }

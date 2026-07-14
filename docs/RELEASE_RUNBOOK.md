@@ -1,9 +1,11 @@
 # Pusula Desktop Release Runbook
 
 Pusula releases are built from one immutable `main` commit. The Windows
-installer is Authenticode signed, the updater archive is signed with the Tauri
-key embedded in the application, and the exact candidate assets are published
-again under a new stable tag without rebuilding them after acceptance.
+installers are Authenticode signed, the lean NSIS installer is also signed
+directly with the Tauri updater key embedded in the application, and the exact
+candidate assets are published again under a new stable tag without rebuilding
+them after acceptance. The detached `.exe.sig` authenticates the same lean
+installer bytes used as the updater payload; there is no updater ZIP.
 
 ## Repository and environment gates
 
@@ -73,11 +75,16 @@ Before any release:
    ```text
    Pusula_<version>_x64_offline-setup.exe
    Pusula_<version>_x64-setup.exe
-   Pusula_<version>_x64.nsis.zip
-   Pusula_<version>_x64.nsis.zip.sig
+   Pusula_<version>_x64-setup.exe.sig
    latest.json
    SHA256SUMS.txt
    ```
+
+   `Pusula_<version>_x64-setup.exe` is the Authenticode-signed lean NSIS
+   installer and the direct Tauri v2 updater payload. Its adjacent `.exe.sig`
+   is the detached Tauri signature referenced by `latest.json`. The separate
+   `Pusula_<version>_x64_offline-setup.exe` includes the offline WebView2 runtime
+   for disconnected installation and is not downloaded by the in-app updater.
 
 A failed publication remains a draft. Do not rerun over it. Inspect the draft,
 preserve the logs, and delete the draft/tag only after proving no asset was
@@ -206,7 +213,7 @@ the current `main` commit. It downloads the candidate, revalidates the exact
 asset allowlist, SHA-256 values, Tauri updater signature, Authenticode
 publisher, and timestamps, then creates a new draft stable tag `v<version>` at
 that same commit. The tag is created exclusively as a lightweight ref, so a
-concurrent or pre-existing tag fails closed. It uploads the six accepted files
+concurrent or pre-existing tag fails closed. It uploads the five accepted files
 byte-for-byte, then uses the read-only admin token to recheck immutable policy,
 candidate identity, both exact refs, and case-sensitive remote digests before
 the isolated write-token step publishes stable as latest. The workflow reads

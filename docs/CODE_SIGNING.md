@@ -2,7 +2,10 @@
 
 Pusula releases use Microsoft Azure Artifact Signing with a **Public Trust** certificate profile. The private key remains in Microsoft's managed hardware security modules; the release workflow does not import an Authenticode PFX or store a code-signing private key in GitHub.
 
-This is separate from Tauri updater signing. The existing `TAURI_SIGNING_PRIVATE_KEY` and `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` secrets sign the updater archive and must remain configured.
+This is separate from Tauri updater signing. The existing
+`TAURI_SIGNING_PRIVATE_KEY` and `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` secrets
+sign the direct NSIS updater payload and produce its detached `.exe.sig` file;
+they must remain configured.
 
 ## One-time Azure enrollment
 
@@ -84,10 +87,27 @@ Windows executable it bundles.
 
 The helper uses SHA-256 and Microsoft's RFC 3161 timestamp service. It authenticates only through the Azure CLI session created by `azure/login`; interactive and unrelated credential providers are explicitly disabled. A signing or verification failure stops the build.
 
-Signing happens during Tauri bundling so both the inner `pusula-desktop.exe` and each NSIS setup executable are signed before Tauri creates the updater ZIP and updater signature. The optional initial-release acceptance baseline is freshly compiled with its own lower embedded version and direct candidate-manifest endpoint before Azure authentication, then signed separately. Because the repository is public, the workflow encrypts that installer as a header-encrypted AES-256 7-Zip archive before uploading a three-day Actions artifact and deletes the plaintext runner copies. The release gate requires the exact `EXPECTED_WINDOWS_PUBLISHER`, a valid timestamp, a Tauri signature that verifies against the public key embedded in the application, and matching lean-installer bytes inside the updater ZIP. It verifies:
+Signing happens during Tauri bundling so both the inner `pusula-desktop.exe` and
+each NSIS setup executable receive Authenticode signatures. Tauri v2 then uses
+the Authenticode-signed lean installer itself,
+`Pusula_<version>_x64-setup.exe`, as the updater payload and emits its detached
+Tauri signature as `Pusula_<version>_x64-setup.exe.sig`; no updater ZIP is
+created or extracted. The larger
+`Pusula_<version>_x64_offline-setup.exe` remains a separate disconnected-install
+artifact with the offline WebView2 runtime and is not the in-app updater
+payload. The optional initial-release acceptance baseline is freshly compiled
+with its own lower embedded version and direct candidate-manifest endpoint
+before Azure authentication, then signed separately. Because the repository is
+public, the workflow encrypts that installer as a header-encrypted AES-256
+7-Zip archive before uploading a three-day Actions artifact and deletes the
+plaintext runner copies. The release gate requires the exact
+`EXPECTED_WINDOWS_PUBLISHER`, a valid timestamp, and a Tauri signature over the
+exact Authenticode-signed lean installer that verifies against the public key
+embedded in the application. It verifies:
 
 - `Pusula_<version>_x64_offline-setup.exe`
 - `Pusula_<version>_x64-setup.exe`
+- `Pusula_<version>_x64-setup.exe.sig`
 
 Tauri restores the unsigned build-tree executable after it packages each target,
 so that restored file is not used as signature evidence. Acceptance instead

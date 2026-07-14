@@ -43,6 +43,61 @@ jobs:
         run: npm run tauri -- build --no-bundle --ci
       - name: Package unsigned offline NSIS installer
         run: npm run tauri -- bundle --bundles nsis --no-sign --ci
+      - name: Package Tauri v2 lean updater smoke artifact
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $smokeRoot = Join-Path $env:RUNNER_TEMP 'pusula-v2-updater-smoke'
+          $keyPath = Join-Path $smokeRoot 'updater.key'
+          $configPath = Join-Path $smokeRoot 'updater-config.json'
+          $bundleDir = 'src-tauri\target\release\bundle\nsis'
+          Remove-Item -LiteralPath $smokeRoot -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Path $smokeRoot | Out-Null
+          try {
+            $password = [Guid]::NewGuid().ToString('N') + [Guid]::NewGuid().ToString('N')
+            .\node_modules\.bin\tauri.cmd signer generate --ci --write-keys $keyPath --password $password
+            if ($LASTEXITCODE -ne 0) { throw 'Could not generate the ephemeral CI updater key.' }
+            $publicKey = (Get-Content -Raw -LiteralPath "$keyPath.pub").Trim()
+
+            [ordered]@{
+              bundle = [ordered]@{
+                createUpdaterArtifacts = $true
+                windows = [ordered]@{
+                  webviewInstallMode = [ordered]@{
+                    type = 'downloadBootstrapper'
+                    silent = $true
+                  }
+                }
+              }
+              plugins = [ordered]@{
+                updater = [ordered]@{
+                  pubkey = $publicKey
+                }
+              }
+            } |
+              ConvertTo-Json -Depth 8 |
+              Set-Content -LiteralPath $configPath -Encoding utf8
+
+            $env:TAURI_SIGNING_PRIVATE_KEY = Get-Content -Raw -LiteralPath $keyPath
+            $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD = $password
+            Remove-Item -LiteralPath $bundleDir -Recurse -Force -ErrorAction Stop
+            npm run tauri -- bundle --bundles nsis --ci --config $configPath
+            if ($LASTEXITCODE -ne 0) { throw 'Tauri v2 lean updater packaging failed.' }
+
+            $installers = @(Get-ChildItem -LiteralPath $bundleDir -Filter '*-setup.exe' -File)
+            if ($installers.Count -ne 1) { throw "Expected one lean updater installer, found $($installers.Count)." }
+            if (-not (Test-Path -LiteralPath "$($installers[0].FullName).sig" -PathType Leaf)) {
+              throw 'Tauri v2 direct NSIS updater signature is missing.'
+            }
+            if (@(Get-ChildItem -LiteralPath $bundleDir -Filter '*.nsis.zip' -File).Count -ne 0) {
+              throw 'Deprecated Tauri v1-compatible NSIS updater ZIP was generated.'
+            }
+          }
+          finally {
+            Remove-Item Env:TAURI_SIGNING_PRIVATE_KEY -ErrorAction SilentlyContinue
+            Remove-Item Env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $smokeRoot -Recurse -Force -ErrorAction SilentlyContinue
+          }
 
   gateway:
     runs-on: ubuntu-latest

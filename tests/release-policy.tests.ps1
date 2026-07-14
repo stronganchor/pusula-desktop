@@ -17,11 +17,18 @@ if ($LASTEXITCODE -ne 0 -or $commit -cnotmatch '^[0-9a-f]{40}$') {
     throw 'Could not determine the release-policy test commit.'
 }
 $candidateTag = "v$version-candidate.$commit"
+$ciWorkflow = Get-Content -Raw -LiteralPath (Join-Path $repoRoot '.github\workflows\ci.yml')
 $releaseWorkflow = Get-Content -Raw -LiteralPath (Join-Path $repoRoot '.github\workflows\release.yml')
 $promotionWorkflow = Get-Content -Raw -LiteralPath (Join-Path $repoRoot '.github\workflows\promote-release.yml')
 $tauriConfig = Get-Content -Raw -LiteralPath (Join-Path $repoRoot 'src-tauri\tauri.conf.json') | ConvertFrom-Json
 if ([string]$tauriConfig.bundle.windows.webviewInstallMode.type -cne 'offlineInstaller') {
     throw 'Release installer must embed the offline WebView2 installer.'
+}
+$updaterArtifacts = $tauriConfig.bundle.PSObject.Properties['createUpdaterArtifacts']
+if ($null -eq $updaterArtifacts -or
+    $updaterArtifacts.Value -isnot [bool] -or
+    -not [bool]$updaterArtifacts.Value) {
+    throw 'The base Tauri configuration must use modern v2 updater artifacts.'
 }
 if ([string]$tauriConfig.bundle.windows.nsis.installMode -cne 'currentUser') {
     throw 'Release installer must retain current-user installation mode.'
@@ -75,6 +82,25 @@ function Test-OrdinalContains {
     )
 
     return $Text.IndexOf($Value, [StringComparison]::Ordinal) -ge 0
+}
+
+$bundleOverrideStart = $releaseWorkflow.IndexOf('- name: Create deterministic bundle overrides', [StringComparison]::Ordinal)
+$bundleOverrideEnd = $releaseWorkflow.IndexOf('- name: Require release signing configuration', [StringComparison]::Ordinal)
+if ($bundleOverrideStart -lt 0 -or $bundleOverrideEnd -le $bundleOverrideStart) {
+    throw 'Release workflow bundle override step is missing or out of order.'
+}
+$bundleOverrides = $releaseWorkflow.Substring($bundleOverrideStart, $bundleOverrideEnd - $bundleOverrideStart)
+if (-not (Test-OrdinalContains -Text $bundleOverrides -Value 'createUpdaterArtifacts = $false') -or
+    -not (Test-OrdinalContains -Text $bundleOverrides -Value 'createUpdaterArtifacts = $true') -or
+    -not (Test-OrdinalContains -Text $bundleOverrides -Value "type = 'downloadBootstrapper'") -or
+    (Test-OrdinalContains -Text $bundleOverrides -Value "type = 'skip'") -or
+    (Test-OrdinalContains -Text $bundleOverrides -Value 'v1Compatible')) {
+    throw 'Release workflow must build a non-updater offline installer and a modern direct-EXE online updater.'
+}
+if (-not (Test-OrdinalContains -Text $ciWorkflow -Value '- name: Package Tauri v2 lean updater smoke artifact') -or
+    -not (Test-OrdinalContains -Text $ciWorkflow -Value 'Tauri v2 direct NSIS updater signature is missing.') -or
+    -not (Test-OrdinalContains -Text $ciWorkflow -Value 'Deprecated Tauri v1-compatible NSIS updater ZIP was generated.')) {
+    throw 'CI must exercise the modern direct-EXE NSIS updater bundle path.'
 }
 
 Assert-OrderedWorkflowSteps -Workflow $releaseWorkflow -StepNames @(
@@ -219,12 +245,11 @@ try {
         }
         Remove-Item -LiteralPath $candidateConfigPath -Force
 
-        $updaterName = "Pusula_${version}_x64.nsis.zip"
+        $updaterName = "Pusula_${version}_x64-setup.exe"
         $signatureName = "$updaterName.sig"
         $signaturePath = Join-Path $fixtureDirectory $signatureName
         [IO.File]::WriteAllText((Join-Path $fixtureDirectory "Pusula_${version}_x64_offline-setup.exe"), 'offline-fixture')
         [IO.File]::WriteAllText((Join-Path $fixtureDirectory "Pusula_${version}_x64-setup.exe"), 'lean-fixture')
-        [IO.File]::WriteAllText((Join-Path $fixtureDirectory $updaterName), 'updater-fixture')
         [IO.File]::WriteAllText($signaturePath, 'fixture-signature')
         & $manifestScript `
             -Version $version `

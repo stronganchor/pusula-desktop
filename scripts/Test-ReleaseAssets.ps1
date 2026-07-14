@@ -24,10 +24,9 @@ if ($ReleaseTag -cne $stableTag -and $ReleaseTag -cnotmatch $candidateTagPattern
 }
 
 $assetDirectory = (Resolve-Path -LiteralPath $Directory -ErrorAction Stop).Path
-$updaterName = "Pusula_${Version}_x64.nsis.zip"
+$updaterName = "Pusula_${Version}_x64-setup.exe"
 $expectedNames = @(
     "Pusula_${Version}_x64_offline-setup.exe",
-    "Pusula_${Version}_x64-setup.exe",
     $updaterName,
     "$updaterName.sig",
     'latest.json',

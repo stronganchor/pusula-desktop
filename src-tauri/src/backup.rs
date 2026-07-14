@@ -11,13 +11,13 @@ use std::{
 use age::x25519;
 use chrono::{DateTime, Datelike, Duration as ChronoDuration, Utc};
 use reqwest::{
-    header::{HeaderMap, HeaderName, HeaderValue, AUTHORIZATION, COOKIE, PROXY_AUTHORIZATION},
+    header::{HeaderMap, HeaderName, HeaderValue},
     Client, StatusCode,
 };
-use rusqlite::{backup::Backup, Connection};
+use rusqlite::{backup::Backup, Connection, DatabaseName};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tempfile::{Builder as TempfileBuilder, NamedTempFile};
+use tempfile::Builder as TempfileBuilder;
 use tokio::sync::Mutex;
 use tokio_util::io::ReaderStream;
 use url::Url;
@@ -32,6 +32,16 @@ const CREDENTIAL_ACCOUNT: &str = "device-token";
 const QUEUE_METADATA_VERSION: u32 = 1;
 const SCHEDULE_INTERVAL_HOURS: i64 = 24;
 const FAILURE_RETRY_HOURS: i64 = 6;
+const LOCAL_RECOVERY_LIMIT: usize = 3;
+const B2_UPLOAD_HOST: &str = "s3.us-west-004.backblazeb2.com";
+const B2_UPLOAD_PATH_PREFIX: &str = "/stronganchor-pusula-desktop-backups/backups/";
+const QUARANTINE_DIRECTORY: &str = "quarantine";
+const REQUIRED_UPLOAD_HEADERS: [&str; 4] = [
+    "content-length",
+    "x-amz-content-sha256",
+    "x-amz-meta-sha256",
+    "x-amz-server-side-encryption",
+];
 
 #[derive(Debug, thiserror::Error)]
 pub enum BackupError {
@@ -124,6 +134,9 @@ pub struct BackupRunReport {
     pub created_at: String,
     pub uploaded_count: usize,
     pub pending_count: usize,
+    pub local_recovery_count: usize,
+    pub queue_healthy: bool,
+    pub quarantined_file_count: usize,
     pub remote_result: RemoteResult,
 }
 
@@ -133,6 +146,7 @@ pub enum RemoteResult {
     Uploaded,
     QueuedOffline,
     NotEnrolled,
+    LocalRecovery,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -160,6 +174,9 @@ pub struct BackupStatusReport {
     pub enrolled: bool,
     pub device_id: Option<String>,
     pub pending_count: usize,
+    pub local_recovery_count: usize,
+    pub queue_healthy: bool,
+    pub quarantined_file_count: usize,
     pub last_attempt_at: Option<String>,
     pub last_snapshot_at: Option<String>,
     pub last_remote_success_at: Option<String>,
@@ -185,6 +202,8 @@ struct QueueMetadata {
     retention_class: RetentionClass,
     size_bytes: u64,
     sha256: String,
+    #[serde(default)]
+    local_recovery: bool,
     upload: Option<PendingUpload>,
 }
 
@@ -291,7 +310,7 @@ struct UploadUrlRequest<'a> {
     retention_class: RetentionClass,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct UploadUrlResponse {
     backup_id: String,
     method: String,
@@ -384,16 +403,53 @@ impl GatewayClient {
         queued: &QueuedBackup,
         reservation: &UploadUrlResponse,
     ) -> BackupResult<()> {
+        let (upload_url, headers) = self.validate_upload_request(queued, reservation)?;
+
+        let file = tokio::fs::File::open(&queued.path).await?;
+        let body = reqwest::Body::wrap_stream(ReaderStream::new(file));
+        let response = self
+            .client
+            .put(upload_url)
+            .headers(headers)
+            .body(body)
+            .send()
+            .await
+            .map_err(|_| BackupError::GatewayUnavailable)?;
+        ensure_success(response.status())
+    }
+
+    fn validate_upload_request(
+        &self,
+        queued: &QueuedBackup,
+        reservation: &UploadUrlResponse,
+    ) -> BackupResult<(Url, HeaderMap)> {
         if reservation.method != "PUT" {
             return Err(BackupError::InvalidGatewayResponse);
         }
 
         let upload_url =
             Url::parse(&reservation.upload_url).map_err(|_| BackupError::InvalidGatewayResponse)?;
-        if upload_url.scheme() != "https" && !self.allow_insecure_uploads {
+        if !upload_url.username().is_empty()
+            || upload_url.password().is_some()
+            || upload_url.fragment().is_some()
+        {
             return Err(BackupError::InvalidGatewayResponse);
         }
-        if !upload_url.username().is_empty() || upload_url.password().is_some() {
+        if self.allow_insecure_uploads {
+            if !matches!(upload_url.scheme(), "http" | "https") {
+                return Err(BackupError::InvalidGatewayResponse);
+            }
+        } else if upload_url.scheme() != "https"
+            || upload_url.host_str() != Some(B2_UPLOAD_HOST)
+            || upload_url.port_or_known_default() != Some(443)
+            || !upload_url.path().starts_with(B2_UPLOAD_PATH_PREFIX)
+            || upload_url.path() == B2_UPLOAD_PATH_PREFIX
+            || upload_url.query().is_none()
+        {
+            return Err(BackupError::InvalidGatewayResponse);
+        }
+
+        if reservation.required_headers.len() != REQUIRED_UPLOAD_HEADERS.len() {
             return Err(BackupError::InvalidGatewayResponse);
         }
 
@@ -401,7 +457,7 @@ impl GatewayClient {
         for (name, value) in &reservation.required_headers {
             let name = HeaderName::from_bytes(name.as_bytes())
                 .map_err(|_| BackupError::InvalidGatewayResponse)?;
-            if name == AUTHORIZATION || name == PROXY_AUTHORIZATION || name == COOKIE {
+            if !REQUIRED_UPLOAD_HEADERS.contains(&name.as_str()) || headers.contains_key(&name) {
                 return Err(BackupError::InvalidGatewayResponse);
             }
             let value =
@@ -424,18 +480,22 @@ impl GatewayClient {
         {
             return Err(BackupError::InvalidGatewayResponse);
         }
+        if headers
+            .get("x-amz-content-sha256")
+            .and_then(|value| value.to_str().ok())
+            != Some("UNSIGNED-PAYLOAD")
+        {
+            return Err(BackupError::InvalidGatewayResponse);
+        }
+        if headers
+            .get("x-amz-server-side-encryption")
+            .and_then(|value| value.to_str().ok())
+            != Some("AES256")
+        {
+            return Err(BackupError::InvalidGatewayResponse);
+        }
 
-        let file = tokio::fs::File::open(&queued.path).await?;
-        let body = reqwest::Body::wrap_stream(ReaderStream::new(file));
-        let response = self
-            .client
-            .put(upload_url)
-            .headers(headers)
-            .body(body)
-            .send()
-            .await
-            .map_err(|_| BackupError::GatewayUnavailable)?;
-        ensure_success(response.status())
+        Ok((upload_url, headers))
     }
 
     async fn complete(&self, token: &str, backup_id: &str) -> BackupResult<()> {
@@ -568,7 +628,51 @@ impl BackupService {
     }
 
     pub async fn prepare_for_destructive_import(&self) -> BackupResult<BackupRunReport> {
-        self.backup_now(RetentionClass::Rolling).await
+        let _guard = self.operation_lock.lock().await;
+        let database = self.database.clone();
+        let queue_dir = self.queue_dir.clone();
+        let recipient = self.recipient.clone();
+        let queued = tokio::task::spawn_blocking(move || {
+            create_encrypted_snapshot(
+                &database,
+                &queue_dir,
+                &recipient,
+                RetentionClass::Rolling,
+                true,
+            )
+        })
+        .await
+        .map_err(|_| BackupError::Task)??;
+
+        self.prune_queue()?;
+        let queue = self.list_queue()?;
+        let pending_count = queue
+            .iter()
+            .filter(|item| !item.metadata.local_recovery)
+            .count();
+        let local_recovery_count = queue
+            .iter()
+            .filter(|item| item.metadata.local_recovery)
+            .count();
+        let quarantined_file_count = self.quarantined_file_count()?;
+
+        let mut state = self.read_state().unwrap_or_default();
+        state.last_attempt_at = Some(Utc::now().to_rfc3339());
+        state.last_snapshot_at = Some(queued.metadata.created_at.clone());
+        let _ = self.write_state(&state);
+
+        Ok(BackupRunReport {
+            encrypted_snapshot_created: true,
+            safe_to_continue: true,
+            retention_class: RetentionClass::Rolling,
+            created_at: queued.metadata.created_at,
+            uploaded_count: 0,
+            pending_count,
+            local_recovery_count,
+            queue_healthy: quarantined_file_count == 0,
+            quarantined_file_count,
+            remote_result: RemoteResult::LocalRecovery,
+        })
     }
 
     async fn create_and_flush(
@@ -586,7 +690,7 @@ impl BackupService {
         let queue_dir = self.queue_dir.clone();
         let recipient = self.recipient.clone();
         let queued = tokio::task::spawn_blocking(move || {
-            create_encrypted_snapshot(&database, &queue_dir, &recipient, retention_class)
+            create_encrypted_snapshot(&database, &queue_dir, &recipient, retention_class, false)
         })
         .await
         .map_err(|_| BackupError::Task)??;
@@ -619,7 +723,16 @@ impl BackupService {
         state.next_scheduled_at =
             Some((attempted_at + ChronoDuration::hours(next_attempt_hours)).to_rfc3339());
         let _ = self.write_state(&state);
-        let pending_count = self.list_queue().map(|queue| queue.len()).unwrap_or(1);
+        let queue = self.list_queue()?;
+        let pending_count = queue
+            .iter()
+            .filter(|item| !item.metadata.local_recovery)
+            .count();
+        let local_recovery_count = queue
+            .iter()
+            .filter(|item| item.metadata.local_recovery)
+            .count();
+        let quarantined_file_count = self.quarantined_file_count()?;
         Ok(BackupRunReport {
             encrypted_snapshot_created: true,
             safe_to_continue: true,
@@ -627,6 +740,9 @@ impl BackupService {
             created_at: queued.metadata.created_at,
             uploaded_count,
             pending_count,
+            local_recovery_count,
+            queue_healthy: quarantined_file_count == 0,
+            quarantined_file_count,
             remote_result,
         })
     }
@@ -634,7 +750,13 @@ impl BackupService {
     async fn flush_queue(&self, token: &str) -> BackupResult<usize> {
         let mut uploaded_count = 0;
         for mut queued in self.list_queue()? {
-            verify_queued_backup(&queued)?;
+            if queued.metadata.local_recovery {
+                continue;
+            }
+            if verify_queued_backup(&queued).is_err() {
+                self.quarantine_backup(&queued, "ciphertext")?;
+                continue;
+            }
 
             if let Some(pending) = &queued.metadata.upload {
                 if pending.stage == UploadStage::Uploaded {
@@ -669,7 +791,16 @@ impl BackupService {
 
     pub async fn status(&self) -> BackupResult<BackupStatusReport> {
         let state = self.read_state()?;
-        let pending_count = self.list_queue()?.len();
+        let queue = self.list_queue()?;
+        let pending_count = queue
+            .iter()
+            .filter(|item| !item.metadata.local_recovery)
+            .count();
+        let local_recovery_count = queue
+            .iter()
+            .filter(|item| item.metadata.local_recovery)
+            .count();
+        let quarantined_file_count = self.quarantined_file_count()?;
         let token = self.token_store.load().ok().flatten();
         let enrolled = token.is_some();
         let (remote, gateway_reachable) = if let Some(token) = token {
@@ -684,6 +815,9 @@ impl BackupService {
             enrolled,
             device_id: state.device_id,
             pending_count,
+            local_recovery_count,
+            queue_healthy: quarantined_file_count == 0,
+            quarantined_file_count,
             last_attempt_at: state.last_attempt_at,
             last_snapshot_at: state.last_snapshot_at,
             last_remote_success_at: state.last_remote_success_at,
@@ -741,15 +875,30 @@ impl BackupService {
             }
             let metadata_path = queue_metadata_path(&path);
             let metadata = match fs::read(&metadata_path) {
-                Ok(bytes) => serde_json::from_slice(&bytes)?,
+                Ok(bytes) => match serde_json::from_slice::<QueueMetadata>(&bytes) {
+                    Ok(metadata) if metadata.format_version == QUEUE_METADATA_VERSION => metadata,
+                    Ok(_) | Err(_) => {
+                        quarantine_file(&metadata_path, &self.queue_dir, "metadata")?;
+                        match reconstruct_queue_metadata(&path, &metadata_path) {
+                            Ok(metadata) => metadata,
+                            Err(_) => {
+                                self.quarantine_paths(&path, &metadata_path, "unreadable")?;
+                                continue;
+                            }
+                        }
+                    }
+                },
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    reconstruct_queue_metadata(&path, &metadata_path)?
+                    match reconstruct_queue_metadata(&path, &metadata_path) {
+                        Ok(metadata) => metadata,
+                        Err(_) => {
+                            self.quarantine_paths(&path, &metadata_path, "unreadable")?;
+                            continue;
+                        }
+                    }
                 }
                 Err(error) => return Err(error.into()),
             };
-            if metadata.format_version != QUEUE_METADATA_VERSION {
-                return Err(BackupError::Configuration);
-            }
             queued.push(QueuedBackup {
                 path,
                 metadata_path,
@@ -758,6 +907,37 @@ impl BackupService {
         }
         queued.sort_by(|left, right| left.metadata.created_at.cmp(&right.metadata.created_at));
         Ok(queued)
+    }
+
+    fn quarantine_backup(&self, queued: &QueuedBackup, reason: &str) -> BackupResult<()> {
+        self.quarantine_paths(&queued.path, &queued.metadata_path, reason)
+    }
+
+    fn quarantine_paths(
+        &self,
+        ciphertext_path: &Path,
+        metadata_path: &Path,
+        reason: &str,
+    ) -> BackupResult<()> {
+        quarantine_file(ciphertext_path, &self.queue_dir, reason)?;
+        quarantine_file(metadata_path, &self.queue_dir, reason)?;
+        Ok(())
+    }
+
+    fn quarantined_file_count(&self) -> BackupResult<usize> {
+        let quarantine_dir = self.queue_dir.join(QUARANTINE_DIRECTORY);
+        let entries = match fs::read_dir(quarantine_dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(error) => return Err(error.into()),
+        };
+        let mut count = 0;
+        for entry in entries {
+            if entry?.file_type()?.is_file() {
+                count += 1;
+            }
+        }
+        Ok(count)
     }
 
     fn prune_queue(&self) -> BackupResult<()> {
@@ -769,12 +949,22 @@ impl BackupService {
         ] {
             let matching: Vec<&QueuedBackup> = queued
                 .iter()
-                .filter(|item| item.metadata.retention_class == retention)
+                .filter(|item| {
+                    !item.metadata.local_recovery && item.metadata.retention_class == retention
+                })
                 .collect();
             let remove_count = matching.len().saturating_sub(retention.pending_limit());
             for item in matching.into_iter().take(remove_count) {
                 remove_queued_backup(item)?;
             }
+        }
+        let local_recoveries: Vec<&QueuedBackup> = queued
+            .iter()
+            .filter(|item| item.metadata.local_recovery)
+            .collect();
+        let remove_count = local_recoveries.len().saturating_sub(LOCAL_RECOVERY_LIMIT);
+        for item in local_recoveries.into_iter().take(remove_count) {
+            remove_queued_backup(item)?;
         }
         Ok(())
     }
@@ -791,28 +981,20 @@ fn create_encrypted_snapshot(
     queue_dir: &Path,
     recipient: &x25519::Recipient,
     retention_class: RetentionClass,
+    local_recovery: bool,
 ) -> BackupResult<QueuedBackup> {
     fs::create_dir_all(queue_dir)?;
-    let plaintext = NamedTempFile::new()?;
-    {
-        let source = Connection::open(database.path())?;
-        let mut destination = Connection::open(plaintext.path())?;
-        let backup = Backup::new(&source, &mut destination)?;
-        backup.run_to_completion(128, Duration::from_millis(5), None)?;
-        drop(backup);
-        let integrity: String =
-            destination.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
-        if integrity != "ok" {
-            return Err(BackupError::Database(rusqlite::Error::InvalidQuery));
-        }
-    }
-
     let created_at = Utc::now();
+    let snapshot_kind = if local_recovery {
+        "local-recovery"
+    } else {
+        retention_class.as_str()
+    };
     let file_name = format!(
         "backup-{}-{}-{}.sqlite3.age",
         created_at.format("%Y%m%dT%H%M%SZ"),
         Uuid::new_v4(),
-        retention_class.as_str()
+        snapshot_kind
     );
     let final_path = queue_dir.join(file_name);
     let mut partial = TempfileBuilder::new()
@@ -822,18 +1004,31 @@ fn create_encrypted_snapshot(
 
     let encryptor = age::Encryptor::with_recipients(std::iter::once(recipient as _))
         .map_err(|_| BackupError::Encryption)?;
-    let mut plaintext_reader = BufReader::new(File::open(plaintext.path())?);
     let mut encrypted_writer = encryptor
         .wrap_output(partial.as_file_mut())
         .map_err(|_| BackupError::Encryption)?;
+
+    // SQLite's online backup API takes one consistent snapshot into an in-memory
+    // connection. Serializing that connection lets age consume the bytes directly;
+    // plaintext is never placed in a filesystem temporary file.
+    let source = Connection::open(database.path())?;
+    let mut destination = Connection::open_in_memory()?;
+    let backup = Backup::new(&source, &mut destination)?;
+    backup.run_to_completion(128, Duration::from_millis(5), None)?;
+    drop(backup);
+    let integrity: String =
+        destination.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+    if integrity != "ok" {
+        return Err(BackupError::Database(rusqlite::Error::InvalidQuery));
+    }
+    let serialized = destination.serialize(DatabaseName::Main)?;
+    let mut plaintext_reader = &serialized[..];
     std::io::copy(&mut plaintext_reader, &mut encrypted_writer)?;
     let encrypted_file = encrypted_writer
         .finish()
         .map_err(|_| BackupError::Encryption)?;
     encrypted_file.flush()?;
     encrypted_file.sync_all()?;
-    drop(plaintext_reader);
-    drop(plaintext);
 
     partial
         .persist(&final_path)
@@ -849,6 +1044,7 @@ fn create_encrypted_snapshot(
         retention_class,
         size_bytes,
         sha256,
+        local_recovery,
         upload: None,
     };
     if let Err(error) = write_json_atomic(&metadata_path, &metadata) {
@@ -898,14 +1094,19 @@ fn reconstruct_queue_metadata(path: &Path, metadata_path: &Path) -> BackupResult
         .file_name()
         .and_then(|name| name.to_str())
         .ok_or(BackupError::Configuration)?;
-    let retention_class = [
-        RetentionClass::Rolling,
-        RetentionClass::Daily,
-        RetentionClass::Monthly,
-    ]
-    .into_iter()
-    .find(|retention| file_name.ends_with(&format!("-{}.sqlite3.age", retention.as_str())))
-    .ok_or(BackupError::Configuration)?;
+    let local_recovery = file_name.ends_with("-local-recovery.sqlite3.age");
+    let retention_class = if local_recovery {
+        RetentionClass::Rolling
+    } else {
+        [
+            RetentionClass::Rolling,
+            RetentionClass::Daily,
+            RetentionClass::Monthly,
+        ]
+        .into_iter()
+        .find(|retention| file_name.ends_with(&format!("-{}.sqlite3.age", retention.as_str())))
+        .ok_or(BackupError::Configuration)?
+    };
     let file_metadata = fs::metadata(path)?;
     let created_at = DateTime::<Utc>::from(file_metadata.modified()?);
     let metadata = QueueMetadata {
@@ -914,10 +1115,34 @@ fn reconstruct_queue_metadata(path: &Path, metadata_path: &Path) -> BackupResult
         retention_class,
         size_bytes: file_metadata.len(),
         sha256: sha256_file(path)?,
+        local_recovery,
         upload: None,
     };
     write_json_atomic(metadata_path, &metadata)?;
     Ok(metadata)
+}
+
+fn quarantine_file(path: &Path, queue_dir: &Path, reason: &str) -> BackupResult<bool> {
+    if !path.exists() {
+        return Ok(false);
+    }
+    let original_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or(BackupError::Configuration)?;
+    let quarantine_dir = queue_dir.join(QUARANTINE_DIRECTORY);
+    fs::create_dir_all(&quarantine_dir)?;
+    let target = quarantine_dir.join(format!(
+        "{}-{}-{}-{}",
+        Utc::now().format("%Y%m%dT%H%M%SZ"),
+        reason,
+        Uuid::new_v4(),
+        original_name
+    ));
+    fs::rename(path, &target)?;
+    sync_parent_directory(&quarantine_dir)?;
+    sync_parent_directory(queue_dir)?;
+    Ok(true)
 }
 
 fn remove_queued_backup(queued: &QueuedBackup) -> BackupResult<()> {
@@ -1140,8 +1365,7 @@ mod tests {
                 "content-length": size.to_string(),
                 "x-amz-content-sha256": "UNSIGNED-PAYLOAD",
                 "x-amz-meta-sha256": sha,
-                "x-amz-server-side-encryption": "AES256",
-                "x-pusula-required": "present"
+                "x-amz-server-side-encryption": "AES256"
             },
             "expires_at": "2026-07-14T12:15:00Z"
         }))
@@ -1156,9 +1380,9 @@ mod tests {
         assert!(headers.get("cookie").is_none());
         assert_eq!(
             headers
-                .get("x-pusula-required")
+                .get("x-amz-server-side-encryption")
                 .and_then(|value| value.to_str().ok()),
-            Some("present")
+            Some("AES256")
         );
         assert!(!body.starts_with(b"SQLite format 3"));
         *state.uploaded_without_bearer.lock().expect("uploaded") = true;
@@ -1267,5 +1491,189 @@ mod tests {
         assert!(*observations.completed.lock().expect("completed"));
 
         server.abort();
+    }
+
+    fn queued_for_upload(temp: &TempDir) -> QueuedBackup {
+        let path = temp.path().join("test.sqlite3.age");
+        QueuedBackup {
+            metadata_path: queue_metadata_path(&path),
+            path,
+            metadata: QueueMetadata {
+                format_version: QUEUE_METADATA_VERSION,
+                created_at: "2026-07-14T12:00:00Z".to_owned(),
+                retention_class: RetentionClass::Rolling,
+                size_bytes: 3,
+                sha256: "a".repeat(64),
+                local_recovery: false,
+                upload: None,
+            },
+        }
+    }
+
+    fn valid_production_reservation() -> UploadUrlResponse {
+        UploadUrlResponse {
+            backup_id: "00000000-0000-4000-8000-000000000002".to_owned(),
+            method: "PUT".to_owned(),
+            upload_url: concat!(
+                "https://s3.us-west-004.backblazeb2.com/",
+                "stronganchor-pusula-desktop-backups/backups/rolling/",
+                "device/file.sqlite3.age?X-Amz-Signature=test"
+            )
+            .to_owned(),
+            required_headers: BTreeMap::from([
+                ("content-length".to_owned(), "3".to_owned()),
+                (
+                    "x-amz-content-sha256".to_owned(),
+                    "UNSIGNED-PAYLOAD".to_owned(),
+                ),
+                ("x-amz-meta-sha256".to_owned(), "a".repeat(64)),
+                (
+                    "x-amz-server-side-encryption".to_owned(),
+                    "AES256".to_owned(),
+                ),
+            ]),
+        }
+    }
+
+    #[test]
+    fn production_uploads_are_pinned_to_the_expected_b2_destination_and_headers() {
+        let temp = TempDir::new().expect("temp");
+        let queued = queued_for_upload(&temp);
+        let gateway = GatewayClient::new(
+            "https://pusula-backup.stronganchortech.com/",
+            false,
+            Duration::from_secs(2),
+        )
+        .expect("gateway");
+        gateway
+            .validate_upload_request(&queued, &valid_production_reservation())
+            .expect("valid production upload");
+
+        for invalid_url in [
+            "https://evil.example/stronganchor-pusula-desktop-backups/backups/file?sig=x",
+            "https://s3.us-west-004.backblazeb2.com/other-bucket/backups/file?sig=x",
+            "https://s3.us-west-004.backblazeb2.com:444/stronganchor-pusula-desktop-backups/backups/file?sig=x",
+            "https://s3.us-west-004.backblazeb2.com/stronganchor-pusula-desktop-backups/backups/file",
+            "http://s3.us-west-004.backblazeb2.com/stronganchor-pusula-desktop-backups/backups/file?sig=x",
+        ] {
+            let mut reservation = valid_production_reservation();
+            reservation.upload_url = invalid_url.to_owned();
+            assert!(matches!(
+                gateway.validate_upload_request(&queued, &reservation),
+                Err(BackupError::InvalidGatewayResponse)
+            ));
+        }
+
+        let mut extra_header = valid_production_reservation();
+        extra_header
+            .required_headers
+            .insert("authorization".to_owned(), "secret".to_owned());
+        assert!(matches!(
+            gateway.validate_upload_request(&queued, &extra_header),
+            Err(BackupError::InvalidGatewayResponse)
+        ));
+
+        for (header, invalid_value) in [
+            ("content-length", "4"),
+            ("x-amz-content-sha256", "payload-hash"),
+            ("x-amz-meta-sha256", "wrong"),
+            ("x-amz-server-side-encryption", "none"),
+        ] {
+            let mut reservation = valid_production_reservation();
+            reservation
+                .required_headers
+                .insert(header.to_owned(), invalid_value.to_owned());
+            assert!(matches!(
+                gateway.validate_upload_request(&queued, &reservation),
+                Err(BackupError::InvalidGatewayResponse)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_sidecar_is_reconstructed_without_stalling_healthy_backups() {
+        let temp = TempDir::new().expect("temp");
+        let database = seeded_database(&temp);
+        let identity = x25519::Identity::generate();
+        let service = test_service(
+            &temp,
+            database,
+            &identity,
+            "http://127.0.0.1:9/",
+            Arc::new(MemoryTokenStore::default()),
+        );
+
+        service
+            .backup_now(RetentionClass::Rolling)
+            .await
+            .expect("first backup");
+        let first = service.list_queue().expect("first queue").remove(0);
+        fs::write(&first.metadata_path, b"{broken").expect("corrupt sidecar");
+
+        let status = service.status().await.expect("degraded status");
+        assert_eq!(status.pending_count, 1);
+        assert!(!status.queue_healthy);
+        assert_eq!(status.quarantined_file_count, 1);
+        assert!(first.path.exists());
+        assert!(first.metadata_path.exists());
+
+        service
+            .backup_now(RetentionClass::Rolling)
+            .await
+            .expect("second backup");
+        assert_eq!(service.list_queue().expect("healthy queue").len(), 2);
+    }
+
+    #[tokio::test]
+    async fn corrupt_ciphertext_is_quarantined_without_blocking_the_queue() {
+        let temp = TempDir::new().expect("temp");
+        let database = seeded_database(&temp);
+        let identity = x25519::Identity::generate();
+        let service = test_service(
+            &temp,
+            database,
+            &identity,
+            "http://127.0.0.1:9/",
+            Arc::new(MemoryTokenStore::default()),
+        );
+
+        service
+            .backup_now(RetentionClass::Rolling)
+            .await
+            .expect("backup");
+        let queued = service.list_queue().expect("queue").remove(0);
+        fs::write(&queued.path, b"corrupt").expect("corrupt ciphertext");
+
+        assert_eq!(service.flush_queue("unused-token").await.expect("flush"), 0);
+        assert!(service.list_queue().expect("empty queue").is_empty());
+        assert_eq!(service.quarantined_file_count().expect("quarantine"), 2);
+    }
+
+    #[tokio::test]
+    async fn destructive_import_recovery_snapshots_remain_local_and_are_bounded() {
+        let temp = TempDir::new().expect("temp");
+        let database = seeded_database(&temp);
+        let identity = x25519::Identity::generate();
+        let service = test_service(
+            &temp,
+            database,
+            &identity,
+            "http://127.0.0.1:9/",
+            Arc::new(MemoryTokenStore::with_token("unused-token")),
+        );
+
+        for _ in 0..4 {
+            let report = service
+                .prepare_for_destructive_import()
+                .await
+                .expect("local recovery");
+            assert_eq!(report.remote_result, RemoteResult::LocalRecovery);
+            assert!(report.safe_to_continue);
+        }
+
+        assert_eq!(service.flush_queue("unused-token").await.expect("flush"), 0);
+        let queue = service.list_queue().expect("queue");
+        assert_eq!(queue.len(), LOCAL_RECOVERY_LIMIT);
+        assert!(queue.iter().all(|item| item.metadata.local_recovery));
     }
 }

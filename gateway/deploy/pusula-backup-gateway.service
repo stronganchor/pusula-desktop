@@ -1,0 +1,55 @@
+[Unit]
+Description=Pusula Desktop backup credential gateway
+Documentation=file:/usr/local/share/doc/pusula-backup-gateway/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pusula-backup
+Group=pusula-backup
+EnvironmentFile=/etc/pusula-backup-gateway.env
+WorkingDirectory=/var/lib/pusula-backup-gateway
+ExecStartPre=/usr/local/lib/pusula-backup-gateway/pusula-backup-gateway migrate
+ExecStart=/usr/local/lib/pusula-backup-gateway/pusula-backup-gateway serve
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=30s
+TimeoutStopSec=20s
+UMask=0077
+
+StateDirectory=pusula-backup-gateway
+StateDirectoryMode=0700
+ReadWritePaths=/var/lib/pusula-backup-gateway
+
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectHostname=true
+ProtectClock=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectProc=invisible
+ProcSubset=pid
+CapabilityBoundingSet=
+AmbientCapabilities=
+DevicePolicy=closed
+LockPersonality=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RemoveIPC=true
+SystemCallArchitectures=native
+
+LimitNOFILE=1024
+TasksMax=64
+MemoryHigh=192M
+MemoryMax=256M
+
+[Install]
+WantedBy=multi-user.target

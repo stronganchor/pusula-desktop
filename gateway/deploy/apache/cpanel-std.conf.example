@@ -1,0 +1,8 @@
+# Install as:
+# /etc/apache2/conf.d/userdata/std/2_4/__CPANEL_USER__/__VHOST__/pusula-backup-gateway.conf
+#
+# __VHOST__ is the actual cPanel Apache vhost name for
+# pusula-backup.stronganchortech.com. This non-TLS vhost only redirects.
+
+RewriteEngine On
+RewriteRule ^ https://pusula-backup.stronganchortech.com%{REQUEST_URI} [R=308,L,NE]

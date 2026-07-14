@@ -1,0 +1,19 @@
+# Install as:
+# /etc/apache2/conf.d/userdata/ssl/2_4/__CPANEL_USER__/__VHOST__/pusula-backup-gateway.conf
+#
+# __VHOST__ is the actual cPanel Apache SSL vhost name for
+# pusula-backup.stronganchortech.com. Keep TCP 12741 closed in CSF; only Apache
+# should reach this loopback listener.
+
+ProxyRequests Off
+ProxyPreserveHost On
+ProxyAddHeaders On
+RequestHeader set X-Forwarded-Proto "https"
+
+ProxyPass        "/" "http://127.0.0.1:12741/" connectiontimeout=5 timeout=25 retry=0
+ProxyPassReverse "/" "http://127.0.0.1:12741/"
+
+<Location "/">
+    Require all granted
+    LimitRequestBody 16384
+</Location>

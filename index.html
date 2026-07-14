@@ -1,43 +1,78 @@
 <!doctype html>
-<html lang="en">
+<html lang="tr">
   <head>
     <meta charset="UTF-8" />
-    <link rel="stylesheet" href="/src/styles.css" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Tauri App</title>
-    <script type="module" src="/src/main.ts" defer></script>
+    <meta name="color-scheme" content="light" />
+    <title>Pusula</title>
+    <script type="module" src="/src/main.ts"></script>
   </head>
-
   <body>
-    <main class="container">
-      <h1>Welcome to Tauri</h1>
-
-      <div class="row">
-        <a href="https://vite.dev" target="_blank">
-          <img src="/src/assets/vite.svg" class="logo vite" alt="Vite logo" />
-        </a>
-        <a href="https://tauri.app" target="_blank">
-          <img
-            src="/src/assets/tauri.svg"
-            class="logo tauri"
-            alt="Tauri logo"
-          />
-        </a>
-        <a href="https://www.typescriptlang.org/docs" target="_blank">
-          <img
-            src="/src/assets/typescript.svg"
-            class="logo typescript"
-            alt="typescript logo"
-          />
-        </a>
+    <div id="pusula-startup-error" class="pusula-startup-error" hidden></div>
+    <div id="pusula-lite-app" class="pusula-app">
+      <div class="pusula-header">
+        <div class="pusula-title-tabs">
+          <div class="pusula-tabs">
+            <button class="active" data-tab="search">MÜŞTERİ ARAMA</button>
+            <button data-tab="add">MÜŞTERİ BİLGİLERİ</button>
+            <button data-tab="sale">SATIŞ KAYDET</button>
+            <button data-tab="detail">TAKSİTLİ SATIŞ KAYIT BİLGİSİ</button>
+            <button data-tab="report">GÜNLÜK TAHSİLAT RAPORU</button>
+            <button data-tab="expected">BEKLENEN ÖDEMELER</button>
+          </div>
+        </div>
+        <div class="pusula-header-tools">
+          <div class="pusula-status" id="pusula-status"></div>
+          <button id="pusula-data-tools-button" class="pusula-data-tools-button" type="button">
+            VERİ VE YEDEK
+          </button>
+        </div>
       </div>
-      <p>Click on the Tauri logo to learn more about the framework</p>
-
-      <form class="row" id="greet-form">
-        <input id="greet-input" placeholder="Enter a name..." />
-        <button type="submit">Greet</button>
-      </form>
-      <p id="greet-msg"></p>
-    </main>
+      <div class="pusula-offline-banner" id="pusula-offline-banner" hidden></div>
+      <div class="pusula-tab-content" id="pusula-tab-search"></div>
+      <div class="pusula-tab-content" id="pusula-tab-add" style="display: none"></div>
+      <div class="pusula-tab-content" id="pusula-tab-sale" style="display: none"></div>
+      <div class="pusula-tab-content" id="pusula-tab-detail" style="display: none"></div>
+      <div class="pusula-tab-content" id="pusula-tab-report" style="display: none"></div>
+      <div class="pusula-tab-content" id="pusula-tab-expected" style="display: none"></div>
+    </div>
+    <div id="pusula-data-modal" class="pusula-desktop-modal" hidden>
+      <section class="pusula-desktop-modal-card" role="dialog" aria-modal="true" aria-labelledby="pusula-data-modal-title">
+        <h2 id="pusula-data-modal-title">Veri ve Yedek Yönetimi</h2>
+        <p id="pusula-data-modal-description" class="pusula-desktop-modal-description"></p>
+        <dl id="pusula-data-status" class="pusula-data-status"></dl>
+        <section id="pusula-backup-panel" class="pusula-backup-panel">
+          <div class="pusula-backup-heading">
+            <h3>Şifreli Uzak Yedek</h3>
+            <button id="pusula-backup-now-button" type="button">ŞİMDİ YEDEKLE</button>
+          </div>
+          <p>
+            Yedekler bu bilgisayardan çıkmadan şifrelenir. İnternet yoksa güvenli sırada bekler ve bağlantı
+            geldiğinde otomatik gönderilir.
+          </p>
+          <dl id="pusula-backup-status" class="pusula-data-status"></dl>
+          <div id="pusula-backup-enrollment" class="pusula-backup-enrollment">
+            <label>
+              Tek kullanımlık kurulum kodu
+              <input id="pusula-enrollment-code" type="password" autocomplete="off" spellcheck="false" />
+            </label>
+            <label>
+              Bilgisayar adı
+              <input id="pusula-device-name" type="text" value="Pusula Ana Bilgisayar" maxlength="100" />
+            </label>
+            <button id="pusula-enroll-button" type="button">YEDEĞİ ETKİNLEŞTİR</button>
+          </div>
+        </section>
+        <div id="pusula-data-modal-message" class="pusula-desktop-modal-message" aria-live="polite"></div>
+        <div class="pusula-desktop-modal-actions">
+          <button id="pusula-import-button" type="button">JSON İÇE AKTAR</button>
+          <button id="pusula-export-button" type="button">JSON DIŞA AKTAR</button>
+          <button id="pusula-update-check-button" type="button">GÜNCELLEMEYİ DENETLE</button>
+          <button id="pusula-empty-start-button" type="button" hidden>BOŞ BAŞLA</button>
+          <button id="pusula-data-modal-close" type="button">KAPAT</button>
+        </div>
+      </section>
+    </div>
+    <div id="pusula-system-status" class="pusula-system-status" aria-live="polite"></div>
   </body>
 </html>

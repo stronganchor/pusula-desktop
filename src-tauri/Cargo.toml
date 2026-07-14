@@ -1,8 +1,8 @@
 [package]
 name = "pusula-desktop"
 version = "0.1.0"
-description = "A Tauri App"
-authors = ["you"]
+description = "Offline-first Windows application for Pusula business records"
+authors = ["Strong Anchor Technology"]
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -18,8 +18,28 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+age = { version = "0.12", default-features = false }
 tauri = { version = "2", features = [] }
-tauri-plugin-opener = "2"
+tauri-plugin-dialog = "2"
+tauri-plugin-process = "2"
+tauri-plugin-single-instance = "2"
+tauri-plugin-updater = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+chrono = { version = "0.4", features = ["clock", "serde"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream"] }
+rusqlite = { version = "0.32", features = ["backup", "bundled", "serialize"] }
+sha2 = "0.10"
+thiserror = "2"
+tempfile = "3"
+tokio = { version = "1", features = ["fs", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["io"] }
+url = "2"
+uuid = { version = "1", features = ["v4"] }
 
+[target.'cfg(windows)'.dependencies]
+keyring = { version = "3", default-features = false, features = ["windows-native"] }
+
+[dev-dependencies]
+axum = "0.8"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread"] }

@@ -2,20 +2,26 @@
   "name": "pusula-desktop",
   "private": true,
   "version": "0.1.0",
+  "description": "Offline-first Windows desktop application for Pusula business records",
+  "license": "UNLICENSED",
+  "repository": "https://github.com/stronganchor/pusula-desktop",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
+    "test:frontend": "node --test tests/*.test.mjs",
     "preview": "vite preview",
     "tauri": "tauri"
   },
   "dependencies": {
     "@tauri-apps/api": "^2",
-    "@tauri-apps/plugin-opener": "^2"
+    "@tauri-apps/plugin-dialog": "^2.7.1",
+    "@tauri-apps/plugin-process": "^2.3.1",
+    "@tauri-apps/plugin-updater": "^2.10.1"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2",
-    "vite": "^6.0.3",
-    "typescript": "~5.6.2"
+    "typescript": "~5.6.2",
+    "vite": "^6.0.3"
   }
 }

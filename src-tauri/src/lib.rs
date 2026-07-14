@@ -13,7 +13,7 @@ pub use db::Database;
 pub use models::{DatabaseStatus, ExportBundle, ExportSummary, ImportSummary};
 use serde_json::Value;
 use tauri::{Manager, State};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, OwnedRwLockWriteGuard, RwLock};
 
 struct DbState {
     database: Database,
@@ -22,6 +22,10 @@ struct DbState {
 
 struct BackupState {
     service: BackupService,
+}
+
+struct UpdateState {
+    maintenance_guard: Mutex<Option<OwnedRwLockWriteGuard<()>>>,
 }
 
 async fn run_database_task<T, F>(operation: F) -> Result<T, String>
@@ -221,12 +225,37 @@ async fn backup_status(state: State<'_, BackupState>) -> Result<BackupStatusRepo
 }
 
 #[tauri::command]
-async fn prepare_for_update(state: State<'_, BackupState>) -> Result<BackupRunReport, String> {
-    let service = state.service.clone();
-    service
+async fn prepare_for_update(
+    database_state: State<'_, DbState>,
+    backup_state: State<'_, BackupState>,
+    update_state: State<'_, UpdateState>,
+) -> Result<BackupRunReport, String> {
+    let mut prepared = update_state.maintenance_guard.lock().await;
+    if prepared.is_some() {
+        return Err("Güncelleme hazırlığı zaten etkin.".to_owned());
+    }
+
+    // Wait for every active database operation, then retain the exclusive
+    // guard across the frontend's installer call. No new business write can
+    // land between this snapshot and process replacement.
+    let maintenance_guard = database_state.maintenance_gate.clone().write_owned().await;
+    let report = backup_state
+        .service
+        .clone()
         .prepare_for_update()
         .await
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+    if !report.encrypted_snapshot_created || !report.safe_to_continue {
+        return Err("Güncelleme öncesi şifreli yedek doğrulanamadı.".to_owned());
+    }
+    *prepared = Some(maintenance_guard);
+    Ok(report)
+}
+
+#[tauri::command]
+async fn cancel_prepared_update(state: State<'_, UpdateState>) -> Result<(), String> {
+    state.maintenance_guard.lock().await.take();
+    Ok(())
 }
 
 #[tauri::command]
@@ -253,7 +282,6 @@ pub fn run() {
             }
         }))
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
@@ -272,6 +300,9 @@ pub fn run() {
             });
             app.manage(BackupState {
                 service: backup_service.clone(),
+            });
+            app.manage(UpdateState {
+                maintenance_guard: Mutex::new(None),
             });
             tauri::async_runtime::spawn(async move {
                 tokio::time::sleep(Duration::from_secs(30)).await;
@@ -294,6 +325,7 @@ pub fn run() {
             backup_now,
             backup_status,
             prepare_for_update,
+            cancel_prepared_update,
             prepare_for_destructive_import,
         ])
         .run(tauri::generate_context!())
@@ -364,5 +396,27 @@ mod tests {
 
         assert_eq!(result, 17);
         assert_eq!(*events.lock().unwrap(), vec!["recovery", "import"]);
+    }
+
+    #[tokio::test]
+    async fn prepared_update_blocks_database_operations_until_cancelled() {
+        let gate = Arc::new(RwLock::new(()));
+        let update_state = UpdateState {
+            maintenance_guard: Mutex::new(None),
+        };
+        *update_state.maintenance_guard.lock().await = Some(gate.clone().write_owned().await);
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), gate.clone().read_owned())
+                .await
+                .is_err()
+        );
+
+        update_state.maintenance_guard.lock().await.take();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), gate.read_owned())
+                .await
+                .is_ok()
+        );
     }
 }

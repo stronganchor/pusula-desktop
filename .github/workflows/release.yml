@@ -59,7 +59,9 @@ jobs:
             -ExpectedVersion $env:RELEASE_VERSION `
             -Repository $env:RELEASE_REPOSITORY `
             -ExpectedCommit $env:RELEASE_COMMIT `
-            -CandidateTag $env:RELEASE_CANDIDATE_TAG
+            -CandidateTag $env:RELEASE_CANDIDATE_TAG `
+            -BuildInitialAcceptanceBaseline $env:BUILD_INITIAL_ACCEPTANCE_BASELINE `
+            -AcceptanceBaselineVersion $env:ACCEPTANCE_BASELINE_VERSION
       - run: npm ci
       - run: npm run build
       - run: npm run test:frontend
@@ -77,8 +79,25 @@ jobs:
       - name: Package unsigned offline NSIS installer
         run: npm run tauri -- bundle --bundles nsis --no-sign --ci
 
+  validate-gateway:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - name: Validate the exact gateway source shipped with this candidate
+        run: |
+          cargo fmt --manifest-path gateway/Cargo.toml --check
+          cargo clippy --manifest-path gateway/Cargo.toml --all-targets -- -D warnings
+          cargo test --manifest-path gateway/Cargo.toml
+
   sign:
-    needs: validate
+    needs: [validate, validate-gateway]
     runs-on: windows-latest
     environment: windows-release
     permissions:
@@ -114,6 +133,8 @@ jobs:
             -Repository $env:RELEASE_REPOSITORY `
             -ExpectedCommit $env:RELEASE_COMMIT `
             -CandidateTag $env:RELEASE_CANDIDATE_TAG `
+            -BuildInitialAcceptanceBaseline $env:BUILD_INITIAL_ACCEPTANCE_BASELINE `
+            -AcceptanceBaselineVersion $env:ACCEPTANCE_BASELINE_VERSION `
             -RequireRepositoryImmutability
       - run: npm ci
       - run: npm run build
@@ -287,10 +308,14 @@ jobs:
           ARTIFACT_SIGNING_ACCOUNT: ${{ vars.ARTIFACT_SIGNING_ACCOUNT }}
           ARTIFACT_SIGNING_PROFILE: ${{ vars.ARTIFACT_SIGNING_PROFILE }}
           EXPECTED_WINDOWS_PUBLISHER: ${{ vars.EXPECTED_WINDOWS_PUBLISHER }}
+          EXPECTED_WINDOWS_CERTIFICATE_SHA256: ${{ vars.EXPECTED_WINDOWS_CERTIFICATE_SHA256 }}
         run: |
           $ErrorActionPreference = 'Stop'
-          foreach ($name in 'TAURI_SIGNING_PRIVATE_KEY','TAURI_SIGNING_PRIVATE_KEY_PASSWORD','AZURE_CLIENT_ID','AZURE_TENANT_ID','AZURE_SUBSCRIPTION_ID','ARTIFACT_SIGNING_ENDPOINT','ARTIFACT_SIGNING_ACCOUNT','ARTIFACT_SIGNING_PROFILE','EXPECTED_WINDOWS_PUBLISHER') {
+          foreach ($name in 'TAURI_SIGNING_PRIVATE_KEY','TAURI_SIGNING_PRIVATE_KEY_PASSWORD','AZURE_CLIENT_ID','AZURE_TENANT_ID','AZURE_SUBSCRIPTION_ID','ARTIFACT_SIGNING_ENDPOINT','ARTIFACT_SIGNING_ACCOUNT','ARTIFACT_SIGNING_PROFILE','EXPECTED_WINDOWS_PUBLISHER','EXPECTED_WINDOWS_CERTIFICATE_SHA256') {
             if ([string]::IsNullOrWhiteSpace((Get-Item "env:$name").Value)) { throw "Missing required release value: $name" }
+          }
+          if ($env:EXPECTED_WINDOWS_CERTIFICATE_SHA256 -cnotmatch '^[0-9a-fA-F]{64}$') {
+            throw 'EXPECTED_WINDOWS_CERTIFICATE_SHA256 must be the exact SHA-256 of the approved signer certificate.'
           }
           if ($env:BUILD_INITIAL_ACCEPTANCE_BASELINE -eq 'true' -and
               ([string]::IsNullOrWhiteSpace($env:ACCEPTANCE_BASELINE_ARCHIVE_PASSWORD) -or
@@ -391,6 +416,7 @@ jobs:
         shell: pwsh
         env:
           EXPECTED_WINDOWS_PUBLISHER: ${{ vars.EXPECTED_WINDOWS_PUBLISHER }}
+          EXPECTED_WINDOWS_CERTIFICATE_SHA256: ${{ vars.EXPECTED_WINDOWS_CERTIFICATE_SHA256 }}
         run: |
           $ErrorActionPreference = 'Stop'
           $version = $env:RELEASE_VERSION
@@ -411,6 +437,12 @@ jobs:
             if (-not [string]::Equals($publisher, $env:EXPECTED_WINDOWS_PUBLISHER, [StringComparison]::Ordinal)) {
               throw "Unexpected Authenticode publisher for $($executable.Name): $publisher"
             }
+            $certificateHash = ([BitConverter]::ToString(
+              [Security.Cryptography.SHA256]::Create().ComputeHash($signature.SignerCertificate.RawData)
+            )).Replace('-', '').ToLowerInvariant()
+            if ($certificateHash -cne $env:EXPECTED_WINDOWS_CERTIFICATE_SHA256.ToLowerInvariant()) {
+              throw "Unexpected Authenticode certificate for $($executable.Name): $certificateHash"
+            }
           }
 
       - name: Verify private acceptance baseline identity and Authenticode signatures
@@ -418,6 +450,7 @@ jobs:
         shell: pwsh
         env:
           EXPECTED_WINDOWS_PUBLISHER: ${{ vars.EXPECTED_WINDOWS_PUBLISHER }}
+          EXPECTED_WINDOWS_CERTIFICATE_SHA256: ${{ vars.EXPECTED_WINDOWS_CERTIFICATE_SHA256 }}
         run: |
           $ErrorActionPreference = 'Stop'
           $baselineExecutable = Get-Item -LiteralPath (Join-Path $env:RUNNER_TEMP 'initial-acceptance-baseline-unsigned.exe')
@@ -438,6 +471,12 @@ jobs:
             )
             if (-not [string]::Equals($publisher, $env:EXPECTED_WINDOWS_PUBLISHER, [StringComparison]::Ordinal)) {
               throw "Unexpected private baseline publisher for $($executable.Name): $publisher"
+            }
+            $certificateHash = ([BitConverter]::ToString(
+              [Security.Cryptography.SHA256]::Create().ComputeHash($signature.SignerCertificate.RawData)
+            )).Replace('-', '').ToLowerInvariant()
+            if ($certificateHash -cne $env:EXPECTED_WINDOWS_CERTIFICATE_SHA256.ToLowerInvariant()) {
+              throw "Unexpected private baseline certificate for $($executable.Name): $certificateHash"
             }
           }
 
@@ -475,6 +514,18 @@ jobs:
             $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $archivePath).Hash.ToLowerInvariant()
             "$hash  $archiveName" |
               Set-Content -LiteralPath (Join-Path $encryptedDir "$archiveName.sha256") -Encoding ascii
+            [ordered]@{
+              schema_version = 1
+              repository = $env:RELEASE_REPOSITORY
+              candidate_commit = $env:RELEASE_COMMIT
+              candidate_workflow_run_id = [long]'${{ github.run_id }}'
+              baseline_version = $env:ACCEPTANCE_BASELINE_VERSION
+              candidate_version = $env:RELEASE_VERSION
+              archive_name = $archiveName
+              archive_sha256 = $hash
+            } | ConvertTo-Json -Compress | Set-Content `
+              -LiteralPath (Join-Path $encryptedDir 'initial-acceptance-baseline-metadata.json') `
+              -Encoding utf8NoBOM
           } finally {
             Remove-Item -LiteralPath 'acceptance-baseline' -Recurse -Force -ErrorAction SilentlyContinue
             Remove-Item -LiteralPath (Join-Path $env:RUNNER_TEMP 'initial-acceptance-baseline-unsigned.exe') -Force -ErrorAction SilentlyContinue
@@ -560,6 +611,9 @@ jobs:
             -Repository $env:RELEASE_REPOSITORY `
             -ExpectedCommit $env:RELEASE_COMMIT `
             -CandidateTag $env:RELEASE_CANDIDATE_TAG `
+            -BuildInitialAcceptanceBaseline $env:BUILD_INITIAL_ACCEPTANCE_BASELINE `
+            -AcceptanceBaselineVersion $env:ACCEPTANCE_BASELINE_VERSION `
+            -AllowExactCandidateDraftResume `
             -RequireRepositoryImmutability
           .\scripts\Test-ReleaseAssets.ps1 `
             -Directory release-assets `
@@ -567,164 +621,30 @@ jobs:
             -ReleaseTag $env:RELEASE_CANDIDATE_TAG `
             -Repository $env:RELEASE_REPOSITORY
 
-      - name: Create exact candidate tag and upload a private draft
+      - name: Create or safely resume the exact candidate draft
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $ErrorActionPreference = 'Stop'
-          $tag = $env:RELEASE_CANDIDATE_TAG
-          $refArgs = @(
-            'api', '--method', 'POST',
-            "repos/$($env:RELEASE_REPOSITORY)/git/refs",
-            '-f', "ref=refs/tags/$tag",
-            '-f', "sha=$($env:RELEASE_COMMIT)"
-          )
-          $createdRefJson = gh @refArgs
-          if ($LASTEXITCODE -ne 0) {
-            throw 'Could not exclusively create the candidate Git tag at the built commit.'
-          }
-          $createdRef = $createdRefJson | ConvertFrom-Json
-          if ([string]$createdRef.ref -cne "refs/tags/$tag" -or
-              [string]$createdRef.object.type -cne 'commit' -or
-              [string]$createdRef.object.sha -cne $env:RELEASE_COMMIT) {
-            throw 'Created candidate Git tag is not a lightweight tag at the built commit.'
-          }
+          .\scripts\Prepare-ResumableCandidateRelease.ps1 `
+            -Repository $env:RELEASE_REPOSITORY `
+            -Version $env:RELEASE_VERSION `
+            -CandidateTag $env:RELEASE_CANDIDATE_TAG `
+            -ExpectedCommit $env:RELEASE_COMMIT `
+            -AssetDirectory release-assets
 
-          $releaseArgs = @(
-            'release', 'create', $tag,
-            '--repo', $env:RELEASE_REPOSITORY,
-            '--target', $env:RELEASE_COMMIT,
-            '--title', "Pusula $($env:RELEASE_VERSION) acceptance candidate",
-            '--generate-notes',
-            '--draft'
-          )
-          $releaseArgs += '--prerelease'
-          gh @releaseArgs
-          if ($LASTEXITCODE -ne 0) { throw 'Could not create the draft GitHub release.' }
-
-          $assets = @(Get-ChildItem -LiteralPath release-assets -File | Sort-Object Name)
-          $uploadArgs = @('release', 'upload', $tag, '--repo', $env:RELEASE_REPOSITORY) + @($assets.FullName)
-          gh @uploadArgs
-          if ($LASTEXITCODE -ne 0) { throw 'Release asset upload failed; the release remains a draft.' }
-
-          $draftRefJson = gh api "repos/$($env:RELEASE_REPOSITORY)/git/ref/tags/$tag"
-          if ($LASTEXITCODE -ne 0) { throw 'Could not read back the candidate tag after draft creation.' }
-          $draftRef = $draftRefJson | ConvertFrom-Json
-          if ([string]$draftRef.object.type -cne 'commit' -or [string]$draftRef.object.sha -cne $env:RELEASE_COMMIT) {
-            throw 'Candidate tag moved away from the built commit after draft creation.'
-          }
-
-      - name: Recheck immutable policy, exact tag, identity, and draft bytes immediately before publication
-        shell: pwsh
-        env:
-          GH_TOKEN: ${{ secrets.RELEASE_ADMIN_READ_TOKEN }}
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $tag = $env:RELEASE_CANDIDATE_TAG
-          $head = (& git rev-parse HEAD).Trim()
-          if ($LASTEXITCODE -ne 0 -or $head -cne $env:RELEASE_COMMIT) {
-            throw 'Candidate publication checkout changed after draft creation.'
-          }
-          $mainJson = gh api "repos/$($env:RELEASE_REPOSITORY)/git/ref/heads/main"
-          if ($LASTEXITCODE -ne 0 -or [string](($mainJson | ConvertFrom-Json).object.sha) -cne $env:RELEASE_COMMIT) {
-            throw 'main moved after the candidate draft was created.'
-          }
-          $immutabilityJson = gh api `
-            -H 'X-GitHub-Api-Version: 2026-03-10' `
-            "repos/$($env:RELEASE_REPOSITORY)/immutable-releases"
-          if ($LASTEXITCODE -ne 0 -or -not [bool](($immutabilityJson | ConvertFrom-Json).enabled)) {
-            throw 'Repository release immutability is not enabled immediately before candidate publication.'
-          }
-
-          $tagRefJson = gh api "repos/$($env:RELEASE_REPOSITORY)/git/ref/tags/$tag"
-          if ($LASTEXITCODE -ne 0) { throw 'Could not verify the candidate tag immediately before publication.' }
-          $tagRef = $tagRefJson | ConvertFrom-Json
-          if ([string]$tagRef.object.type -cne 'commit' -or [string]$tagRef.object.sha -cne $env:RELEASE_COMMIT) {
-            throw 'Candidate tag does not point directly to the built commit immediately before publication.'
-          }
-
-          $releaseJson = gh api "repos/$($env:RELEASE_REPOSITORY)/releases/tags/$tag"
-          if ($LASTEXITCODE -ne 0) { throw 'Could not read the uploaded draft release through the GitHub API.' }
-          $release = $releaseJson | ConvertFrom-Json
-          if (-not $release.draft) { throw 'Release was exposed before validation completed.' }
-          if (-not [bool]$release.prerelease) { throw 'Draft candidate is not marked as a prerelease.' }
-          if ([string]$release.target_commitish -cne $env:RELEASE_COMMIT) { throw 'Draft release target differs from the built commit.' }
-          $assets = @(Get-ChildItem -LiteralPath release-assets -File | Sort-Object Name)
-          $localAssets = @($assets | ForEach-Object {
-            [pscustomobject][ordered]@{
-              name = $_.Name
-              size = [long]$_.Length
-              digest = "sha256:$((Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName).Hash.ToLowerInvariant())"
-            }
-          } | Sort-Object name)
-          $remoteAssets = @($release.assets | ForEach-Object {
-            if ([string]::IsNullOrWhiteSpace([string]$_.digest)) {
-              throw "GitHub did not return a digest for uploaded asset $($_.name); the draft will not be published."
-            }
-            [pscustomobject][ordered]@{
-              name = [string]$_.name
-              size = [long]$_.size
-              digest = ([string]$_.digest).ToLowerInvariant()
-            }
-          } | Sort-Object name)
-          if (($localAssets | ConvertTo-Json -Compress) -cne ($remoteAssets | ConvertTo-Json -Compress)) {
-            throw 'Remote release asset names, sizes, or SHA-256 digests do not exactly match the verified local allowlist.'
-          }
-
-      - name: Publish the revalidated candidate
+      - name: Revalidate and publish the candidate draft in one write-token process
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_ADMIN_READ_TOKEN: ${{ secrets.RELEASE_ADMIN_READ_TOKEN }}
         run: |
-          $ErrorActionPreference = 'Stop'
-          $tag = $env:RELEASE_CANDIDATE_TAG
-          $tagRefJson = gh api "repos/$($env:RELEASE_REPOSITORY)/git/ref/tags/$tag"
-          if ($LASTEXITCODE -ne 0) { throw 'Could not verify the candidate tag at publication time.' }
-          $tagRef = $tagRefJson | ConvertFrom-Json
-          if ([string]$tagRef.object.type -cne 'commit' -or [string]$tagRef.object.sha -cne $env:RELEASE_COMMIT) {
-            throw 'Candidate tag changed before publication.'
-          }
-
-          $publishArgs = @('release', 'edit', $tag, '--repo', $env:RELEASE_REPOSITORY, '--draft=false')
-          gh @publishArgs
-          if ($LASTEXITCODE -ne 0) { throw 'Validated release could not be published; it remains a draft.' }
-          $publishedJson = gh release view $tag --repo $env:RELEASE_REPOSITORY --json tagName,isDraft,isImmutable,isPrerelease,targetCommitish
-          if ($LASTEXITCODE -ne 0) { throw 'Published candidate could not be read back.' }
-          $published = $publishedJson | ConvertFrom-Json
-          if ([string]$published.tagName -cne $tag -or $published.isDraft -or -not $published.isPrerelease -or -not $published.isImmutable) {
-            throw 'Published candidate did not enter the required immutable prerelease state.'
-          }
-          if ([string]$published.targetCommitish -cne $env:RELEASE_COMMIT) {
-            throw 'Published candidate target differs from the built commit.'
-          }
-          $publishedRefJson = gh api "repos/$($env:RELEASE_REPOSITORY)/git/ref/tags/$tag"
-          if ($LASTEXITCODE -ne 0) { throw 'Published candidate tag could not be read back.' }
-          $publishedRef = $publishedRefJson | ConvertFrom-Json
-          if ([string]$publishedRef.object.type -cne 'commit' -or [string]$publishedRef.object.sha -cne $env:RELEASE_COMMIT) {
-            throw 'Published immutable candidate tag is not pinned to the built commit.'
-          }
-          $publishedApiJson = gh api "repos/$($env:RELEASE_REPOSITORY)/releases/tags/$tag"
-          if ($LASTEXITCODE -ne 0) { throw 'Published candidate assets could not be read back.' }
-          $publishedApi = $publishedApiJson | ConvertFrom-Json
-          $assets = @(Get-ChildItem -LiteralPath release-assets -File | Sort-Object Name)
-          $localAssets = @($assets | ForEach-Object {
-            [pscustomobject][ordered]@{
-              name = $_.Name
-              size = [long]$_.Length
-              digest = "sha256:$((Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName).Hash.ToLowerInvariant())"
-            }
-          } | Sort-Object name)
-          $publishedAssets = @($publishedApi.assets | ForEach-Object {
-            if ([string]::IsNullOrWhiteSpace([string]$_.digest)) {
-              throw "GitHub did not return a digest for published candidate asset $($_.name)."
-            }
-            [pscustomobject][ordered]@{
-              name = [string]$_.name
-              size = [long]$_.size
-              digest = ([string]$_.digest).ToLowerInvariant()
-            }
-          } | Sort-Object name)
-          if (($localAssets | ConvertTo-Json -Compress) -cne ($publishedAssets | ConvertTo-Json -Compress)) {
-            throw 'Published immutable candidate bytes differ from the revalidated draft.'
-          }
+          .\scripts\Publish-VerifiedRelease.ps1 `
+            -Mode Candidate `
+            -Repository $env:RELEASE_REPOSITORY `
+            -Tag $env:RELEASE_CANDIDATE_TAG `
+            -ExpectedCommit $env:RELEASE_COMMIT `
+            -ExpectedVersion $env:RELEASE_VERSION `
+            -AssetDirectory release-assets `
+            -BuildInitialAcceptanceBaseline $env:BUILD_INITIAL_ACCEPTANCE_BASELINE `
+            -AcceptanceBaselineVersion $env:ACCEPTANCE_BASELINE_VERSION

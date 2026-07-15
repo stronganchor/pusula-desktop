@@ -1,7 +1,7 @@
 use std::{cmp::Ordering, collections::HashMap};
 
 use chrono::Local;
-use rusqlite::{params, Connection, OptionalExtension, Transaction};
+use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::Deserialize;
 use serde_json::{json, Map, Number, Value};
 use url::Url;
@@ -1237,11 +1237,48 @@ impl Database {
 
     fn create_payment(&self, installment_id: i64, body: &Value) -> AppResult<Value> {
         let body = object(body)?;
-        let amount = body.get("amount").map(money_to_kurus).transpose()?;
+        let amount = body
+            .get("amount")
+            .map(money_to_kurus)
+            .transpose()?
+            .ok_or_else(|| AppError::user("Ödeme tutarı zorunludur."))?;
         let payment_date = require_date(text_field(body, "payment_date"), true, "Ödeme tarihi")?;
+        let request_key = text_field(body, "request_key")
+            .and_then(|value| normalize_sale_request_key(&value))
+            .ok_or_else(|| AppError::user("Ödeme istek anahtarı zorunludur."))?;
         let mut connection = self.connect()?;
-        let transaction = connection.transaction()?;
-        let response = create_payment_tx(&transaction, installment_id, amount, &payment_date)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing: Option<(i64, i64, i64, String)> = transaction
+            .query_row(
+                "SELECT id, installment_id, amount_kurus, payment_date
+                 FROM installment_payments WHERE request_key = ?",
+                [&request_key],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?;
+        if let Some((payment_id, existing_installment_id, existing_amount, existing_date)) =
+            existing
+        {
+            if existing_installment_id != installment_id
+                || existing_amount != amount
+                || existing_date != payment_date
+            {
+                return Err(AppError::user(
+                    "Ödeme istek anahtarı farklı bir tahsilat için zaten kullanılmış.",
+                ));
+            }
+            let response = payment_creation_response(&transaction, installment_id, payment_id)?;
+            transaction.commit()?;
+            return Ok(response);
+        }
+
+        let response = create_payment_tx(
+            &transaction,
+            installment_id,
+            amount,
+            &payment_date,
+            &request_key,
+        )?;
         mark_modified(&transaction)?;
         transaction.commit()?;
         Ok(response)
@@ -1507,8 +1544,9 @@ fn insert_payment_raw_tx(
 fn create_payment_tx(
     transaction: &Transaction<'_>,
     installment_id: i64,
-    requested_amount: Option<i64>,
+    amount: i64,
     payment_date: &str,
+    request_key: &str,
 ) -> AppResult<Value> {
     let installment_amount: i64 = transaction
         .query_row(
@@ -1523,27 +1561,43 @@ fn create_payment_tx(
     if remaining <= 0 {
         return Err(AppError::user("Bu taksit tamamen ödenmiş."));
     }
-    let amount = requested_amount.unwrap_or(remaining);
     if amount <= 0 {
         return Err(AppError::user("Ödeme tutarı sıfırdan büyük olmalıdır."));
     }
     if amount > remaining {
         return Err(AppError::user("Ödeme tutarı kalan borçtan büyük olamaz."));
     }
-    let payment_id = insert_payment_raw_tx(transaction, installment_id, amount, payment_date)?;
+    transaction.execute(
+        "INSERT INTO installment_payments(
+            installment_id, amount_kurus, payment_date, created_at, request_key
+         ) VALUES (?, ?, ?, ?, ?)",
+        params![
+            installment_id,
+            amount,
+            payment_date,
+            created_at(),
+            request_key
+        ],
+    )?;
+    let payment_id = transaction.last_insert_rowid();
     recalculate_paid_date(transaction, installment_id)?;
-    let paid_after = paid_before + amount;
-    let installment = installment_json(transaction, installment_id, false)?;
+    payment_creation_response(transaction, installment_id, payment_id)
+}
+
+fn payment_creation_response(
+    connection: &Connection,
+    installment_id: i64,
+    payment_id: i64,
+) -> AppResult<Value> {
+    let mut payment = payment_json(connection, installment_id, payment_id)?
+        .ok_or_else(|| AppError::user("Ödeme kaydı bulunamadı."))?;
+    let paid_after = money_to_kurus(&payment["running_paid_amount"])?;
+    let amount = money_to_kurus(&payment["amount"])?;
+    payment["paid_before"] = money_json(paid_after.saturating_sub(amount));
+    payment["paid_after"] = money_json(paid_after);
+    let installment = installment_json(connection, installment_id, false)?;
     Ok(json!({
-        "payment": {
-            "id": payment_id,
-            "installment_id": installment_id,
-            "amount": money_json(amount),
-            "payment_date": payment_date,
-            "paid_before": money_json(paid_before),
-            "paid_after": money_json(paid_after),
-            "remaining_after_payment": money_json(installment_amount - paid_after),
-        },
+        "payment": payment,
         "installment": installment,
     }))
 }

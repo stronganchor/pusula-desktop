@@ -3,6 +3,7 @@ use std::{path::PathBuf, sync::Arc};
 use clap::{Parser, Subcommand};
 use pusula_backup_gateway::{
     api::cleanup_stale_relay_spools,
+    b2::B2Client,
     build_gateway,
     config::{token_pepper_from_env, ServiceConfig, DEFAULT_DATABASE_PATH},
     db::Database,
@@ -53,6 +54,23 @@ enum Command {
     RevokeDevice {
         #[arg(long)]
         device_id: String,
+    },
+    /// List completed backup records (Unix root only).
+    ListBackups {
+        #[arg(long, default_value_t = 50)]
+        limit: u32,
+    },
+    /// Look up one completed backup record by ID (Unix root only).
+    LookupBackup {
+        #[arg(long)]
+        backup_id: String,
+    },
+    /// Download and verify one exact completed B2 object version (Unix root only).
+    DownloadBackup {
+        #[arg(long)]
+        backup_id: String,
+        #[arg(long)]
+        output: PathBuf,
     },
 }
 
@@ -141,6 +159,55 @@ async fn run(cli: Cli) -> Result<()> {
             database.revoke_device(&device_id)?;
             println!("{}", json!({ "status": "revoked", "device_id": device_id }));
         }
+        Command::ListBackups { limit } => {
+            require_root()?;
+            let database = migration_database(cli.database);
+            let backups = database.list_completed_backups(limit)?;
+            println!(
+                "{}",
+                serde_json::to_string(&backups).map_err(AppError::internal)?
+            );
+        }
+        Command::LookupBackup { backup_id } => {
+            require_root()?;
+            validate_backup_id(&backup_id)?;
+            let database = migration_database(cli.database);
+            let backup = database.completed_backup(&backup_id)?;
+            println!(
+                "{}",
+                serde_json::to_string(&backup).map_err(AppError::internal)?
+            );
+        }
+        Command::DownloadBackup { backup_id, output } => {
+            require_root()?;
+            validate_backup_id(&backup_id)?;
+            let config = ServiceConfig::from_env(Some(cli.database))?;
+            let database = Database::new(config.database_path.clone(), config.token_pepper.clone());
+            let backup = database.completed_backup(&backup_id)?;
+            let version_id = backup.version_id.as_deref().ok_or(AppError::Conflict(
+                "completed backup has no verified storage version",
+            ))?;
+            let b2 = B2Client::new(config.b2, config.http_client);
+            let verified = b2
+                .download_verified(
+                    &backup.object_key,
+                    version_id,
+                    backup.size_bytes,
+                    &backup.sha256,
+                    &output,
+                )
+                .await?;
+            println!(
+                "{}",
+                json!({
+                    "status": "downloaded",
+                    "backup_id": backup.id,
+                    "version_id": verified.version_id,
+                    "size_bytes": verified.size_bytes,
+                    "sha256": verified.sha256
+                })
+            );
+        }
     }
     Ok(())
 }
@@ -151,6 +218,33 @@ fn migration_database(path: PathBuf) -> Database {
 
 fn admin_database(path: PathBuf) -> Result<Database> {
     Ok(Database::new(path, token_pepper_from_env()?))
+}
+
+fn validate_backup_id(value: &str) -> Result<()> {
+    let parsed = uuid::Uuid::parse_str(value)
+        .map_err(|_| AppError::BadRequest("backup_id must be a UUID"))?;
+    if parsed.to_string() != value {
+        return Err(AppError::BadRequest(
+            "backup_id must use canonical lowercase UUID form",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn require_root() -> Result<()> {
+    // SAFETY: geteuid has no preconditions and does not dereference memory.
+    if unsafe { libc::geteuid() } != 0 {
+        return Err(AppError::Unauthorized);
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn require_root() -> Result<()> {
+    Err(AppError::BadRequest(
+        "backup recovery commands must run as Unix root",
+    ))
 }
 
 fn init_tracing() {

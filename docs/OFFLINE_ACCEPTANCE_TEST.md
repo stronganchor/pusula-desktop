@@ -31,6 +31,10 @@ Disable Wi-Fi and Ethernet and confirm Windows has no route to the internet.
 - [ ] Record a sale with a down payment and installments; verify that the sale
   and every installment appear together.
 - [ ] Record a partial payment, a final payment, and a same-day reversal.
+- [ ] Double-click or otherwise trigger one partial-payment submit twice; only
+  one payment row and one financial increment exist. Repeat an exact pending
+  submit after restarting the app and confirm the durable request key replays
+  the same row; changing amount or date must not reuse that key.
 - [ ] Verify daily collections and expected-payment filters and totals.
 - [ ] Print a sale receipt and a payment receipt.
 - [ ] Restart Windows and verify all records and reports remain available.
@@ -44,19 +48,40 @@ Disable Wi-Fi and Ethernet and confirm Windows has no route to the internet.
   continue and the backup status clearly reports the failure.
 - [ ] A destructive import refuses to start when its encrypted pre-import
   snapshot cannot be durably written.
+- [ ] Hold the shared database lock from another process; both app startup and
+  restore replacement fail closed. Leave a synthetic
+  `.pusula-restore-in-progress.json` marker and confirm startup refuses SQLite
+  access. Confirm a normal restore refuses to overwrite it, then use
+  `-RecoverInterruptedRestore` and require verified rollback/removal plus no
+  recorded plaintext staging/candidate remnants before the marker clears.
 
 ## Backup, restore, and update
 
 - [ ] An offline change produces a consistent encrypted local backup.
 - [ ] Enrollment stores no token in app files/logs and the one-time code cannot
   be replayed.
+- [ ] Revoke a device token and require **Yeniden kurulum gerekli** plus visible
+  enrollment controls; reenrollment uploads the preserved ciphertext queue.
 - [ ] Reconnect the network; the desktop uploads ciphertext directly through a
   short-lived single-object URL and reports server confirmation.
 - [ ] On a network where the direct B2 TLS connection fails before any HTTP
   response, the desktop retries the same backup ID through the authenticated
   gateway relay; B2 receives only the existing `.age` ciphertext, the gateway
   spool is empty afterward, and a B2 HTTP rejection does not trigger the relay.
-- [ ] The gateway and B2 metadata agree on ciphertext size and SHA-256.
+- [ ] The desktop queue sidecar, gateway verification record, and exact B2
+  object version agree on ciphertext size and SHA-256. The nonempty gateway and
+  B2 version IDs match exactly, and the gateway verification timestamp falls
+  within the recorded acceptance interval.
+- [ ] Force `uploaded`/`relay_pending` `404 not_found`; Pusula clears only the
+  stale binding, re-reserves, and uploads byte-identical ciphertext. Force
+  `409 object_not_present`; it preserves the same binding and stage-appropriate
+  retry. Force `502 storage_verification_failed`; it confirms later without a
+  blind PUT/relay. Lost direct/relay responses must still yield exactly one B2
+  object version.
+- [ ] Leave the computer off across the first of a month. On the next launch,
+  require one daily and one catch-up monthly artifact for the local business
+  periods. Re-run the six-hour scheduler in the same periods and require no
+  duplicate artifacts; remote retries only drain the existing queue.
 - [ ] Restore that object into a clean test profile using the recovery runbook;
   SQLite integrity, row counts, and financial totals match the source.
 - [ ] Install the previous signed version, make an offline write, reconnect, and
@@ -66,6 +91,10 @@ Disable Wi-Fi and Ethernet and confirm Windows has no route to the internet.
   confirmation without changing the candidate artifact.
 - [ ] The pre-update backup completes before installation and all records remain
   intact after relaunch.
+- [ ] Stall a remote backup request, then start update preparation. A local
+  business write remains available while preflight waits for its snapshot lane;
+  once preflight takes the maintenance gate it creates a durable encrypted
+  local snapshot without another gateway request.
 
 ### Controlled invalid-signature drill
 
@@ -134,7 +163,16 @@ not replace, the signed previous-version-to-candidate update drill.
 
 ## Release evidence
 
-Attach only non-sensitive evidence: installer/update hashes, signature status,
-test versions, fixture manifest values, gateway backup ID, B2 object metadata,
-and pass/fail results. Never attach customer exports, tokens, keys, or database
-files to GitHub.
+Use only the closed schema in `acceptance-evidence.template.json`, then run
+`scripts/New-ReleaseAcceptanceEvidence.ps1` as documented in
+`RELEASE_RUNBOOK.md`. Stable publication accepts only its canonical compact
+UTF-8/no-BOM JSON and attaches those exact bytes as
+`Pusula_<version>_acceptance-evidence.json`.
+
+The evidence may contain installer/update hashes, exact signer identity, test
+versions, the committed logical fixture-manifest checksum and exact
+counts/totals, gateway backup ID, ciphertext size/hash metadata, the exact
+matching gateway/B2 object version ID, the gateway verification timestamp, and
+enumerated pass results. Never add free-text notes, names, filesystem paths,
+customer exports, tokens, keys, credentials, database files, or other sensitive
+fields.

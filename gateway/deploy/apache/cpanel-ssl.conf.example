@@ -10,9 +10,16 @@ ProxyPreserveHost On
 ProxyAddHeaders On
 RequestHeader set X-Forwarded-Proto "https"
 
-ProxyPass        "/v1/backups/relay/" "http://127.0.0.1:12741/v1/backups/relay/" connectiontimeout=5 timeout=900 retry=0
+# Per-Apache-child backend pools fail within one second instead of accumulating
+# an unbounded proxy wait queue. The gateway independently enforces process-wide
+# request, DB, aggregate-rate, and single-relay limits. Completion streams the
+# entire encrypted B2 object through SHA-256, so it needs the bounded long
+# response window without receiving the relay route's large request-body limit.
+ProxyPass        "/v1/backups/complete" "http://127.0.0.1:12741/v1/backups/complete" connectiontimeout=5 timeout=900 retry=0 max=2 acquire=1000
+ProxyPassReverse "/v1/backups/complete" "http://127.0.0.1:12741/v1/backups/complete"
+ProxyPass        "/v1/backups/relay/" "http://127.0.0.1:12741/v1/backups/relay/" connectiontimeout=5 timeout=900 retry=0 max=1 acquire=1000
 ProxyPassReverse "/v1/backups/relay/" "http://127.0.0.1:12741/v1/backups/relay/"
-ProxyPass        "/" "http://127.0.0.1:12741/" connectiontimeout=5 timeout=25 retry=0
+ProxyPass        "/" "http://127.0.0.1:12741/" connectiontimeout=5 timeout=25 retry=0 max=16 acquire=1000
 ProxyPassReverse "/" "http://127.0.0.1:12741/"
 
 <Location "/">

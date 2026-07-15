@@ -411,7 +411,7 @@ try {
 
     if ($PreparationOnly) {
         $preparationEvidence = [ordered]@{
-            schema_version = 1
+            schema_version = 2
             result = 'preparation-only'
             runtime_executed = $false
             source_commit = $sourceCommit
@@ -553,7 +553,7 @@ try {
     }
 
     $evidence = [ordered]@{
-        schema_version = 1
+        schema_version = 2
         test = 'tauri-invalid-signature-rejection'
         result = 'pass'
         completed_at_utc = [DateTimeOffset]::UtcNow.ToString('o')

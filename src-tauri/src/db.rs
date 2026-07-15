@@ -19,7 +19,7 @@ use crate::{
     },
 };
 
-pub const SCHEMA_VERSION: i32 = 1;
+pub const SCHEMA_VERSION: i32 = 2;
 pub const EXPORT_FORMAT_VERSION: u32 = 1;
 pub(crate) const MAX_SAFE_JS_INTEGER: i64 = 9_007_199_254_740_991;
 
@@ -166,6 +166,13 @@ CREATE TABLE settings (
 INSERT INTO business_profile(id) VALUES (1);
 "#;
 
+const MIGRATION_2: &str = r#"
+ALTER TABLE installment_payments ADD COLUMN request_key TEXT;
+CREATE UNIQUE INDEX payments_request_key_idx
+    ON installment_payments(request_key)
+    WHERE request_key IS NOT NULL;
+"#;
+
 #[derive(Debug, Clone)]
 pub struct Database {
     path: PathBuf,
@@ -266,13 +273,14 @@ impl Database {
             },
         )?;
 
-        let payments = query_all(&transaction, "SELECT id, installment_id, amount_kurus, payment_date, created_at FROM installment_payments ORDER BY id", |row| {
+        let payments = query_all(&transaction, "SELECT id, installment_id, amount_kurus, payment_date, created_at, request_key FROM installment_payments ORDER BY id", |row| {
             Ok(PaymentExport {
                 id: row.get(0)?,
                 installment_id: row.get(1)?,
                 amount_kurus: row.get(2)?,
                 payment_date: row.get(3)?,
                 created_at: row.get(4)?,
+                request_key: row.get(5)?,
             })
         })?;
 
@@ -353,8 +361,8 @@ impl Database {
         }
         for payment in &bundle.payments {
             transaction.execute(
-                "INSERT INTO installment_payments(id, installment_id, amount_kurus, payment_date, created_at) VALUES (?, ?, ?, ?, ?)",
-                params![payment.id, payment.installment_id, payment.amount_kurus, payment.payment_date, payment.created_at],
+                "INSERT INTO installment_payments(id, installment_id, amount_kurus, payment_date, created_at, request_key) VALUES (?, ?, ?, ?, ?, ?)",
+                params![payment.id, payment.installment_id, payment.amount_kurus, payment.payment_date, payment.created_at, payment.request_key],
             )?;
         }
 
@@ -573,6 +581,12 @@ fn migrate(connection: &mut Connection) -> AppResult<()> {
         let transaction = connection.transaction()?;
         transaction.execute_batch(MIGRATION_1)?;
         transaction.pragma_update(None, "user_version", 1)?;
+        transaction.commit()?;
+    }
+    if version < 2 {
+        let transaction = connection.transaction()?;
+        transaction.execute_batch(MIGRATION_2)?;
+        transaction.pragma_update(None, "user_version", 2)?;
         transaction.commit()?;
     }
     Ok(())
@@ -947,6 +961,7 @@ fn validate_bundle(bundle: &ExportBundle) -> AppResult<()> {
     }
 
     let mut payment_ids = HashSet::new();
+    let mut payment_request_keys = HashSet::new();
     let mut payment_totals: HashMap<i64, i64> = HashMap::new();
     for row in &bundle.payments {
         require_unique_positive_id(row.id, &mut payment_ids, "ödeme")?;
@@ -966,6 +981,15 @@ fn validate_bundle(bundle: &ExportBundle) -> AppResult<()> {
             && DateTime::parse_from_rfc3339(&row.created_at).is_err()
         {
             return Err(AppError::user("Ödeme oluşturma zamanı geçersiz."));
+        }
+        if let Some(raw_key) = row.request_key.as_deref() {
+            let key = normalize_sale_request_key(raw_key)
+                .ok_or_else(|| AppError::user("Geçersiz veya yinelenen ödeme istek anahtarı."))?;
+            if !payment_request_keys.insert(key) {
+                return Err(AppError::user(
+                    "Geçersiz veya yinelenen ödeme istek anahtarı.",
+                ));
+            }
         }
         let total = payment_totals.entry(row.installment_id).or_default();
         *total = total
@@ -1003,6 +1027,12 @@ fn normalize_import_text(bundle: &mut ExportBundle) {
     }
     for row in &mut bundle.sales {
         trim(&mut row.description);
+        row.request_key = row
+            .request_key
+            .as_deref()
+            .and_then(normalize_sale_request_key);
+    }
+    for row in &mut bundle.payments {
         row.request_key = row
             .request_key
             .as_deref()
@@ -1162,6 +1192,58 @@ mod tests {
             .pragma_query_value(None, "foreign_keys", |row| row.get(0))
             .unwrap();
         assert_eq!(foreign_keys, 1);
+    }
+
+    #[test]
+    fn migrates_version_one_payment_rows_to_nullable_unique_request_keys() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("version-one.sqlite3");
+        let connection = Connection::open(&path).unwrap();
+        connection.execute_batch(MIGRATION_1).unwrap();
+        connection.pragma_update(None, "user_version", 1).unwrap();
+        connection
+            .execute(
+                "INSERT INTO customers(id, name, registration_date) VALUES (1, 'Eski', '2026-07-15')",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO sales(id, customer_id, date, total_kurus, description)
+                 VALUES (1, 1, '2026-07-15', 10000, '')",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO installments(id, sale_id, amount_kurus) VALUES (1, 1, 10000)",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO installment_payments(
+                    id, installment_id, amount_kurus, payment_date, created_at
+                 ) VALUES (1, 1, 2500, '2026-07-15', '2026-07-15T12:00:00Z')",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+
+        let database = Database::initialize(&path).unwrap();
+        let connection = database.connect().unwrap();
+        let request_key: Option<String> = connection
+            .query_row(
+                "SELECT request_key FROM installment_payments WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(request_key, None);
+        let version: i32 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
     }
 
     #[test]

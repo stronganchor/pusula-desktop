@@ -73,6 +73,8 @@ pub struct PaymentExport {
     pub amount_kurus: i64,
     pub payment_date: String,
     pub created_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Serialize)]

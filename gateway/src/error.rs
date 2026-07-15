@@ -13,8 +13,12 @@ pub enum AppError {
     Unauthorized,
     #[error("not found")]
     NotFound,
+    #[error("reserved object is not present in storage")]
+    ObjectNotPresent { retry_after_seconds: u64 },
     #[error("rate limited")]
     RateLimited { retry_after_seconds: u64 },
+    #[error("service capacity is temporarily exhausted")]
+    ServiceUnavailable { retry_after_seconds: u64 },
     #[error("conflict: {0}")]
     Conflict(&'static str),
     #[error("object storage verification failed: {0}")]
@@ -58,10 +62,20 @@ impl IntoResponse for AppError {
                 "not_found",
                 "The requested resource was not found.",
             ),
+            Self::ObjectNotPresent { .. } => (
+                StatusCode::CONFLICT,
+                "object_not_present",
+                "The reserved object is not present yet.",
+            ),
             Self::RateLimited { .. } => (
                 StatusCode::TOO_MANY_REQUESTS,
                 "rate_limited",
                 "Too many requests. Retry later.",
+            ),
+            Self::ServiceUnavailable { .. } => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "service_unavailable",
+                "The gateway is temporarily at capacity.",
             ),
             Self::Conflict(_) => (
                 StatusCode::CONFLICT,
@@ -104,10 +118,19 @@ impl IntoResponse for AppError {
                 HeaderValue::from_static("Bearer realm=\"pusula-backup\""),
             );
         }
-        if let Self::RateLimited {
-            retry_after_seconds,
-        } = self
-        {
+        let retry_after_seconds = match self {
+            Self::RateLimited {
+                retry_after_seconds,
+            }
+            | Self::ServiceUnavailable {
+                retry_after_seconds,
+            }
+            | Self::ObjectNotPresent {
+                retry_after_seconds,
+            } => Some(retry_after_seconds),
+            _ => None,
+        };
+        if let Some(retry_after_seconds) = retry_after_seconds {
             if let Ok(value) = HeaderValue::from_str(&retry_after_seconds.to_string()) {
                 response.headers_mut().insert(header::RETRY_AFTER, value);
             }

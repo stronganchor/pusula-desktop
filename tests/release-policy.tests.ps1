@@ -6,11 +6,17 @@ $ErrorActionPreference = 'Stop'
 
 $repoRoot = Split-Path $PSScriptRoot -Parent
 $identityScript = Join-Path $repoRoot 'scripts\Test-ReleaseIdentity.ps1'
-$promotionScript = Join-Path $repoRoot 'scripts\Test-CandidatePromotion.ps1'
+$publicationScript = Join-Path $repoRoot 'scripts\Publish-VerifiedRelease.ps1'
+$candidatePreparationScript = Join-Path $repoRoot 'scripts\Prepare-ResumableCandidateRelease.ps1'
+$stablePreparationScript = Join-Path $repoRoot 'scripts\Prepare-ResumableStableRelease.ps1'
+$repositoryControlsScript = Join-Path $repoRoot 'scripts\Release-RepositoryControls.ps1'
 $candidateConfigScript = Join-Path $repoRoot 'scripts\New-CandidateUpdaterConfig.ps1'
 $manifestScript = Join-Path $repoRoot 'scripts\New-UpdateManifest.ps1'
 $assetScript = Join-Path $repoRoot 'scripts\Test-ReleaseAssets.ps1'
 & (Join-Path $repoRoot 'tests\invalid-updater-signature-harness.tests.ps1') | Out-Host
+& (Join-Path $repoRoot 'tests\release-acceptance-evidence.tests.ps1') | Out-Host
+& (Join-Path $repoRoot 'tests\candidate-release-resume.tests.ps1') | Out-Host
+& (Join-Path $repoRoot 'tests\release-publication.tests.ps1') | Out-Host
 $package = Get-Content -Raw -LiteralPath (Join-Path $repoRoot 'package.json') | ConvertFrom-Json
 $version = [string]$package.version
 $commit = (& git -C $repoRoot rev-parse HEAD).Trim()
@@ -21,6 +27,10 @@ $candidateTag = "v$version-candidate.$commit"
 $ciWorkflow = Get-Content -Raw -LiteralPath (Join-Path $repoRoot '.github\workflows\ci.yml')
 $releaseWorkflow = Get-Content -Raw -LiteralPath (Join-Path $repoRoot '.github\workflows\release.yml')
 $promotionWorkflow = Get-Content -Raw -LiteralPath (Join-Path $repoRoot '.github\workflows\promote-release.yml')
+$publicationPolicy = Get-Content -Raw -LiteralPath $publicationScript
+$candidatePreparationPolicy = Get-Content -Raw -LiteralPath $candidatePreparationScript
+$stablePreparationPolicy = Get-Content -Raw -LiteralPath $stablePreparationScript
+$repositoryControlsPolicy = Get-Content -Raw -LiteralPath $repositoryControlsScript
 $tauriConfig = Get-Content -Raw -LiteralPath (Join-Path $repoRoot 'src-tauri\tauri.conf.json') | ConvertFrom-Json
 if ([string]$tauriConfig.bundle.windows.webviewInstallMode.type -cne 'offlineInstaller') {
     throw 'Release installer must embed the offline WebView2 installer.'
@@ -103,55 +113,80 @@ if (-not (Test-OrdinalContains -Text $ciWorkflow -Value '- name: Package Tauri v
     -not (Test-OrdinalContains -Text $ciWorkflow -Value 'Deprecated Tauri v1-compatible NSIS updater ZIP was generated.')) {
     throw 'CI must exercise the modern direct-EXE NSIS updater bundle path.'
 }
+if (-not (Test-OrdinalContains -Text $releaseWorkflow -Value 'validate-gateway:') -or
+    -not (Test-OrdinalContains -Text $releaseWorkflow -Value 'needs: [validate, validate-gateway]') -or
+    -not (Test-OrdinalContains -Text $releaseWorkflow -Value '- name: Validate the exact gateway source shipped with this candidate') -or
+    -not (Test-OrdinalContains -Text $releaseWorkflow -Value 'cargo fmt --manifest-path gateway/Cargo.toml --check') -or
+    -not (Test-OrdinalContains -Text $releaseWorkflow -Value 'cargo clippy --manifest-path gateway/Cargo.toml --all-targets -- -D warnings') -or
+    -not (Test-OrdinalContains -Text $releaseWorkflow -Value 'cargo test --manifest-path gateway/Cargo.toml')) {
+    throw 'The signed-release workflow must validate the exact gateway commit before privileged signing.'
+}
 
 Assert-OrderedWorkflowSteps -Workflow $releaseWorkflow -StepNames @(
-    'Create exact candidate tag and upload a private draft',
-    'Recheck immutable policy, exact tag, identity, and draft bytes immediately before publication',
-    'Publish the revalidated candidate'
+    'Create or safely resume the exact candidate draft',
+    'Revalidate and publish the candidate draft in one write-token process'
 )
 Assert-OrderedWorkflowSteps -Workflow $promotionWorkflow -StepNames @(
-    'Create exact stable tag and upload a private draft',
-    'Recheck immutable policy, candidate, exact stable tag, and draft bytes immediately before publication',
-    'Publish the revalidated stable release'
+    'Decode bounded canonical acceptance evidence',
+    'Revalidate immutable candidate, signatures, and canonical evidence',
+    'Add exact evidence as the sixth stable asset',
+    'Create or safely resume the exact stable draft',
+    'Revalidate and publish the stable draft in one write-token process'
 )
-if (-not (Test-OrdinalContains -Text $releaseWorkflow -Value '"ref=refs/tags/$tag"') -or
-    -not (Test-OrdinalContains -Text $releaseWorkflow -Value '"sha=$($env:RELEASE_COMMIT)"') -or
-    ([regex]::Matches($releaseWorkflow, [regex]::Escape('git/ref/tags/$tag'))).Count -lt 4) {
-    throw 'Candidate workflow must exclusively create and repeatedly verify its exact lightweight Git tag.'
+if (-not (Test-OrdinalContains -Text $releaseWorkflow -Value '.\scripts\Prepare-ResumableCandidateRelease.ps1') -or
+    -not (Test-OrdinalContains -Text $releaseWorkflow -Value '-AllowExactCandidateDraftResume')) {
+    throw 'Candidate workflow must safely resume only its exact lightweight tag and draft.'
 }
-if (-not (Test-OrdinalContains -Text $promotionWorkflow -Value '"ref=refs/tags/$stableTag"') -or
-    -not (Test-OrdinalContains -Text $promotionWorkflow -Value '"sha=$candidateCommit"') -or
-    ([regex]::Matches($promotionWorkflow, [regex]::Escape('git/ref/tags/$stableTag'))).Count -lt 4) {
-    throw 'Stable workflow must exclusively create and repeatedly verify its exact lightweight Git tag.'
+if (-not (Test-OrdinalContains -Text $promotionWorkflow -Value 'acceptance_evidence_base64:') -or
+    -not (Test-OrdinalContains -Text $promotionWorkflow -Value 'actions: read') -or
+    -not (Test-OrdinalContains -Text $promotionWorkflow -Value 'maximum 60 KiB encoded / 45 KiB decoded') -or
+    -not (Test-OrdinalContains -Text $promotionWorkflow -Value '.\scripts\Decode-ReleaseAcceptanceEvidence.ps1') -or
+    -not (Test-OrdinalContains -Text $promotionWorkflow -Value '.\scripts\Prepare-ResumableStableRelease.ps1')) {
+    throw 'Stable workflow must carry bounded canonical evidence and use the safe resumable-draft helper.'
 }
-$candidateRecheckStart = $releaseWorkflow.IndexOf('- name: Recheck immutable policy, exact tag, identity, and draft bytes immediately before publication', [StringComparison]::Ordinal)
-$candidatePublishStart = $releaseWorkflow.IndexOf('- name: Publish the revalidated candidate', [StringComparison]::Ordinal)
-$candidateRecheck = $releaseWorkflow.Substring($candidateRecheckStart, $candidatePublishStart - $candidateRecheckStart)
-if (-not (Test-OrdinalContains -Text $candidateRecheck -Value 'GH_TOKEN: ${{ secrets.RELEASE_ADMIN_READ_TOKEN }}') -or
-    -not (Test-OrdinalContains -Text $candidateRecheck -Value '$assets = @(Get-ChildItem -LiteralPath release-assets -File | Sort-Object Name)') -or
-    -not (Test-OrdinalContains -Text $candidateRecheck -Value 'immutable-releases') -or
-    -not (Test-OrdinalContains -Text $candidateRecheck -Value ') -cne ($remoteAssets | ConvertTo-Json -Compress)')) {
-    throw 'Candidate workflow must reconstruct and case-sensitively revalidate draft assets and immutability with the read-only admin token.'
-}
-$stableRecheckStart = $promotionWorkflow.IndexOf('- name: Recheck immutable policy, candidate, exact stable tag, and draft bytes immediately before publication', [StringComparison]::Ordinal)
-$stablePublishStart = $promotionWorkflow.IndexOf('- name: Publish the revalidated stable release', [StringComparison]::Ordinal)
-$stableRecheck = $promotionWorkflow.Substring($stableRecheckStart, $stablePublishStart - $stableRecheckStart)
-if (-not (Test-OrdinalContains -Text $stableRecheck -Value 'GH_TOKEN: ${{ secrets.RELEASE_ADMIN_READ_TOKEN }}') -or
-    -not (Test-OrdinalContains -Text $stableRecheck -Value 'immutable-releases') -or
-    -not (Test-OrdinalContains -Text $stableRecheck -Value ') -cne ($remoteAssets | ConvertTo-Json -Compress)')) {
-    throw 'Stable workflow must case-sensitively revalidate draft assets and immutability with the read-only admin token.'
-}
+$candidatePublishStart = $releaseWorkflow.IndexOf('- name: Revalidate and publish the candidate draft in one write-token process', [StringComparison]::Ordinal)
+$stablePublishStart = $promotionWorkflow.IndexOf('- name: Revalidate and publish the stable draft in one write-token process', [StringComparison]::Ordinal)
 $candidatePublish = $releaseWorkflow.Substring($candidatePublishStart)
-if (-not (Test-OrdinalContains -Text $candidatePublish -Value 'GH_TOKEN: ${{ github.token }}') -or
-    -not (Test-OrdinalContains -Text $candidatePublish -Value 'git/ref/tags/$tag') -or
-    -not (Test-OrdinalContains -Text $candidatePublish -Value ') -cne ($publishedAssets | ConvertTo-Json -Compress)')) {
-    throw 'Candidate publication must use the isolated write token and read back its exact immutable tag and bytes.'
-}
 $stablePublish = $promotionWorkflow.Substring($stablePublishStart)
-if (-not (Test-OrdinalContains -Text $stablePublish -Value 'GH_TOKEN: ${{ github.token }}') -or
-    -not (Test-OrdinalContains -Text $stablePublish -Value 'git/ref/tags/$stableTag') -or
-    -not (Test-OrdinalContains -Text $stablePublish -Value ') -cne ($publishedAssets | ConvertTo-Json -Compress)')) {
-    throw 'Stable publication must use the isolated write token and read back its exact immutable tag and bytes.'
+foreach ($publicationStep in @($candidatePublish, $stablePublish)) {
+    if (-not (Test-OrdinalContains -Text $publicationStep -Value 'GH_TOKEN: ${{ github.token }}') -or
+        -not (Test-OrdinalContains -Text $publicationStep -Value 'RELEASE_ADMIN_READ_TOKEN: ${{ secrets.RELEASE_ADMIN_READ_TOKEN }}') -or
+        -not (Test-OrdinalContains -Text $publicationStep -Value '.\scripts\Publish-VerifiedRelease.ps1')) {
+        throw 'Each final publication must execute the shared recheck/PATCH helper with exclusive write-token custody.'
+    }
+}
+if (-not (Test-OrdinalContains -Text $candidatePublish -Value '-BuildInitialAcceptanceBaseline $env:BUILD_INITIAL_ACCEPTANCE_BASELINE') -or
+    -not (Test-OrdinalContains -Text $candidatePublish -Value '-AcceptanceBaselineVersion $env:ACCEPTANCE_BASELINE_VERSION')) {
+    throw 'Final candidate publication must recheck the exact initial baseline gate.'
+}
+if (-not (Test-OrdinalContains -Text $publicationPolicy -Value 'releases/assets/$assetId') -or
+    -not (Test-OrdinalContains -Text $publicationPolicy -Value 'releases/$releaseId') -or
+    -not (Test-OrdinalContains -Text $publicationPolicy -Value "'--method', 'PATCH'") -or
+    -not (Test-OrdinalContains -Text $publicationPolicy -Value 'X-GitHub-Api-Version: 2026-03-10') -or
+    -not (Test-OrdinalContains -Text $publicationPolicy -Value 'Assert-PusulaReleaseRepositoryControls') -or
+    -not (Test-OrdinalContains -Text $publicationPolicy -Value 'gh release verify') -or
+    (Test-OrdinalContains -Text $publicationPolicy -Value "'DELETE'") -or
+    (Test-OrdinalContains -Text $publicationPolicy -Value 'release delete')) {
+    throw 'Shared publication helper must revalidate numeric IDs/digests, PATCH once, verify immutability, and never delete.'
+}
+if (-not (Test-OrdinalContains -Text $stablePreparationPolicy -Value 'rerun will verify and resume without clobbering') -or
+    -not (Test-OrdinalContains -Text $stablePreparationPolicy -Value 'never retag it') -or
+    (Test-OrdinalContains -Text $stablePreparationPolicy -Value '--clobber') -or
+    (Test-OrdinalContains -Text $stablePreparationPolicy -Value "'DELETE'")) {
+    throw 'Stable draft preparation must resume only exact assets and never clobber, delete, or retag.'
+}
+if (-not (Test-OrdinalContains -Text $candidatePreparationPolicy -Value 'rerun failed jobs to verify and resume without clobbering') -or
+    -not (Test-OrdinalContains -Text $candidatePreparationPolicy -Value 'never retag it') -or
+    (Test-OrdinalContains -Text $candidatePreparationPolicy -Value '--clobber') -or
+    (Test-OrdinalContains -Text $candidatePreparationPolicy -Value "'DELETE'")) {
+    throw 'Candidate draft preparation must resume only exact assets and never clobber, delete, or retag.'
+}
+if (-not (Test-OrdinalContains -Text $repositoryControlsPolicy -Value "'Protect release tags'") -or
+    -not (Test-OrdinalContains -Text $repositoryControlsPolicy -Value "'refs/tags/v*'") -or
+    -not (Test-OrdinalContains -Text $repositoryControlsPolicy -Value "@('deletion', 'update')") -or
+    -not (Test-OrdinalContains -Text $repositoryControlsPolicy -Value "current_user_can_bypass") -or
+    -not (Test-OrdinalContains -Text $repositoryControlsPolicy -Value 'immutable-releases')) {
+    throw 'Release repository controls must verify immutable releases and the exact no-bypass release-tag ruleset.'
 }
 
 $originalRef = $env:GITHUB_REF
@@ -162,6 +197,9 @@ $global:PusulaReleasePolicyImmutabilityEnabled = $true
 $global:PusulaReleasePolicyCandidateImmutable = $true
 $global:PusulaReleasePolicyStableTagExists = $false
 $global:PusulaReleasePolicyStableReleaseExists = $false
+$global:PusulaReleasePolicyCandidateOnlyReleaseExists = $false
+$global:PusulaReleasePolicyExactCandidateDraftExists = $false
+$global:PusulaReleasePolicyRulesetMode = 'exact'
 
 function global:gh {
     $global:LASTEXITCODE = 0
@@ -173,10 +211,41 @@ function global:gh {
                 enforced_by_owner = $false
             } | ConvertTo-Json -Compress)
     }
+    if ($commandLine -like '*rulesets/18968971*') {
+        $bypassActors = @()
+        $canBypass = 'never'
+        $include = @('refs/tags/v*')
+        if ($global:PusulaReleasePolicyRulesetMode -eq 'bypass') {
+            $bypassActors = @(@{ actor_id = 1; actor_type = 'RepositoryRole'; bypass_mode = 'always' })
+            $canBypass = 'always'
+        }
+        elseif ($global:PusulaReleasePolicyRulesetMode -eq 'wrong-ref') {
+            $include = @('~DEFAULT_BRANCH')
+        }
+        return (@{
+                id = 18968971
+                name = 'Protect release tags'
+                target = 'tag'
+                enforcement = 'active'
+                conditions = @{ ref_name = @{ include = $include; exclude = @() } }
+                rules = @(@{ type = 'update' }, @{ type = 'deletion' })
+                bypass_actors = $bypassActors
+                current_user_can_bypass = $canBypass
+            } | ConvertTo-Json -Depth 8 -Compress)
+    }
+    if ($commandLine -like '*repos/stronganchor/pusula-desktop/rulesets*') {
+        return (@(@{ id = 18968971; name = 'Protect release tags'; target = 'tag' }) | ConvertTo-Json -Compress)
+    }
     if ($commandLine -like '*git/ref/heads/main*') {
         return (@{ object = @{ sha = $global:PusulaReleasePolicyCommit } } | ConvertTo-Json -Compress)
     }
     if ($commandLine -like '*matching-refs/tags/*') {
+        if ($global:PusulaReleasePolicyExactCandidateDraftExists) {
+            return (ConvertTo-Json -InputObject @(@{
+                        ref = "refs/tags/$($global:PusulaReleasePolicyCandidateTag)"
+                        object = @{ sha = $global:PusulaReleasePolicyCommit; type = 'commit' }
+                    }) -Depth 5 -Compress)
+        }
         if ($global:PusulaReleasePolicyStableTagExists) {
             return (@(@{
                         ref = "refs/tags/v$($global:PusulaReleasePolicyVersion)"
@@ -186,8 +255,14 @@ function global:gh {
         return '[]'
     }
     if ($commandLine -like '*releases?per_page=100*') {
-        if ($global:PusulaReleasePolicyStableReleaseExists -and $commandLine -like '*.tag_name*') {
-            return "v$($global:PusulaReleasePolicyVersion)"
+        if ($global:PusulaReleasePolicyExactCandidateDraftExists) {
+            return "$($global:PusulaReleasePolicyCandidateTag)`ttrue`ttrue"
+        }
+        if ($global:PusulaReleasePolicyStableReleaseExists) {
+            return "v0.0.9`tfalse`tfalse"
+        }
+        if ($global:PusulaReleasePolicyCandidateOnlyReleaseExists) {
+            return "v0.0.9-candidate.$('f' * 40)`tfalse`ttrue"
         }
         return
     }
@@ -213,7 +288,9 @@ try {
             -ExpectedVersion "$version-rc.1" `
             -Repository 'stronganchor/pusula-desktop' `
             -ExpectedCommit $commit `
-            -CandidateTag $candidateTag
+            -CandidateTag $candidateTag `
+            -BuildInitialAcceptanceBaseline true `
+            -AcceptanceBaselineVersion '0.0.9'
     }
 
     Assert-ThrowsLike -Pattern '*Candidate tag must exactly equal*' -Action {
@@ -221,14 +298,52 @@ try {
             -ExpectedVersion $version `
             -Repository 'stronganchor/pusula-desktop' `
             -ExpectedCommit $commit `
-            -CandidateTag "v$version-candidate.$('0' * 40)"
+            -CandidateTag "v$version-candidate.$('0' * 40)" `
+            -BuildInitialAcceptanceBaseline true `
+            -AcceptanceBaselineVersion '0.0.9'
     }
 
+    Assert-ThrowsLike -Pattern '*first stable release requires build_initial_acceptance_baseline=true*' -Action {
+        & $identityScript `
+            -ExpectedVersion $version -Repository 'stronganchor/pusula-desktop' -ExpectedCommit $commit `
+            -CandidateTag $candidateTag -BuildInitialAcceptanceBaseline false -AcceptanceBaselineVersion '0.0.9'
+    }
+    Assert-ThrowsLike -Pattern '*exact 0.0.9 acceptance baseline*' -Action {
+        & $identityScript `
+            -ExpectedVersion $version -Repository 'stronganchor/pusula-desktop' -ExpectedCommit $commit `
+            -CandidateTag $candidateTag -BuildInitialAcceptanceBaseline true -AcceptanceBaselineVersion '0.0.8'
+    }
     & $identityScript `
         -ExpectedVersion $version `
         -Repository 'stronganchor/pusula-desktop' `
         -ExpectedCommit $commit `
-        -CandidateTag $candidateTag | Out-Host
+        -CandidateTag $candidateTag `
+        -BuildInitialAcceptanceBaseline true `
+        -AcceptanceBaselineVersion '0.0.9' | Out-Host
+
+    $global:PusulaReleasePolicyStableReleaseExists = $true
+    & $identityScript `
+        -ExpectedVersion $version -Repository 'stronganchor/pusula-desktop' -ExpectedCommit $commit `
+        -CandidateTag $candidateTag -BuildInitialAcceptanceBaseline false -AcceptanceBaselineVersion '0.0.9' | Out-Host
+    $global:PusulaReleasePolicyStableReleaseExists = $false
+    $global:PusulaReleasePolicyCandidateOnlyReleaseExists = $true
+    Assert-ThrowsLike -Pattern '*first stable release requires build_initial_acceptance_baseline=true*' -Action {
+        & $identityScript `
+            -ExpectedVersion $version -Repository 'stronganchor/pusula-desktop' -ExpectedCommit $commit `
+            -CandidateTag $candidateTag -BuildInitialAcceptanceBaseline false -AcceptanceBaselineVersion '0.0.9'
+    }
+    $global:PusulaReleasePolicyCandidateOnlyReleaseExists = $false
+    $global:PusulaReleasePolicyExactCandidateDraftExists = $true
+    & $identityScript `
+        -ExpectedVersion $version -Repository 'stronganchor/pusula-desktop' -ExpectedCommit $commit `
+        -CandidateTag $candidateTag -BuildInitialAcceptanceBaseline true -AcceptanceBaselineVersion '0.0.9' `
+        -AllowExactCandidateDraftResume | Out-Host
+    Assert-ThrowsLike -Pattern '*already exists for version*' -Action {
+        & $identityScript `
+            -ExpectedVersion $version -Repository 'stronganchor/pusula-desktop' -ExpectedCommit $commit `
+            -CandidateTag $candidateTag -BuildInitialAcceptanceBaseline true -AcceptanceBaselineVersion '0.0.9'
+    }
+    $global:PusulaReleasePolicyExactCandidateDraftExists = $false
 
     $fixtureDirectory = Join-Path $env:TEMP ('pusula-release-policy-fixture-' + [Guid]::NewGuid().ToString('N'))
     try {
@@ -310,66 +425,27 @@ try {
             -Repository 'stronganchor/pusula-desktop' `
             -ExpectedCommit $commit `
             -CandidateTag $candidateTag `
+            -BuildInitialAcceptanceBaseline true `
+            -AcceptanceBaselineVersion '0.0.9' `
             -RequireRepositoryImmutability
     }
 
-    Assert-ThrowsLike -Pattern '*release immutability must be enabled*' -Action {
-        & $promotionScript `
-            -Version $version `
-            -CandidateTag $candidateTag `
-            -Repository 'stronganchor/pusula-desktop' `
-            -WorkflowCommit $commit `
-            -AcceptanceEvidenceSha256 ('a' * 64) `
-            -Confirmation "PROMOTE v$version" `
-            -DownloadDirectory (Join-Path $env:TEMP 'pusula-release-policy-disabled') `
-            -ExpectedWindowsPublisher 'Test Publisher' `
-            -MinisignPath (Join-Path $env:SystemRoot 'System32\notepad.exe')
-    }
-
     $global:PusulaReleasePolicyImmutabilityEnabled = $true
-    $global:PusulaReleasePolicyCandidateImmutable = $false
-    Assert-ThrowsLike -Pattern '*Only an immutable candidate release can be promoted*' -Action {
-        & $promotionScript `
-            -Version $version `
-            -CandidateTag $candidateTag `
-            -Repository 'stronganchor/pusula-desktop' `
-            -WorkflowCommit $commit `
-            -AcceptanceEvidenceSha256 ('b' * 64) `
-            -Confirmation "PROMOTE v$version" `
-            -DownloadDirectory (Join-Path $env:TEMP 'pusula-release-policy-mutable') `
-            -ExpectedWindowsPublisher 'Test Publisher' `
-            -MinisignPath (Join-Path $env:SystemRoot 'System32\notepad.exe')
+    $global:PusulaReleasePolicyRulesetMode = 'bypass'
+    Assert-ThrowsLike -Pattern '*no bypass actors*' -Action {
+        & $identityScript `
+            -ExpectedVersion $version -Repository 'stronganchor/pusula-desktop' -ExpectedCommit $commit `
+            -CandidateTag $candidateTag -BuildInitialAcceptanceBaseline true -AcceptanceBaselineVersion '0.0.9' `
+            -RequireRepositoryImmutability
     }
-
-    $global:PusulaReleasePolicyCandidateImmutable = $true
-    $global:PusulaReleasePolicyStableTagExists = $true
-    Assert-ThrowsLike -Pattern '*Stable tag already exists and cannot be overwritten*' -Action {
-        & $promotionScript `
-            -Version $version `
-            -CandidateTag $candidateTag `
-            -Repository 'stronganchor/pusula-desktop' `
-            -WorkflowCommit $commit `
-            -AcceptanceEvidenceSha256 ('c' * 64) `
-            -Confirmation "PROMOTE v$version" `
-            -DownloadDirectory (Join-Path $env:TEMP 'pusula-release-policy-stable') `
-            -ExpectedWindowsPublisher 'Test Publisher' `
-            -MinisignPath (Join-Path $env:SystemRoot 'System32\notepad.exe')
+    $global:PusulaReleasePolicyRulesetMode = 'wrong-ref'
+    Assert-ThrowsLike -Pattern '*include only refs/tags/v*' -Action {
+        & $identityScript `
+            -ExpectedVersion $version -Repository 'stronganchor/pusula-desktop' -ExpectedCommit $commit `
+            -CandidateTag $candidateTag -BuildInitialAcceptanceBaseline true -AcceptanceBaselineVersion '0.0.9' `
+            -RequireRepositoryImmutability
     }
-
-    $global:PusulaReleasePolicyStableTagExists = $false
-    $global:PusulaReleasePolicyStableReleaseExists = $true
-    Assert-ThrowsLike -Pattern '*Stable release already exists and cannot be overwritten*' -Action {
-        & $promotionScript `
-            -Version $version `
-            -CandidateTag $candidateTag `
-            -Repository 'stronganchor/pusula-desktop' `
-            -WorkflowCommit $commit `
-            -AcceptanceEvidenceSha256 ('d' * 64) `
-            -Confirmation "PROMOTE v$version" `
-            -DownloadDirectory (Join-Path $env:TEMP 'pusula-release-policy-stable-release') `
-            -ExpectedWindowsPublisher 'Test Publisher' `
-            -MinisignPath (Join-Path $env:SystemRoot 'System32\notepad.exe')
-    }
+    $global:PusulaReleasePolicyRulesetMode = 'exact'
 }
 finally {
     $env:GITHUB_REF = $originalRef
@@ -381,7 +457,10 @@ finally {
             'PusulaReleasePolicyImmutabilityEnabled',
             'PusulaReleasePolicyCandidateImmutable',
             'PusulaReleasePolicyStableTagExists',
-            'PusulaReleasePolicyStableReleaseExists'
+            'PusulaReleasePolicyStableReleaseExists',
+            'PusulaReleasePolicyCandidateOnlyReleaseExists',
+            'PusulaReleasePolicyExactCandidateDraftExists',
+            'PusulaReleasePolicyRulesetMode'
         )) {
         Remove-Variable $name -Scope Global -ErrorAction SilentlyContinue
     }

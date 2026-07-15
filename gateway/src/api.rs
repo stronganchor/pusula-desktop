@@ -2,8 +2,8 @@
 use std::os::unix::fs::PermissionsExt;
 use std::{
     path::{Path as FsPath, PathBuf},
-    sync::Arc,
-    time::Duration,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 
 use axum::{
@@ -25,7 +25,7 @@ use uuid::Uuid;
 use crate::{
     b2::B2Client,
     crypto::normalize_sha256,
-    db::{AuthenticatedDevice, BackupRecord, Database},
+    db::{AdmissionPolicy, AuthenticatedDevice, BackupRecord, Database, RetentionClass},
     error::{AppError, Result},
 };
 
@@ -36,9 +36,74 @@ pub struct GatewayState {
     object_prefix: Arc<str>,
     relay_directory: Arc<PathBuf>,
     relay_slots: Arc<Semaphore>,
+    request_slots: Arc<Semaphore>,
+    db_slots: Arc<Semaphore>,
+    aggregate_rate: Arc<AggregateRateLimiter>,
     max_backup_bytes: u64,
-    rate_capacity: u32,
-    rate_refill: Duration,
+    upload_ttl: Duration,
+    admission_policy: AdmissionPolicy,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct GatewayLimits {
+    pub max_backup_bytes: u64,
+    pub upload_ttl: Duration,
+    pub admission_policy: AdmissionPolicy,
+    pub max_request_concurrency: usize,
+    pub max_db_concurrency: usize,
+    pub global_request_capacity: u32,
+    pub global_request_refill: Duration,
+}
+
+struct AggregateRateLimiter {
+    capacity: f64,
+    refill: Duration,
+    state: Mutex<AggregateRateState>,
+}
+
+struct AggregateRateState {
+    tokens: f64,
+    updated_at: Instant,
+}
+
+impl AggregateRateLimiter {
+    fn new(capacity: u32, refill: Duration) -> Result<Self> {
+        if capacity == 0 || refill.is_zero() {
+            return Err(AppError::BadRequest(
+                "aggregate request rate policy is invalid",
+            ));
+        }
+        Ok(Self {
+            capacity: f64::from(capacity),
+            refill,
+            state: Mutex::new(AggregateRateState {
+                tokens: f64::from(capacity),
+                updated_at: Instant::now(),
+            }),
+        })
+    }
+
+    fn try_admit(&self) -> Result<()> {
+        let now = Instant::now();
+        let mut state = self.state.lock().map_err(|_| {
+            AppError::Internal("aggregate rate limiter lock was poisoned".to_owned())
+        })?;
+        let elapsed = now
+            .saturating_duration_since(state.updated_at)
+            .as_secs_f64();
+        state.tokens = (state.tokens + elapsed / self.refill.as_secs_f64()).min(self.capacity);
+        state.updated_at = now;
+        if state.tokens < 1.0 {
+            let retry_after_seconds = ((1.0 - state.tokens) * self.refill.as_secs_f64())
+                .ceil()
+                .max(1.0) as u64;
+            return Err(AppError::RateLimited {
+                retry_after_seconds,
+            });
+        }
+        state.tokens -= 1.0;
+        Ok(())
+    }
 }
 
 impl GatewayState {
@@ -46,21 +111,33 @@ impl GatewayState {
         database: Database,
         b2: B2Client,
         object_prefix: impl Into<Arc<str>>,
-        max_backup_bytes: u64,
-        rate_capacity: u32,
-        rate_refill: Duration,
-    ) -> Self {
+        limits: GatewayLimits,
+    ) -> Result<Self> {
+        if limits.max_backup_bytes == 0
+            || limits.upload_ttl.is_zero()
+            || limits.max_request_concurrency == 0
+            || limits.max_db_concurrency == 0
+        {
+            return Err(AppError::BadRequest("gateway limits are invalid"));
+        }
         let relay_directory = relay_directory(database.path());
-        Self {
+        let aggregate_rate = AggregateRateLimiter::new(
+            limits.global_request_capacity,
+            limits.global_request_refill,
+        )?;
+        Ok(Self {
             database,
             b2,
             object_prefix: object_prefix.into(),
             relay_directory: Arc::new(relay_directory),
             relay_slots: Arc::new(Semaphore::new(1)),
-            max_backup_bytes,
-            rate_capacity,
-            rate_refill,
-        }
+            request_slots: Arc::new(Semaphore::new(limits.max_request_concurrency)),
+            db_slots: Arc::new(Semaphore::new(limits.max_db_concurrency)),
+            aggregate_rate: Arc::new(aggregate_rate),
+            max_backup_bytes: limits.max_backup_bytes,
+            upload_ttl: limits.upload_ttl,
+            admission_policy: limits.admission_policy,
+        })
     }
 }
 
@@ -103,6 +180,7 @@ pub async fn cleanup_stale_relay_spools(database_path: &FsPath) -> Result<u64> {
 }
 
 pub fn router(state: GatewayState) -> Router {
+    let admission_state = state.clone();
     Router::new()
         .route("/healthz", get(health))
         .route("/v1/enroll", post(enroll))
@@ -111,8 +189,35 @@ pub fn router(state: GatewayState) -> Router {
         .route("/v1/backups/complete", post(complete_backup))
         .route("/v1/backups/status", get(backup_status))
         .layer(DefaultBodyLimit::max(16 * 1024))
+        .layer(middleware::from_fn_with_state(
+            admission_state,
+            request_admission,
+        ))
         .layer(middleware::from_fn(security_headers))
         .with_state(state)
+}
+
+async fn request_admission(
+    State(state): State<GatewayState>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    if request.uri().path() == "/healthz" {
+        return next.run(request).await;
+    }
+    let _request_permit = match state.request_slots.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            return AppError::ServiceUnavailable {
+                retry_after_seconds: 1,
+            }
+            .into_response()
+        }
+    };
+    if let Err(error) = state.aggregate_rate.try_admit() {
+        return error.into_response();
+    }
+    next.run(request).await
 }
 
 async fn security_headers(request: Request<Body>, next: Next) -> Response {
@@ -154,8 +259,8 @@ async fn enroll(
     State(state): State<GatewayState>,
     Json(request): Json<EnrollRequest>,
 ) -> Result<impl IntoResponse> {
-    let capacity = state.rate_capacity;
-    let credential = run_db(state.database, move |database| {
+    let capacity = state.admission_policy.rate_capacity;
+    let credential = run_db(&state, move |database| {
         database.enroll_device(&request.enrollment_code, &request.device_name, capacity)
     })
     .await?;
@@ -176,25 +281,6 @@ struct UploadUrlRequest {
     sha256: String,
     #[serde(default)]
     retention_class: RetentionClass,
-}
-
-#[derive(Clone, Copy, Default, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum RetentionClass {
-    #[default]
-    Rolling,
-    Daily,
-    Monthly,
-}
-
-impl RetentionClass {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Rolling => "rolling",
-            Self::Daily => "daily",
-            Self::Monthly => "monthly",
-        }
-    }
 }
 
 #[derive(Serialize)]
@@ -231,48 +317,41 @@ async fn upload_url(
         now.format("%d"),
         backup_id
     );
-    let presigned = state
-        .b2
-        .presign_put(&object_key, request.content_length, &checksum, now)?;
-    let expires_at = now
-        + chrono::Duration::from_std(presigned_ttl(&presigned, now)?)
-            .map_err(AppError::internal)?;
+    let expires_at =
+        now + chrono::Duration::from_std(state.upload_ttl).map_err(AppError::internal)?;
     let expires_epoch = expires_at.timestamp();
-    let refill_seconds = state.rate_refill.as_secs();
-    let capacity = state.rate_capacity;
+    let admission_policy = state.admission_policy;
     let device_id = device.id;
     let db_backup_id = backup_id.clone();
     let db_object_key = object_key;
-    let db_checksum = checksum;
-    run_db(state.database, move |database| {
-        database.reserve_backup(
+    let db_checksum = checksum.clone();
+    let retention_class = request.retention_class;
+    let backup = run_db(&state, move |database| {
+        database.reserve_or_reuse_backup(
             &device_id,
             &db_backup_id,
             &db_object_key,
             request.content_length,
             &db_checksum,
+            retention_class,
             expires_epoch,
-            capacity,
-            refill_seconds,
+            admission_policy,
         )
     })
     .await?;
+    let presigned =
+        state
+            .b2
+            .presign_put(&backup.object_key, backup.size_bytes, &backup.sha256, now)?;
 
     Ok(Json(UploadUrlResponse {
-        backup_id,
-        retention_class: request.retention_class,
+        backup_id: backup.id,
+        retention_class: backup.retention_class,
         method: "PUT",
         upload_url: presigned.url,
         required_headers: presigned.headers,
         expires_at: presigned.expires_at,
     }))
-}
-
-fn presigned_ttl(presigned: &crate::b2::PresignedUpload, now: DateTime<Utc>) -> Result<Duration> {
-    let expires_at = DateTime::parse_from_rfc3339(&presigned.expires_at)
-        .map_err(AppError::internal)?
-        .with_timezone(&Utc);
-    (expires_at - now).to_std().map_err(AppError::internal)
 }
 
 #[derive(Deserialize)]
@@ -287,7 +366,7 @@ struct CompleteResponse {
     status: String,
     completed_at: String,
     etag: Option<String>,
-    version_id: Option<String>,
+    version_id: String,
 }
 
 async fn complete_backup(
@@ -301,7 +380,7 @@ async fn complete_backup(
     let backup_id = request.backup_id;
     let lookup_device_id = device_id.clone();
     let lookup_backup_id = backup_id.clone();
-    let backup = run_db(state.database.clone(), move |database| {
+    let backup = run_db(&state, move |database| {
         database.backup_for_device(&lookup_device_id, &lookup_backup_id)
     })
     .await?;
@@ -311,14 +390,19 @@ async fn complete_backup(
     }
     let verified = state
         .b2
-        .verify_object(&backup.object_key, backup.size_bytes, &backup.sha256)
-        .await?;
-    let completed = run_db(state.database, move |database| {
+        .verify_object_if_present(&backup.object_key, backup.size_bytes, &backup.sha256)
+        .await?
+        .ok_or(AppError::ObjectNotPresent {
+            retry_after_seconds: 5,
+        })?;
+    let completed = run_db(&state, move |database| {
         database.mark_backup_completed(
             &device_id,
             &backup_id,
             verified.etag.as_deref(),
-            verified.version_id.as_deref(),
+            &verified.version_id,
+            verified.size_bytes,
+            &verified.sha256,
         )
     })
     .await?;
@@ -336,7 +420,7 @@ async fn relay_backup(
     let device_id = device.id;
     let lookup_device_id = device_id.clone();
     let lookup_backup_id = backup_id.clone();
-    let backup = run_db(state.database.clone(), move |database| {
+    let backup = run_db(&state, move |database| {
         database.backup_for_device(&lookup_device_id, &lookup_backup_id)
     })
     .await?;
@@ -362,21 +446,35 @@ async fn relay_backup(
             .map_err(|_| AppError::RateLimited {
                 retry_after_seconds: 5,
             })?;
-    let admission_database = state.database.clone();
+
+    if let Some(verified) = state
+        .b2
+        .verify_object_if_present(&backup.object_key, backup.size_bytes, &backup.sha256)
+        .await?
+    {
+        let confirmed_device_id = device_id.clone();
+        let confirmed_backup_id = backup_id.clone();
+        let completed = run_db(&state, move |database| {
+            database.mark_backup_completed(
+                &confirmed_device_id,
+                &confirmed_backup_id,
+                verified.etag.as_deref(),
+                &verified.version_id,
+                verified.size_bytes,
+                &verified.sha256,
+            )
+        })
+        .await?;
+        return Ok(Json(completion_response(completed)?));
+    }
+
     let admission_device_id = device_id.clone();
     let admission_backup_id = backup_id.clone();
-    let rate_capacity = state.rate_capacity;
-    let refill_seconds = state.rate_refill.as_secs();
-    run_db(admission_database, move |database| {
-        database.begin_relay_attempt(
-            &admission_device_id,
-            &admission_backup_id,
-            rate_capacity,
-            refill_seconds,
-        )
+    let admission_policy = state.admission_policy;
+    run_db(&state, move |database| {
+        database.begin_relay_attempt(&admission_device_id, &admission_backup_id, admission_policy)
     })
     .await?;
-
     let spool = spool_relay_body(
         state.relay_directory.as_ref(),
         &backup_id,
@@ -397,12 +495,14 @@ async fn relay_backup(
     spool.cleanup().await?;
     let verified = upload_result?;
 
-    let completed = run_db(state.database, move |database| {
+    let completed = run_db(&state, move |database| {
         database.mark_backup_completed(
             &device_id,
             &backup_id,
             verified.etag.as_deref(),
-            verified.version_id.as_deref(),
+            &verified.version_id,
+            verified.size_bytes,
+            &verified.sha256,
         )
     })
     .await?;
@@ -538,16 +638,32 @@ async fn spool_relay_body(
 }
 
 fn completion_response(backup: BackupRecord) -> Result<CompleteResponse> {
+    let completed_at = backup
+        .completed_at
+        .ok_or_else(|| AppError::Internal("completed backup has no timestamp".to_owned()))?;
+    let version_id = backup
+        .version_id
+        .clone()
+        .filter(|value| {
+            !value.is_empty() && value.len() <= 256 && !value.chars().any(char::is_control)
+        })
+        .ok_or_else(|| {
+            AppError::Upstream("completed backup has no exact storage version".to_owned())
+        })?;
+    if backup.verified_size_bytes != Some(backup.size_bytes)
+        || backup.verified_sha256.as_deref() != Some(backup.sha256.as_str())
+        || backup.verified_at.is_none()
+    {
+        return Err(AppError::Upstream(
+            "completed backup lacks actual-body verification evidence".to_owned(),
+        ));
+    }
     Ok(CompleteResponse {
         backup_id: backup.id,
         status: backup.status,
-        completed_at: timestamp(
-            backup.completed_at.ok_or_else(|| {
-                AppError::Internal("completed backup has no timestamp".to_owned())
-            })?,
-        )?,
+        completed_at: timestamp(completed_at)?,
         etag: backup.etag,
-        version_id: backup.version_id,
+        version_id,
     })
 }
 
@@ -575,10 +691,7 @@ async fn backup_status(
     let device = authenticate(&state, &headers).await?;
     let device_id = device.id;
     let lookup_id = device_id.clone();
-    let summary = run_db(state.database, move |database| {
-        database.backup_summary(&lookup_id)
-    })
-    .await?;
+    let summary = run_db(&state, move |database| database.backup_summary(&lookup_id)).await?;
     let latest_completed = summary
         .latest_completed
         .map(|backup| {
@@ -611,10 +724,7 @@ async fn authenticate(state: &GatewayState, headers: &HeaderMap) -> Result<Authe
         .filter(|token| !token.contains(char::is_whitespace))
         .ok_or(AppError::Unauthorized)?
         .to_owned();
-    run_db(state.database.clone(), move |database| {
-        database.authenticate(&token)
-    })
-    .await
+    run_db(state, move |database| database.authenticate(&token)).await
 }
 
 fn validate_uuid(value: &str) -> Result<()> {
@@ -634,12 +744,53 @@ fn timestamp(epoch: i64) -> Result<String> {
         .ok_or_else(|| AppError::Internal("database timestamp was out of range".to_owned()))
 }
 
-async fn run_db<T, F>(database: Database, operation: F) -> Result<T>
+async fn run_db<T, F>(state: &GatewayState, operation: F) -> Result<T>
 where
     T: Send + 'static,
     F: FnOnce(&Database) -> Result<T> + Send + 'static,
 {
-    tokio::task::spawn_blocking(move || operation(&database))
-        .await
-        .map_err(AppError::internal)?
+    let database = state.database.clone();
+    run_db_with_slots(database, state.db_slots.clone(), operation).await
+}
+
+async fn run_db_with_slots<T, F>(
+    database: Database,
+    db_slots: Arc<Semaphore>,
+    operation: F,
+) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce(&Database) -> Result<T> + Send + 'static,
+{
+    let permit = db_slots
+        .try_acquire_owned()
+        .map_err(|_| AppError::ServiceUnavailable {
+            retry_after_seconds: 1,
+        })?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        operation(&database)
+    })
+    .await
+    .map_err(AppError::internal)?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn db_concurrency_is_fail_fast() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let database = Database::new(
+            directory.path().join("gateway.sqlite3"),
+            Arc::from(b"test-only-pepper-at-least-32-bytes".as_slice()),
+        );
+        let slots = Arc::new(Semaphore::new(1));
+        let _held = slots.clone().try_acquire_owned().unwrap();
+        let error = run_db_with_slots(database, slots, |_| Ok(()))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, AppError::ServiceUnavailable { .. }));
+    }
 }

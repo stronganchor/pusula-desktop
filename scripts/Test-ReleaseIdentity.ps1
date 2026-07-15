@@ -4,6 +4,9 @@ param(
     [Parameter(Mandatory = $true)][string] $Repository,
     [Parameter(Mandatory = $true)][string] $ExpectedCommit,
     [Parameter(Mandatory = $true)][string] $CandidateTag,
+    [Parameter(Mandatory = $true)][ValidateSet('true', 'false')][string] $BuildInitialAcceptanceBaseline,
+    [Parameter(Mandatory = $true)][string] $AcceptanceBaselineVersion,
+    [switch] $AllowExactCandidateDraftResume,
     [switch] $RequireRepositoryImmutability
 )
 
@@ -11,6 +14,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 . (Join-Path $PSScriptRoot 'Release-SemVer.ps1')
+. (Join-Path $PSScriptRoot 'Release-RepositoryControls.ps1')
 $candidate = ConvertTo-StrictSemVer -Version $ExpectedVersion
 
 if ($null -ne $candidate.Prerelease) {
@@ -52,16 +56,7 @@ if ($mainCommit -cne $ExpectedCommit) {
 }
 
 if ($RequireRepositoryImmutability) {
-    $immutabilityResponse = & gh api `
-        -H 'X-GitHub-Api-Version: 2026-03-10' `
-        "repos/$Repository/immutable-releases"
-    if ($LASTEXITCODE -ne 0) {
-        throw 'Could not verify repository release immutability through GitHub.'
-    }
-    $immutability = $immutabilityResponse | ConvertFrom-Json
-    if (-not [bool]$immutability.enabled) {
-        throw 'Repository release immutability must be enabled before privileged release work begins.'
-    }
+    $null = Assert-PusulaReleaseRepositoryControls -Repository $Repository
 }
 
 $matchingTagsResponse = & gh api "repos/$Repository/git/matching-refs/tags/v$ExpectedVersion"
@@ -70,28 +65,46 @@ $parsedMatchingTags = $matchingTagsResponse | ConvertFrom-Json
 $matchingTags = @($parsedMatchingTags)
 $stableRef = "refs/tags/v$ExpectedVersion"
 $candidateRefPrefix = "refs/tags/v$ExpectedVersion-candidate."
-$conflictingRefs = @($matchingTags | Where-Object {
-        [string]$_.ref -ceq $stableRef -or
+$stableRefs = @($matchingTags | Where-Object { [string]$_.ref -ceq $stableRef })
+$candidateRefs = @($matchingTags | Where-Object {
         ([string]$_.ref).StartsWith($candidateRefPrefix, [StringComparison]::Ordinal)
     })
-if ($conflictingRefs.Count -ne 0) {
-    throw "A stable or candidate tag already exists for version $ExpectedVersion. Use a strictly greater version."
+$exactCandidateRefs = @($candidateRefs | Where-Object { [string]$_.ref -ceq "refs/tags/$CandidateTag" })
+if (-not $AllowExactCandidateDraftResume) {
+    if ($stableRefs.Count -ne 0 -or $candidateRefs.Count -ne 0) {
+        throw "A stable or candidate tag already exists for version $ExpectedVersion. Use a strictly greater version."
+    }
+}
+elseif ($stableRefs.Count -ne 0 -or $candidateRefs.Count -ne $exactCandidateRefs.Count -or
+    $exactCandidateRefs.Count -gt 1 -or
+    ($exactCandidateRefs.Count -eq 1 -and
+     ([string]$exactCandidateRefs[0].object.type -cne 'commit' -or
+      [string]$exactCandidateRefs[0].object.sha -cne $normalizedCommit))) {
+    throw 'Candidate draft resume requires only the exact lightweight candidate tag at the workflow commit.'
 }
 
-$releaseRows = @(& gh api --paginate "repos/$Repository/releases?per_page=100" --jq '.[] | [.tag_name, .draft] | @tsv')
+$releaseRows = @(& gh api --paginate "repos/$Repository/releases?per_page=100" --jq '.[] | [.tag_name, .draft, .prerelease] | @tsv')
 if ($LASTEXITCODE -ne 0) { throw 'Could not verify existing GitHub releases.' }
 
 $highestPublished = $null
+$resumableCandidateReleaseCount = 0
 foreach ($row in $releaseRows) {
     if ([string]::IsNullOrWhiteSpace($row)) { continue }
-    $columns = @($row -split "`t", 2)
+    $columns = @($row -split "`t", 3)
     $tag = $columns[0]
     $draft = $columns.Count -gt 1 -and $columns[1] -eq 'true'
-    if ($tag -ceq "v$ExpectedVersion" -or
-        $tag.StartsWith("v$ExpectedVersion-candidate.", [StringComparison]::Ordinal)) {
+    $prerelease = $columns.Count -gt 2 -and $columns[2] -eq 'true'
+    if ($tag -ceq "v$ExpectedVersion") {
         throw "A stable or candidate GitHub release already exists for version $ExpectedVersion. Inspect any draft or use a strictly greater version."
     }
-    if ($draft -or -not $tag.StartsWith('v', [StringComparison]::Ordinal)) { continue }
+    if ($tag.StartsWith("v$ExpectedVersion-candidate.", [StringComparison]::Ordinal)) {
+        if ($AllowExactCandidateDraftResume -and $tag -ceq $CandidateTag -and $draft -and $prerelease) {
+            $resumableCandidateReleaseCount += 1
+            continue
+        }
+        throw "A stable or candidate GitHub release already exists for version $ExpectedVersion. Inspect any draft or use a strictly greater version."
+    }
+    if ($draft -or $prerelease -or -not $tag.StartsWith('v', [StringComparison]::Ordinal)) { continue }
 
     $publishedVersion = $tag.Substring(1)
     try {
@@ -110,6 +123,25 @@ foreach ($row in $releaseRows) {
 if ($null -ne $highestPublished -and
     (Compare-StrictSemVer -Left $ExpectedVersion -Right $highestPublished) -le 0) {
     throw "Release version $ExpectedVersion must be greater than published version $highestPublished."
+}
+if ($resumableCandidateReleaseCount -gt 1 -or
+    ($resumableCandidateReleaseCount -eq 1 -and $exactCandidateRefs.Count -ne 1)) {
+    throw 'Candidate draft resume requires exactly one private prerelease draft and its exact protected tag.'
+}
+
+if ($null -eq $highestPublished) {
+    if ($BuildInitialAcceptanceBaseline -cne 'true') {
+        throw 'The first stable release requires build_initial_acceptance_baseline=true.'
+    }
+    if ($AcceptanceBaselineVersion -cne '0.0.9') {
+        throw 'The first stable release requires the exact 0.0.9 acceptance baseline.'
+    }
+    if ((Compare-StrictSemVer -Left $AcceptanceBaselineVersion -Right $ExpectedVersion) -ge 0) {
+        throw 'The initial 0.0.9 acceptance baseline must be lower than the release version.'
+    }
+}
+elseif ($BuildInitialAcceptanceBaseline -cne 'false') {
+    throw 'A synthetic acceptance baseline is allowed only before the first stable release.'
 }
 
 Write-Output "Release candidate identity verified: $CandidateTag at $ExpectedCommit"

@@ -22,17 +22,24 @@ Windows queue is:
 ```
 
 The JSON sidecar is nonsecret bookkeeping: format version, timestamp,
-retention class, ciphertext size/SHA-256, and optional upload stage/backup ID.
+retention class, ciphertext size/SHA-256, optional local-business schedule
+period, and optional upload stage/backup ID.
 It contains no token, presigned URL, object key, customer data, or local path.
 
-The desktop creates rolling backups for manual and pre-update protection and
-uses daily/monthly retention classes for scheduled protection. While offline,
+The desktop creates rolling backups for manual and pre-update protection. The
+pre-update path creates and flushes only a local encrypted snapshot; it never
+contacts the gateway while business writes are held, and the existing queue is
+uploaded after relaunch. Scheduled daily and monthly periods use the Windows
+local business date. The scheduler catches up a monthly period even when the
+computer was off on the first day of the month, and the durable period marker
+plus queue sidecar permit at most one scheduled artifact per period. While offline,
 the local queue keeps at most 14 rolling, eight daily, and four monthly pending
 artifacts. A normal queued artifact is removed only after the gateway verifies
 its remote object. A destructive import creates a separate `local-recovery`
 artifact that is never uploaded or removed by queue flushing; the newest three
-are retained on the PC for rollback. The scheduler wakes every six hours and
-retries normal queued ciphertext on the next due pass after reconnection.
+are retained on the PC for rollback. The scheduler wakes every six hours;
+remote retry passes flush existing ciphertext only and do not manufacture
+additional daily or monthly snapshots for the same period.
 Backblaze and the gateway never possess the age private identity and cannot
 decrypt a backup.
 
@@ -56,13 +63,23 @@ removed on normal success/error paths, and is cleaned of crash-left relay parts
 at the next startup before any request is accepted.
 
 A failed relay remains in the sidecar as `relay_pending` with the same backup
-ID, survives restart, and is retried idempotently. A successful relay already
-completes the reservation, so the desktop removes the queue item without a
-second completion call. The desktop does **not** relay after B2 returns an HTTP
-status, and it does not use relay to bypass a malformed reservation, failed
-authentication, size/checksum mismatch, or another gateway policy response.
-Those failures leave the encrypted artifact queued for diagnosis or a later
-retry.
+ID and survives restart. Before any repeated direct PUT or relay, the desktop
+asks the authenticated completion endpoint to verify the exact stored object.
+A verified `200` must include the canonical backup ID, completion timestamp,
+and a nonempty object version ID before the local queue item is removed. A
+gateway `409 object_not_present` keeps the same reservation and permits its
+intended PUT/relay retry; `404 not_found` alone clears the stale binding and
+re-reserves the byte-identical ciphertext. A `502 storage_verification_failed`
+is indeterminate, so the sidecar stage is preserved and Pusula confirms again
+later without issuing another PUT. This prevents ambiguous direct or lost relay
+responses from creating a second B2 object version.
+
+The desktop does **not** relay after B2 returns an HTTP status, and it does not
+use relay to bypass a malformed reservation, failed authentication,
+size/checksum mismatch, or another gateway policy response. A definitive
+gateway `401` or `403` deletes the rejected device token and shows **Yeniden
+kurulum gerekli** in **VERİ VE YEDEK**; issue a new one-time enrollment code.
+An object-store HTTP status is not treated as a gateway device rejection.
 
 Malformed sidecars are isolated under `backup-queue\quarantine` and rebuilt
 when safe; ciphertext whose recorded size or SHA-256 no longer matches is also
@@ -75,6 +92,9 @@ new verified backup.
 - An access-controlled copy of `pusula-recovery.agekey`, obtained through the
   approved administrator key-custody channel.
 - `rage.exe` from the official rage project.
+- Python 3. The guarded restore script uses Python's standard-library SQLite
+  support for read-only validation and SQLite online rollback backups. If
+  `python.exe` is not on `PATH`, pass its exact local path with `-PythonPath`.
 - `sqlite3.exe` from SQLite for integrity and reconciliation queries.
 - The ciphertext and its recorded SHA-256/size, downloaded from the private B2
   bucket or copied from the local encrypted queue.
@@ -144,13 +164,34 @@ operation and must never be pasted into a shell transcript or ticket.
    %LOCALAPPDATA%\com.stronganchor.pusula\data\pusula.sqlite3
    ```
 
-3. If a target exists, use SQLite's online `.backup` command to create a
-   timestamped rollback database outside the live `data` directory, then run
-   the same integrity/count/total checks on that rollback.
-4. Move the old database plus any `-wal` and `-shm` siblings into the protected
-   incident rollback directory. Do not delete them.
-5. Copy the validated staged database to a temporary sibling in the live
-   `data` directory, then rename it to `pusula.sqlite3`.
+3. Follow `RESTORE_HARNESS.md` and use `scripts\Restore-PusulaBackup.ps1`; do
+   not replace the files manually. Supply `-RagePath` and `-PythonPath` when
+   those tools are not on `PATH`.
+   The app and restore script acquire the same exclusive
+   `.pusula-database.lock` file before SQLite access, closing the launch-time
+   race that a process-name check alone cannot prevent.
+4. Immediately before detaching WAL/SHM or replacing the base, the harness
+   durably writes `.pusula-restore-in-progress.json` beside the database.
+   Pusula refuses to start while that marker exists, shows the native
+   **Pusula başlatılamadı** dialog with the safe marker-path guidance, and exits
+   without opening SQLite.
+5. The harness creates and verifies a SQLite-online rollback, isolates old
+   sidecars, performs the atomic replacement, and reopens the result. It clears
+   the marker only after verified success or after a verified automatic
+   rollback. If the marker remains after a crash or error, keep Pusula closed
+   and run the explicit recovery mode below. It strictly validates the recorded
+   rollback hash/schema/counts/totals, restores that exact database (or removes
+   a partial clean-machine target), and removes recorded plaintext staging and
+   candidate artifacts before clearing the marker. Never delete the marker
+   merely to make the app start.
+
+   ```powershell
+   .\scripts\Restore-PusulaBackup.ps1 -RecoverInterruptedRestore
+   ```
+
+   If the original restore used custom target, staging, or rollback roots, pass
+   those same paths to recovery. Normal validation/apply runs refuse to
+   overwrite an existing marker.
 6. Start the same or newer compatible Pusula version. Open **VERİ VE YEDEK** and
    require a healthy integrity result plus matching counts/totals.
 7. Complete the disconnected workflow drill, reconnect, re-enroll the device if

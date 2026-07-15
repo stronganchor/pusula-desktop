@@ -47,6 +47,12 @@ Microsoft's setup documentation:
 
 Create and protect a GitHub environment named `windows-release`. Restrict deployments to the `main` branch and require an appropriate reviewer before a signing job starts.
 
+Current owner gate (2026-07-15): the live environment has no required reviewers
+and permits administrator bypass. Until those settings are tightened, a
+repository owner must personally review the exact `main` commit, workflow
+inputs, and protected variables before dispatch. This is an operational gate,
+not a claim that GitHub currently enforces separation of duties.
+
 Configure these environment variables (not secrets):
 
 | Variable | Value |
@@ -58,6 +64,7 @@ Configure these environment variables (not secrets):
 | `ARTIFACT_SIGNING_ACCOUNT` | Artifact Signing account name |
 | `ARTIFACT_SIGNING_PROFILE` | Public Trust certificate profile name |
 | `EXPECTED_WINDOWS_PUBLISHER` | Exact publisher name returned by the profile's Authenticode certificate |
+| `EXPECTED_WINDOWS_CERTIFICATE_SHA256` | Lowercase SHA-256 of the exact approved Authenticode signer certificate DER bytes |
 
 Configure these environment secrets:
 
@@ -77,7 +84,10 @@ not grant write permission. The obsolete `WINDOWS_CODESIGN_PFX_BASE64` and
 The workflow first validates and compiles the immutable `main` commit without
 Azure access, updater secrets, or a write-capable GitHub token. Before signing,
 the protected read-only administration token proves repository release
-immutability is enabled. The signing job then downloads the official Microsoft
+immutability is enabled and verifies the active `Protect release tags` ruleset
+by name and semantics: tag target, only `refs/tags/v*`, update and deletion
+protections, no bypass actors, and no current-user bypass. Tag creation remains
+allowed. The signing job then downloads the official Microsoft
 Artifact Signing Client Tools MSI,
 verifies Microsoft's Authenticode signature, and installs it noninteractively
 before logging in with `azure/login` and GitHub OIDC. The updater private key is
@@ -101,7 +111,8 @@ before Azure authentication, then signed separately. Because the repository is
 public, the workflow encrypts that installer as a header-encrypted AES-256
 7-Zip archive before uploading a three-day Actions artifact and deletes the
 plaintext runner copies. The release gate requires the exact
-`EXPECTED_WINDOWS_PUBLISHER`, a valid timestamp, and a Tauri signature over the
+`EXPECTED_WINDOWS_PUBLISHER`, exact `EXPECTED_WINDOWS_CERTIFICATE_SHA256`, a
+valid timestamp, and a Tauri signature over the
 exact Authenticode-signed lean installer that verifies against the public key
 embedded in the application. It verifies:
 
@@ -116,16 +127,20 @@ candidate update; that proves the inner application extracted from the signed
 NSIS package has the expected publisher and timestamp.
 
 Verified artifacts cross into a separate publication job without the updater
-private key or Azure session. That job exclusively creates a lightweight
-candidate tag derived from the final version and full commit SHA, creates a
-draft, and uploads only the allowlisted artifacts and SHA-256 manifest. A
-read-only admin token then rechecks repository immutability, `main`, the exact
-tag ref, draft state, and case-sensitive remote names/sizes/digests immediately
-before the isolated write-token step publishes it. The job requires the tag,
-release state, and exact bytes to read back correctly after the candidate is
-immutable. After acceptance, the stable-publication workflow applies the same
-gates while copying those exact files under a new immutable `v<version>` stable
-release; it never edits the immutable candidate. The release remains blocked
+private key or Azure session. That job creates, or exactly resumes, a
+lightweight candidate tag derived from the final version and full commit SHA
+plus its deterministic private prerelease draft. It verifies existing numeric
+asset IDs/names/sizes/digests and uploads only missing allowlisted artifacts
+without clobbering. A
+single publication helper temporarily uses the read-only admin token for the
+repository controls, then restores the job-scoped contents-write token. In
+that same process it rechecks `main`, the exact protected tag, numeric release
+ID, numeric asset IDs, and case-sensitive remote names/sizes/digests immediately
+before the numeric release PATCH. It then reads back the immutable release,
+tag, exact assets, and GitHub release attestation. After acceptance, the
+stable-publication workflow applies the same gates while copying those exact
+files plus the canonical acceptance JSON under a new immutable `v<version>`
+stable release; it never edits the immutable candidate. The release remains blocked
 until Azure identity validation is complete, the Public Trust profile exists,
 the expected publisher value is configured, the GitHub environment is
 protected, and a workflow run proves every signature valid. Candidate testing

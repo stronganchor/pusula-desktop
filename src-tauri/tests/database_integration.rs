@@ -1,5 +1,6 @@
 use pusula_desktop_lib::{db::bundle_checksum, Database, ExportBundle};
 use serde_json::{json, Value};
+use std::sync::{Arc, Barrier};
 use tempfile::TempDir;
 
 fn test_database(name: &str) -> (TempDir, Database) {
@@ -106,7 +107,11 @@ fn payments_reports_expected_rows_and_cascades_stay_consistent() {
         &database,
         &format!("/installments/{installment_id}/payments"),
         "POST",
-        json!({ "amount": 30, "payment_date": "2026-07-14" }),
+        json!({
+            "amount": 30,
+            "payment_date": "2026-07-14",
+            "request_key": "payment-30-20260714"
+        }),
     );
     assert_eq!(payment["installment"]["paid_amount"], json!(30.0));
     assert_eq!(payment["installment"]["remaining_amount"], json!(20.0));
@@ -114,7 +119,11 @@ fn payments_reports_expected_rows_and_cascades_stay_consistent() {
     let overpayment = database.api_request(
         &format!("/installments/{installment_id}/payments"),
         Some("POST"),
-        Some(json!({ "amount": 21, "payment_date": "2026-07-14" })),
+        Some(json!({
+            "amount": 21,
+            "payment_date": "2026-07-14",
+            "request_key": "payment-overpayment"
+        })),
     );
     assert!(overpayment
         .unwrap_err()
@@ -186,7 +195,7 @@ fn export_import_and_file_round_trip_validate_before_writing() {
             "footer_sub": "Alt bilgi"
         }),
     );
-    api(
+    let sale = api(
         &source,
         "/sales",
         "POST",
@@ -194,14 +203,62 @@ fn export_import_and_file_round_trip_validate_before_writing() {
             "customer_id": 3,
             "date": "2026-07-01",
             "total": 75.25,
-            "request_key": "export-sale"
+            "request_key": "export-sale",
+            "installments": [
+                { "due_date": "2026-08-01", "amount": 75.25 }
+            ]
+        }),
+    );
+    let installment_id = sale["installment_ids"][0].as_i64().unwrap();
+    api(
+        &source,
+        &format!("/installments/{installment_id}/payments"),
+        "POST",
+        json!({
+            "amount": 10,
+            "payment_date": "2026-07-02",
+            "request_key": "export-payment"
         }),
     );
 
     let bundle = source.export_data().unwrap();
     assert_eq!(bundle.manifest.counts.customers, 1);
     assert_eq!(bundle.manifest.totals.sales_kurus, 7_525);
+    assert_eq!(
+        bundle.payments[0].request_key.as_deref(),
+        Some("export-payment")
+    );
     assert_eq!(bundle.manifest.sha256, bundle_checksum(&bundle).unwrap());
+
+    let mut normalized_payment_key = bundle.clone();
+    normalized_payment_key.payments[0].request_key = Some("  export-payment!?  ".to_owned());
+    normalized_payment_key.manifest.sha256 = bundle_checksum(&normalized_payment_key).unwrap();
+    let (_normalized_directory, normalized_target) = test_database("normalized-payment-key");
+    normalized_target
+        .import_data(normalized_payment_key, false)
+        .unwrap();
+    assert_eq!(
+        normalized_target.export_data().unwrap().payments[0]
+            .request_key
+            .as_deref(),
+        Some("export-payment")
+    );
+
+    let mut duplicate_payment_keys = bundle.clone();
+    duplicate_payment_keys.payments[0].request_key = Some("duplicate-key!".to_owned());
+    let mut second_payment = duplicate_payment_keys.payments[0].clone();
+    second_payment.id += 1;
+    second_payment.request_key = Some("duplicate-key?".to_owned());
+    duplicate_payment_keys.payments.push(second_payment);
+    duplicate_payment_keys.manifest.counts.payments += 1;
+    duplicate_payment_keys.manifest.totals.payments_kurus += 1_000;
+    duplicate_payment_keys.manifest.sha256 = bundle_checksum(&duplicate_payment_keys).unwrap();
+    let (_duplicate_directory, duplicate_target) = test_database("duplicate-payment-key");
+    assert!(duplicate_target
+        .import_data(duplicate_payment_keys, false)
+        .unwrap_err()
+        .to_string()
+        .contains("ödeme istek anahtarı"));
 
     let (_target_directory, target) = test_database("target");
     let mut broken = bundle.clone();
@@ -213,6 +270,7 @@ fn export_import_and_file_round_trip_validate_before_writing() {
     assert!(!summary.replaced);
     assert_eq!(target.status().unwrap().counts.customers, 1);
     assert_eq!(target.export_data().unwrap().sales, bundle.sales);
+    assert_eq!(target.export_data().unwrap().payments, bundle.payments);
 
     let export_path = source_directory.path().join("pusula-export.json");
     let file_summary = source.export_data_file(&export_path, false).unwrap();
@@ -267,6 +325,7 @@ fn imports_php_generated_wordpress_fixture_exactly() {
     assert_eq!(exported.sales[0].total_kurus, 1_234_567_890);
     assert_eq!(exported.installments[0].due_date, None);
     assert_eq!(exported.sales[0].request_key, None);
+    assert_eq!(exported.payments[0].request_key, None);
     assert_eq!(
         exported.business_profile.website,
         "https://example.com/pusula"
@@ -301,7 +360,11 @@ fn verified_import_can_change_normally_and_reopen() {
         &database,
         &format!("/installments/{installment_id}/payments"),
         "POST",
-        json!({ "amount": 10, "payment_date": "2026-07-15" }),
+        json!({
+            "amount": 10,
+            "payment_date": "2026-07-15",
+            "request_key": "post-import-payment"
+        }),
     );
     drop(database);
 
@@ -312,4 +375,81 @@ fn verified_import_can_change_normally_and_reopen() {
     assert_ne!(reopened_status.counts, summary.counts);
     assert_ne!(reopened_status.totals, summary.totals);
     assert_eq!(reopened_status.last_import, Some(summary));
+}
+
+#[test]
+fn payment_request_keys_replay_once_and_reject_conflicting_reuse() {
+    let (_directory, database) = test_database("payment-idempotency");
+    add_customer(&database, 88, "Tekrarsız Tahsilat");
+    let sale = api(
+        &database,
+        "/sales",
+        "POST",
+        json!({
+            "customer_id": 88,
+            "date": "2026-07-15",
+            "total": 100,
+            "request_key": "payment-idempotency-sale",
+            "installments": [
+                { "due_date": "2026-08-15", "amount": 60 },
+                { "due_date": "2026-09-15", "amount": 40 }
+            ]
+        }),
+    );
+    let first_installment = sale["installment_ids"][0].as_i64().unwrap();
+    let second_installment = sale["installment_ids"][1].as_i64().unwrap();
+    let payment_body = json!({
+        "amount": 25,
+        "payment_date": "2026-07-15",
+        "request_key": "stable-payment-request"
+    });
+
+    let barrier = Arc::new(Barrier::new(2));
+    let mut handles = Vec::new();
+    for _ in 0..2 {
+        let database = database.clone();
+        let barrier = barrier.clone();
+        let body = payment_body.clone();
+        handles.push(std::thread::spawn(move || {
+            barrier.wait();
+            api(
+                &database,
+                &format!("/installments/{first_installment}/payments"),
+                "POST",
+                body,
+            )
+        }));
+    }
+    let first = handles.remove(0).join().unwrap();
+    let replay = handles.remove(0).join().unwrap();
+    assert_eq!(first["payment"]["id"], replay["payment"]["id"]);
+    let listed = api(
+        &database,
+        &format!("/installments/{first_installment}/payments"),
+        "GET",
+        Value::Null,
+    );
+    assert_eq!(listed["payments"].as_array().unwrap().len(), 1);
+    assert_eq!(listed["installment"]["paid_amount"], json!(25.0));
+
+    for (installment_id, amount, date) in [
+        (second_installment, 25, "2026-07-15"),
+        (first_installment, 20, "2026-07-15"),
+        (first_installment, 25, "2026-07-16"),
+    ] {
+        let error = database
+            .api_request(
+                &format!("/installments/{installment_id}/payments"),
+                Some("POST"),
+                Some(json!({
+                    "amount": amount,
+                    "payment_date": date,
+                    "request_key": "stable-payment-request"
+                })),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("farklı bir tahsilat"));
+    }
+    assert_eq!(database.status().unwrap().counts.payments, 1);
 }

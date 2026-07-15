@@ -6,7 +6,7 @@ This checklist tracks the production deployment of the optional Pusula backup
 gateway. It does not change the desktop's local-first contract: backup or
 gateway failure must never prevent SQLite business writes.
 
-## Staged on the AlmaLinux host
+## Superseded staging snapshot on the AlmaLinux host
 
 - Gateway source commit: `5a6052b36340f07cbbb883ca013b5737fe26ff13`
 - Rust toolchain: `1.92.0-x86_64-unknown-linux-gnu`
@@ -16,9 +16,9 @@ gateway failure must never prevent SQLite business writes.
 - Validation: formatting, clippy with warnings denied, all unit/integration/doc
   tests plus required-test-name audit, locked release build, ELF/dependency
   checks, and immutable SQLite migration verification passed on AlmaLinux 9.8.
-- Migration evidence: pinned SQLite 3.53.2 reported integrity `ok`; migrations
-  1 `initial` and 2 `relay_attempted_at` matched their exact SQL hashes; no
-  journal, WAL, or SHM sidecar was created.
+- Migration evidence for that snapshot: pinned SQLite 3.53.2 reported integrity
+  `ok`; migrations 1 `initial` and 2 `relay_attempted_at` matched their exact
+  SQL hashes; no journal, WAL, or SHM sidecar was created.
 - Installed binary:
   `/usr/local/lib/pusula-backup-gateway/pusula-backup-gateway`
 - Installed unit: `/etc/systemd/system/pusula-backup-gateway.service`
@@ -30,6 +30,13 @@ file is absent and TCP 12741 has no listener. The audited cPanel subdomain,
 authoritative/public DNS, and exact-host AutoSSL certificate are complete. The
 Apache proxy, Backblaze resource, enrollment code, and device token remain
 absent.
+
+The installed binary is **not** the final integrated release binary. It predates
+migration 3 and the authenticated full-body B2 verification/admission changes,
+so it must remain disabled. Rebuild, validate, and re-stage the gateway from the
+exact final desktop release commit before any activation work. Record the new
+commit, binary SHA-256, migration 1-through-3 checksums, and immutable host
+readback here; do not carry the SHA-256 above forward as current evidence.
 
 ## 2026-07-15 relay compatibility hold
 
@@ -43,28 +50,34 @@ transport blocker rather than a cosmetic test failure.
 The merged source now contains a narrowly scoped fallback: only after a direct
 B2 transport/TLS failure, the enrolled desktop can send the same age-encrypted
 ciphertext through `PUT /v1/backups/relay/{backup_id}`. The gateway bounds and
-hashes a private spool, uploads it to the reserved B2 object, performs the same
-strict `HEAD` verification, and removes the spool on every ordinary path.
-Startup removes crash-left relay parts before binding. One relay is allowed at
-a time; the reservation pays for the first fallback and later retries consume
-the persisted device token bucket. Pending relay retries remain valid after the
+hashes a private spool, uploads it to the reserved B2 object, then verifies the
+actual authenticated B2 response body, exact size, SHA-256, and nonempty object
+version ID before completion. The spool is removed on every ordinary path, and
+startup removes crash-left relay parts before binding. One relay is allowed at
+a time. Every issued direct authorization, exact re-sign, and admitted relay
+attempt consumes one device token plus the full reservation size in the
+persistent 24-hour ledger. Pending relay retries remain valid after the
 presigned direct URL expires.
 
-The installed VPS binary now contains the reviewed relay endpoint and immutable
-migration 2. Live, versioned, and root-only handoff copies match the SHA-256
-above; provenance and the exact 13-file evidence set passed independent
-readback. The earlier `0aa68d0d...` binary and documentation remain in both
-durable archives and intentional rollback copies. The service is still
-`disabled`, `inactive`, and `dead`; the production environment, listener,
-process, Apache proxy, B2 resources, enrollment, and gateway state remain
-absent. Completing this staging gate is not authorization to activate it.
+The installed VPS binary contains the earlier reviewed relay endpoint and
+immutable migration 2 only. Live, versioned, and root-only handoff copies match
+the historical SHA-256 above; provenance and the exact 13-file evidence set
+passed independent readback for that snapshot. The earlier `0aa68d0d...` binary
+and documentation remain in both durable archives and intentional rollback
+copies. The service is still `disabled`, `inactive`, and `dead`; the production
+environment, listener, process, Apache proxy, B2 resources, enrollment, and
+gateway state remain absent. Historical staging evidence is not authorization
+to activate this superseded binary.
 
 ## Outstanding production gates
 
-- [x] Build and install the final relay-capable gateway binary from the exact
-  staged gateway source commit while the unit remains disabled/inactive.
-  Verify the binary, hardened unit, Apache templates, immutable v1-to-v2
-  migration test, and checksum/provenance readback before activation.
+- [ ] Build and install the final gateway binary from the exact final desktop
+  release commit while the unit remains disabled/inactive. Verify formatting,
+  clippy with warnings denied, all gateway tests, locked release build, the
+  hardened unit and Apache templates, immutable v1-to-v3 migration test, exact
+  migration checksums, binary SHA-256, and provenance readback before
+  activation. Replace the historical snapshot values above only after that
+  evidence exists.
 - [ ] Create the private B2 bucket with SSE-B2 in Backblaze region
   `us-west-004`. The current desktop upload allow-list requires endpoint
   `https://s3.us-west-004.backblazeb2.com`, bucket
@@ -98,7 +111,8 @@ absent. Completing this staging gate is not authorization to activate it.
 - [ ] Verify loopback and public `/healthz` return `204` while existing
   monitored sites remain healthy.
 - [ ] Enroll a test device and complete one encrypted upload from the actual
-  Windows network through the ciphertext relay, B2 `HEAD` verification, and
+  Windows network through the ciphertext relay, authenticated full-body B2
+  `GET` verification, exact nonempty version ID, verified size/SHA-256/time, and
   status. Require the relay spool to be empty afterward. Also re-test the
   preferred direct B2 route; if the ISP sinkhole remains, record relay as the
   expected durability path for that network.
@@ -109,6 +123,14 @@ Do not publish an initial desktop release as backup-complete until every item
 above is evidenced. A minimal `/healthz` response proves only process
 liveness; it does not prove B2 permissions, lifecycle, encryption recovery, or
 desktop upload behavior.
+
+Migration 3 cannot retroactively prove the bytes or exact object version for a
+row completed by an older binary. Legacy completed rows whose `version_id` or
+`verified_size_bytes`, `verified_sha256`, or `verified_at` is missing are
+therefore excluded from verified list/lookup/download operations. Preserve
+them as incident/history data; recover through an independently inventoried
+exact B2 version and the restore harness as documented in `gateway/RUNBOOK.md`,
+not by fabricating verification fields.
 
 ## Activation and rollback authority
 

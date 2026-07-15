@@ -26,6 +26,17 @@ pub struct ServiceConfig {
     pub max_backup_bytes: u64,
     pub rate_capacity: u32,
     pub rate_refill: Duration,
+    pub max_pending_per_device: u32,
+    pub device_byte_quota_24h: u64,
+    pub pending_max_age: Duration,
+    pub pending_cleanup_limit: u32,
+    pub authorization_cleanup_limit: u32,
+    pub daily_min_interval: Duration,
+    pub monthly_min_interval: Duration,
+    pub max_request_concurrency: usize,
+    pub max_db_concurrency: usize,
+    pub global_request_capacity: u32,
+    pub global_request_refill: Duration,
     pub b2: B2Config,
     pub http_client: reqwest::Client,
 }
@@ -101,6 +112,80 @@ impl ServiceConfig {
                 "PUSULA_GATEWAY_UPLOAD_REFILL_SECONDS must be between 1 and 3600",
             ));
         }
+        let max_pending_per_device = parse_env("PUSULA_GATEWAY_MAX_PENDING_PER_DEVICE", 8_u32)?;
+        if !(1..=100).contains(&max_pending_per_device) {
+            return Err(AppError::BadRequest(
+                "PUSULA_GATEWAY_MAX_PENDING_PER_DEVICE must be between 1 and 100",
+            ));
+        }
+        let device_byte_quota_24h =
+            parse_env("PUSULA_GATEWAY_DEVICE_24H_BYTE_QUOTA", 1_073_741_824_u64)?;
+        validate_device_byte_quota(max_backup_bytes, device_byte_quota_24h)?;
+        let pending_max_age_seconds = parse_env(
+            "PUSULA_GATEWAY_PENDING_MAX_AGE_SECONDS",
+            30 * 24 * 60 * 60_u64,
+        )?;
+        if !(24 * 60 * 60..=180 * 24 * 60 * 60).contains(&pending_max_age_seconds) {
+            return Err(AppError::BadRequest(
+                "PUSULA_GATEWAY_PENDING_MAX_AGE_SECONDS must be between 1 and 180 days",
+            ));
+        }
+        let pending_cleanup_limit = parse_env("PUSULA_GATEWAY_PENDING_CLEANUP_LIMIT", 100_u32)?;
+        if !(1..=1000).contains(&pending_cleanup_limit) {
+            return Err(AppError::BadRequest(
+                "PUSULA_GATEWAY_PENDING_CLEANUP_LIMIT must be between 1 and 1000",
+            ));
+        }
+        let authorization_cleanup_limit =
+            parse_env("PUSULA_GATEWAY_AUTHORIZATION_CLEANUP_LIMIT", 500_u32)?;
+        if !(1..=5000).contains(&authorization_cleanup_limit) {
+            return Err(AppError::BadRequest(
+                "PUSULA_GATEWAY_AUTHORIZATION_CLEANUP_LIMIT must be between 1 and 5000",
+            ));
+        }
+        let daily_min_interval_seconds = parse_env(
+            "PUSULA_GATEWAY_DAILY_MIN_INTERVAL_SECONDS",
+            20 * 60 * 60_u64,
+        )?;
+        if !(20 * 60 * 60..=7 * 24 * 60 * 60).contains(&daily_min_interval_seconds) {
+            return Err(AppError::BadRequest(
+                "PUSULA_GATEWAY_DAILY_MIN_INTERVAL_SECONDS must be between 20 hours and 7 days",
+            ));
+        }
+        let monthly_min_interval_seconds = parse_env(
+            "PUSULA_GATEWAY_MONTHLY_MIN_INTERVAL_SECONDS",
+            25 * 24 * 60 * 60_u64,
+        )?;
+        if !(25 * 24 * 60 * 60..=90 * 24 * 60 * 60).contains(&monthly_min_interval_seconds) {
+            return Err(AppError::BadRequest(
+                "PUSULA_GATEWAY_MONTHLY_MIN_INTERVAL_SECONDS must be between 25 and 90 days",
+            ));
+        }
+        let max_request_concurrency = parse_env("PUSULA_GATEWAY_MAX_REQUEST_CONCURRENCY", 8_usize)?;
+        if !(4..=256).contains(&max_request_concurrency) {
+            return Err(AppError::BadRequest(
+                "PUSULA_GATEWAY_MAX_REQUEST_CONCURRENCY must be between 4 and 256",
+            ));
+        }
+        let max_db_concurrency = parse_env("PUSULA_GATEWAY_MAX_DB_CONCURRENCY", 4_usize)?;
+        if !(1..=32).contains(&max_db_concurrency) {
+            return Err(AppError::BadRequest(
+                "PUSULA_GATEWAY_MAX_DB_CONCURRENCY must be between 1 and 32",
+            ));
+        }
+        let global_request_capacity = parse_env("PUSULA_GATEWAY_GLOBAL_REQUEST_BURST", 60_u32)?;
+        if !(1..=10_000).contains(&global_request_capacity) {
+            return Err(AppError::BadRequest(
+                "PUSULA_GATEWAY_GLOBAL_REQUEST_BURST must be between 1 and 10000",
+            ));
+        }
+        let global_request_refill_seconds =
+            parse_env("PUSULA_GATEWAY_GLOBAL_REQUEST_REFILL_SECONDS", 1_u64)?;
+        if !(1..=3600).contains(&global_request_refill_seconds) {
+            return Err(AppError::BadRequest(
+                "PUSULA_GATEWAY_GLOBAL_REQUEST_REFILL_SECONDS must be between 1 and 3600",
+            ));
+        }
 
         let http_client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(5))
@@ -140,6 +225,17 @@ impl ServiceConfig {
             max_backup_bytes,
             rate_capacity,
             rate_refill: Duration::from_secs(refill_seconds),
+            max_pending_per_device,
+            device_byte_quota_24h,
+            pending_max_age: Duration::from_secs(pending_max_age_seconds),
+            pending_cleanup_limit,
+            authorization_cleanup_limit,
+            daily_min_interval: Duration::from_secs(daily_min_interval_seconds),
+            monthly_min_interval: Duration::from_secs(monthly_min_interval_seconds),
+            max_request_concurrency,
+            max_db_concurrency,
+            global_request_capacity,
+            global_request_refill: Duration::from_secs(global_request_refill_seconds),
             b2: B2Config {
                 endpoint,
                 region,
@@ -230,4 +326,30 @@ fn normalize_prefix(prefix: &str) -> Result<String> {
         return Err(AppError::BadRequest("B2 object prefix is invalid"));
     }
     Ok(format!("{prefix}/"))
+}
+
+fn validate_device_byte_quota(max_backup_bytes: u64, quota: u64) -> Result<()> {
+    let minimum_fallback_quota = max_backup_bytes.checked_mul(2).ok_or(AppError::BadRequest(
+        "PUSULA_GATEWAY_MAX_BACKUP_BYTES is too large for the byte quota",
+    ))?;
+    if quota < minimum_fallback_quota || quota > 1024 * 1024 * 1024 * 1024 {
+        return Err(AppError::BadRequest(
+            "PUSULA_GATEWAY_DEVICE_24H_BYTE_QUOTA must cover one direct grant plus one relay and not exceed 1 TiB",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn byte_quota_must_cover_a_direct_grant_and_relay_fallback() {
+        assert!(validate_device_byte_quota(256, 512).is_ok());
+        assert!(matches!(
+            validate_device_byte_quota(256, 511),
+            Err(AppError::BadRequest(_))
+        ));
+    }
 }

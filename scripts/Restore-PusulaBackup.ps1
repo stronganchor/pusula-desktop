@@ -24,6 +24,13 @@ Path to a prior incident/recovery evidence JSON document. Required with -Apply.
 Replace the target database after all validation gates pass. Without this
 switch, the script only validates and reports.
 
+.PARAMETER RecoverInterruptedRestore
+Acquire the shared database lock and recover only from the strict durable
+interrupted-restore marker. This mode requires no ciphertext or recovery key;
+it verifies and restores the recorded rollback (or removes a partial
+clean-machine target), cleans recorded plaintext artifacts, and only then
+clears the marker.
+
 .EXAMPLE
 ./scripts/Restore-PusulaBackup.ps1 `
   -CiphertextPath 'C:\secure\backup.sqlite3.age' `
@@ -35,17 +42,24 @@ switch, the script only validates and reports.
   -RecoveryIdentityPath 'E:\keys\pusula-recovery.agekey' `
   -ExpectedEvidencePath 'C:\secure\restore-evidence.json' `
   -Apply
+
+.EXAMPLE
+./scripts/Restore-PusulaBackup.ps1 -RecoverInterruptedRestore
 #>
-[CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'High')]
+[CmdletBinding(DefaultParameterSetName = 'Restore', SupportsShouldProcess = $true, ConfirmImpact = 'High')]
 param(
-    [Parameter(Mandatory = $true)]
+    [Parameter(Mandatory = $true, ParameterSetName = 'Restore')]
     [ValidateNotNullOrEmpty()]
     [string]$CiphertextPath,
 
-    [Parameter(Mandatory = $true)]
+    [Parameter(Mandatory = $true, ParameterSetName = 'Restore')]
     [ValidateNotNullOrEmpty()]
     [string]$RecoveryIdentityPath,
 
+    [Parameter(Mandatory = $true, ParameterSetName = 'RecoverInterrupted')]
+    [switch]$RecoverInterruptedRestore,
+
+    [Parameter(ParameterSetName = 'Restore')]
     [string]$ExpectedEvidencePath,
 
     [string]$TargetDatabasePath,
@@ -54,24 +68,29 @@ param(
 
     [string]$RollbackRoot,
 
+    [Parameter(ParameterSetName = 'Restore')]
     [string]$RagePath = 'rage.exe',
 
     [string]$PythonPath = 'python.exe',
 
+    [Parameter(ParameterSetName = 'Restore')]
     [switch]$Apply
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$script:SupportedSchemaVersion = 1
+$script:SupportedSchemaVersion = 2
 $script:StagingDirectory = $null
 $script:CandidatePath = $null
 $script:LockPath = $null
 $script:LockStream = $null
+$script:MarkerPath = $null
+$script:MarkerCreated = $false
 $script:CleanupFailure = $null
 $script:RollbackDirectory = $null
 $script:KeepRollback = $false
+$script:PreserveInterruptedArtifacts = $false
 
 $script:SqliteHelper = @'
 import json
@@ -99,7 +118,8 @@ EXPECTED_TABLE_COLUMNS = {
         "id", "sale_id", "due_date", "amount_kurus", "paid_date"
     },
     "installment_payments": {
-        "id", "installment_id", "amount_kurus", "payment_date", "created_at"
+        "id", "installment_id", "amount_kurus", "payment_date", "created_at",
+        "request_key"
     },
     "settings": {"key", "value"},
 }
@@ -170,6 +190,30 @@ def validate_database(path, expected_schema):
                 raise ValueError(
                     f"table {table} is missing columns: " + ", ".join(missing_columns)
                 )
+
+        payment_indexes = {
+            row[1]: row
+            for row in connection.execute('PRAGMA index_list("installment_payments")')
+        }
+        request_index = payment_indexes.get("payments_request_key_idx")
+        if request_index is None or int(request_index[2]) != 1 or int(request_index[4]) != 1:
+            raise ValueError(
+                "installment_payments is missing the unique partial payment idempotency index"
+            )
+        request_index_columns = [
+            row[2]
+            for row in connection.execute('PRAGMA index_info("payments_request_key_idx")')
+        ]
+        if request_index_columns != ["request_key"]:
+            raise ValueError("payment idempotency index does not cover request_key")
+        request_index_sql = scalar(
+            connection,
+            "SELECT sql FROM sqlite_schema WHERE type = 'index' "
+            "AND name = 'payments_request_key_idx'",
+        )
+        normalized_index_sql = " ".join(str(request_index_sql).lower().split())
+        if "where request_key is not null" not in normalized_index_sql:
+            raise ValueError("payment idempotency index is not partial on non-null keys")
 
         if int(scalar(connection, "SELECT COUNT(*) FROM business_profile WHERE id = 1")) != 1:
             raise ValueError("business_profile must contain exactly the id=1 row")
@@ -479,6 +523,335 @@ function Write-FileDurably {
     }
 }
 
+function New-RestoreInProgressMarker {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$IncidentId,
+        [Parameter(Mandatory = $true)][string]$TargetDatabase,
+        [Parameter(Mandatory = $true)][string]$RollbackDirectory,
+        [Parameter(Mandatory = $true)][bool]$TargetExisted,
+        [Parameter(Mandatory = $true)][string]$StagingDirectory,
+        [Parameter(Mandatory = $true)][string]$CandidateDatabase
+    )
+
+    $rollbackDatabase = if ($TargetExisted) {
+        Join-Path $RollbackDirectory 'pusula-before-restore.sqlite3'
+    }
+    else {
+        $null
+    }
+    $rollbackEvidence = if ($TargetExisted) {
+        Join-Path $RollbackDirectory 'rollback-evidence.json'
+    }
+    else {
+        $null
+    }
+    $marker = [pscustomobject][ordered]@{
+        format_version = 3
+        incident_id = $IncidentId
+        phase = 'database_swap'
+        target_database_path = $TargetDatabase
+        target_existed = $TargetExisted
+        rollback_directory = $RollbackDirectory
+        rollback_database_path = $rollbackDatabase
+        rollback_evidence_path = $rollbackEvidence
+        staging_directory_path = $StagingDirectory
+        candidate_database_path = $CandidateDatabase
+        created_at = (Get-Date).ToUniversalTime().ToString('o')
+    }
+    [System.IO.File]::WriteAllText(
+        $Path,
+        ($marker | ConvertTo-Json -Depth 4 -Compress),
+        (New-Object System.Text.UTF8Encoding($false))
+    )
+    Write-FileDurably -Path $Path
+    $script:MarkerCreated = $true
+}
+
+function Remove-RestoreInProgressMarkerAfterVerification {
+    if (-not $script:MarkerCreated) {
+        return
+    }
+    if ($env:PUSULA_TEST_FAIL_RECORDED_ARTIFACT_CLEANUP -eq '1') {
+        throw 'Injected failure before recorded restore artifact cleanup.'
+    }
+    # The marker is the app's fail-closed incident pointer. Remove and verify
+    # every plaintext path it records before deleting that pointer; otherwise a
+    # power loss or cleanup failure could leave sensitive data behind while the
+    # app is allowed to start.
+    Remove-PlaintextPath -Path $script:CandidatePath
+    Remove-PlaintextPath -Path $script:StagingDirectory
+    if ((-not [string]::IsNullOrWhiteSpace($script:CandidatePath) -and
+            [System.IO.File]::Exists($script:CandidatePath)) -or
+        (-not [string]::IsNullOrWhiteSpace($script:StagingDirectory) -and
+            [System.IO.Directory]::Exists($script:StagingDirectory))) {
+        throw 'Verified restore resolution could not remove all recorded plaintext artifacts.'
+    }
+    $script:CandidatePath = $null
+    $script:StagingDirectory = $null
+    [System.IO.File]::Delete($script:MarkerPath)
+    if ([System.IO.File]::Exists($script:MarkerPath)) {
+        throw 'Verified restore resolution could not clear the durable marker.'
+    }
+    $script:MarkerCreated = $false
+}
+
+function Assert-ExactJsonProperties {
+    param(
+        [Parameter(Mandatory = $true)]$Object,
+        [Parameter(Mandatory = $true)][string[]]$Expected,
+        [Parameter(Mandatory = $true)][string]$Description
+    )
+
+    if ($Object -isnot [pscustomobject]) {
+        throw "$Description must be a JSON object."
+    }
+    $actual = @($Object.PSObject.Properties | ForEach-Object { $_.Name })
+    if ($actual.Count -ne $Expected.Count) {
+        throw "$Description has unexpected or missing properties."
+    }
+    foreach ($name in $Expected) {
+        if ($actual -cnotcontains $name) {
+            throw "$Description has unexpected or missing properties."
+        }
+    }
+}
+
+function Read-RestoreInProgressMarker {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$ExpectedTargetDatabase,
+        [Parameter(Mandatory = $true)][string]$ExpectedRollbackRoot,
+        [Parameter(Mandatory = $true)][string]$ExpectedStagingRoot
+    )
+
+    if (-not [System.IO.File]::Exists($Path)) {
+        throw 'No interrupted Pusula restore marker was found.'
+    }
+    if ((Get-Item -LiteralPath $Path).Length -gt 16384) {
+        throw 'The interrupted restore marker is unexpectedly large.'
+    }
+    try {
+        $marker = [System.IO.File]::ReadAllText($Path) | ConvertFrom-Json
+    }
+    catch {
+        throw 'The interrupted restore marker is not valid JSON.'
+    }
+    Assert-ExactJsonProperties `
+        -Object $marker `
+        -Expected @(
+            'format_version',
+            'incident_id',
+            'phase',
+            'target_database_path',
+            'target_existed',
+            'rollback_directory',
+            'rollback_database_path',
+            'rollback_evidence_path',
+            'staging_directory_path',
+            'candidate_database_path',
+            'created_at'
+        ) `
+        -Description 'The interrupted restore marker'
+
+    $formatVersion = ConvertTo-ExactNonNegativeInt64 `
+        -Value $marker.format_version `
+        -Description 'restore marker format_version'
+    if ($formatVersion -ne 3) {
+        throw 'The interrupted restore marker format is unsupported.'
+    }
+    $incidentId = [string]$marker.incident_id
+    if ($incidentId -cnotmatch '^\d{8}T\d{6}Z-[a-f0-9]{32}$') {
+        throw 'The interrupted restore marker incident_id is invalid.'
+    }
+    if (-not [string]::Equals(
+        [string]$marker.phase,
+        'database_swap',
+        [System.StringComparison]::Ordinal
+    )) {
+        throw 'The interrupted restore marker phase is invalid.'
+    }
+    if ($marker.target_existed -isnot [bool]) {
+        throw 'The interrupted restore marker target_existed value is invalid.'
+    }
+    $createdAt = [System.DateTimeOffset]::MinValue
+    if (-not [System.DateTimeOffset]::TryParse(
+        [string]$marker.created_at,
+        [System.Globalization.CultureInfo]::InvariantCulture,
+        [System.Globalization.DateTimeStyles]::RoundtripKind,
+        [ref]$createdAt
+    )) {
+        throw 'The interrupted restore marker created_at value is invalid.'
+    }
+
+    $targetDatabase = Get-FullPath -Path ([string]$marker.target_database_path)
+    if (-not [string]::Equals(
+        $targetDatabase,
+        (Get-FullPath -Path $ExpectedTargetDatabase),
+        [System.StringComparison]::OrdinalIgnoreCase
+    )) {
+        throw 'The interrupted restore marker targets a different database.'
+    }
+    $rollbackDirectory = Get-FullPath -Path ([string]$marker.rollback_directory)
+    $expectedRollbackDirectory = Get-FullPath -Path (Join-Path $ExpectedRollbackRoot $incidentId)
+    if (-not [string]::Equals(
+        $rollbackDirectory,
+        $expectedRollbackDirectory,
+        [System.StringComparison]::OrdinalIgnoreCase
+    )) {
+        throw 'The interrupted restore marker rollback directory is outside the configured rollback root.'
+    }
+    if (-not [System.IO.Directory]::Exists($rollbackDirectory)) {
+        throw 'The interrupted restore rollback directory was not found.'
+    }
+    Assert-OutsideSyncRoots -Path $rollbackDirectory -Description 'Interrupted restore rollback directory'
+    Assert-NoReparsePoints -Path $rollbackDirectory -Description 'Interrupted restore rollback directory'
+
+    $stagingDirectory = Get-FullPath -Path ([string]$marker.staging_directory_path)
+    $expectedStagingDirectory = Get-FullPath -Path (Join-Path $ExpectedStagingRoot $incidentId)
+    if (-not [string]::Equals(
+        $stagingDirectory,
+        $expectedStagingDirectory,
+        [System.StringComparison]::OrdinalIgnoreCase
+    )) {
+        throw 'The interrupted restore marker staging directory is outside the configured staging root.'
+    }
+    $candidateDatabase = Get-FullPath -Path ([string]$marker.candidate_database_path)
+    $candidateDirectory = [System.IO.Path]::GetDirectoryName($candidateDatabase)
+    $candidateName = [System.IO.Path]::GetFileName($candidateDatabase)
+    if (-not [string]::Equals(
+        $candidateDirectory,
+        [System.IO.Path]::GetDirectoryName($targetDatabase),
+        [System.StringComparison]::OrdinalIgnoreCase
+    ) -or $candidateName -cnotmatch '^\.pusula-restore-[a-f0-9]{32}\.sqlite3$') {
+        throw 'The interrupted restore marker candidate database path is outside the target directory.'
+    }
+    Assert-OutsideSyncRoots -Path $stagingDirectory -Description 'Interrupted restore staging directory'
+    Assert-NoReparsePoints -Path $stagingDirectory -Description 'Interrupted restore staging directory'
+    Assert-NoReparsePoints -Path $candidateDatabase -Description 'Interrupted restore candidate database'
+
+    $rollbackDatabase = $null
+    $rollbackEvidence = $null
+    if ([bool]$marker.target_existed) {
+        $rollbackDatabase = Get-FullPath -Path ([string]$marker.rollback_database_path)
+        $rollbackEvidence = Get-FullPath -Path ([string]$marker.rollback_evidence_path)
+        if (-not [string]::Equals(
+            $rollbackDatabase,
+            (Join-Path $rollbackDirectory 'pusula-before-restore.sqlite3'),
+            [System.StringComparison]::OrdinalIgnoreCase
+        ) -or -not [string]::Equals(
+            $rollbackEvidence,
+            (Join-Path $rollbackDirectory 'rollback-evidence.json'),
+            [System.StringComparison]::OrdinalIgnoreCase
+        )) {
+            throw 'The interrupted restore marker rollback artifact paths are invalid.'
+        }
+        $rollbackDatabase = Resolve-ExistingFile -Path $rollbackDatabase -Description 'Verified rollback database'
+        $rollbackEvidence = Resolve-ExistingFile -Path $rollbackEvidence -Description 'Rollback evidence'
+        Assert-NoReparsePoints -Path $rollbackDatabase -Description 'Verified rollback database'
+        Assert-NoReparsePoints -Path $rollbackEvidence -Description 'Rollback evidence'
+    }
+    elseif ($null -ne $marker.rollback_database_path -or $null -ne $marker.rollback_evidence_path) {
+        throw 'The clean-machine restore marker unexpectedly records rollback artifacts.'
+    }
+
+    return [pscustomobject][ordered]@{
+        format_version = $formatVersion
+        incident_id = $incidentId
+        target_database_path = $targetDatabase
+        target_existed = [bool]$marker.target_existed
+        rollback_directory = $rollbackDirectory
+        rollback_database_path = $rollbackDatabase
+        rollback_evidence_path = $rollbackEvidence
+        staging_directory_path = $stagingDirectory
+        candidate_database_path = $candidateDatabase
+        created_at = $createdAt.ToUniversalTime().ToString('o')
+    }
+}
+
+function Read-RollbackEvidence {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    if ((Get-Item -LiteralPath $Path).Length -gt 65536) {
+        throw 'Rollback evidence is unexpectedly large.'
+    }
+    try {
+        $evidence = [System.IO.File]::ReadAllText($Path) | ConvertFrom-Json
+    }
+    catch {
+        throw 'Rollback evidence is not valid JSON.'
+    }
+    Assert-ExactJsonProperties `
+        -Object $evidence `
+        -Expected @(
+            'schema_version',
+            'integrity_check',
+            'foreign_key_violations',
+            'counts',
+            'totals',
+            'database_sha256',
+            'created_at'
+        ) `
+        -Description 'Rollback evidence'
+    if ([long](ConvertTo-ExactNonNegativeInt64 $evidence.schema_version 'rollback schema_version') -ne $script:SupportedSchemaVersion -or
+        -not [string]::Equals([string]$evidence.integrity_check, 'ok', [System.StringComparison]::Ordinal) -or
+        [long](ConvertTo-ExactNonNegativeInt64 $evidence.foreign_key_violations 'rollback foreign_key_violations') -ne 0) {
+        throw 'Rollback evidence does not record a valid Pusula database.'
+    }
+    $databaseSha256 = [string]$evidence.database_sha256
+    if ($databaseSha256 -cnotmatch '^[a-f0-9]{64}$') {
+        throw 'Rollback evidence database_sha256 is invalid.'
+    }
+    $normalizedCounts = [ordered]@{}
+    foreach ($name in @('customers', 'contacts', 'sales', 'installments', 'payments')) {
+        $normalizedCounts[$name] = ConvertTo-ExactNonNegativeInt64 `
+            -Value (Get-RequiredProperty $evidence.counts $name "counts.$name") `
+            -Description "rollback counts.$name"
+    }
+    $normalizedTotals = [ordered]@{}
+    foreach ($name in @('sales_kurus', 'installments_kurus', 'payments_kurus')) {
+        $normalizedTotals[$name] = ConvertTo-ExactNonNegativeInt64 `
+            -Value (Get-RequiredProperty $evidence.totals $name "totals.$name") `
+            -Description "rollback totals.$name"
+    }
+    return [pscustomobject][ordered]@{
+        schema_version = [long]$evidence.schema_version
+        integrity_check = 'ok'
+        foreign_key_violations = 0
+        counts = [pscustomobject]$normalizedCounts
+        totals = [pscustomobject]$normalizedTotals
+        database_sha256 = $databaseSha256
+    }
+}
+
+function Assert-RollbackEvidenceMatches {
+    param(
+        [Parameter(Mandatory = $true)]$Evidence,
+        [Parameter(Mandatory = $true)]$DatabaseResult,
+        [Parameter(Mandatory = $true)][string]$DatabaseSha256
+    )
+
+    if (-not [string]::Equals(
+        $Evidence.database_sha256,
+        $DatabaseSha256,
+        [System.StringComparison]::Ordinal
+    ) -or [long]$Evidence.schema_version -ne [long]$DatabaseResult.schema_version -or
+        -not [string]::Equals($Evidence.integrity_check, $DatabaseResult.integrity_check, [System.StringComparison]::Ordinal) -or
+        [long]$Evidence.foreign_key_violations -ne [long]$DatabaseResult.foreign_key_violations) {
+        throw 'Verified rollback database does not match its recorded evidence.'
+    }
+    foreach ($name in @('customers', 'contacts', 'sales', 'installments', 'payments')) {
+        if ([long]$Evidence.counts.$name -ne [long]$DatabaseResult.counts.$name) {
+            throw "Verified rollback database count $name does not match its recorded evidence."
+        }
+    }
+    foreach ($name in @('sales_kurus', 'installments_kurus', 'payments_kurus')) {
+        if ([long]$Evidence.totals.$name -ne [long]$DatabaseResult.totals.$name) {
+            throw "Verified rollback database total $name does not match its recorded evidence."
+        }
+    }
+}
+
 function Assert-SqliteHeader {
     param([Parameter(Mandatory = $true)][string]$Path)
 
@@ -735,25 +1108,203 @@ if ([string]::IsNullOrWhiteSpace($RollbackRoot)) {
     $RollbackRoot = Join-Path $env:LOCALAPPDATA 'com.stronganchor.pusula\restore-rollbacks'
 }
 
-$ciphertext = Resolve-ExistingFile -Path $CiphertextPath -Description 'Encrypted backup'
-$recoveryIdentity = Resolve-ExistingFile -Path $RecoveryIdentityPath -Description 'Recovery identity'
 $targetDatabase = Get-FullPath -Path $TargetDatabasePath
 $stagingRootPath = Get-FullPath -Path $StagingRoot
 $rollbackRootPath = Get-FullPath -Path $RollbackRoot
-$rageExecutable = Resolve-Executable -Path $RagePath -Description 'rage executable'
 $pythonExecutable = Resolve-Executable -Path $PythonPath -Description 'Python 3 executable'
 
 Assert-OutsideSyncRoots -Path $targetDatabase -Description 'Target database'
 Assert-OutsideSyncRoots -Path $stagingRootPath -Description 'Staging root'
 Assert-OutsideSyncRoots -Path $rollbackRootPath -Description 'Rollback root'
-Assert-OutsideSyncRoots -Path $recoveryIdentity -Description 'Recovery identity'
 Assert-NoReparsePoints -Path $targetDatabase -Description 'Target database'
 Assert-NoReparsePoints -Path $stagingRootPath -Description 'Staging root'
 Assert-NoReparsePoints -Path $rollbackRootPath -Description 'Rollback root'
-Assert-NoReparsePoints -Path $recoveryIdentity -Description 'Recovery identity'
-if ($Apply) {
+if ($Apply -or $RecoverInterruptedRestore) {
     Assert-SameVolume -FirstPath $targetDatabase -SecondPath $rollbackRootPath
 }
+
+$targetDirectory = [System.IO.Path]::GetDirectoryName($targetDatabase)
+$databaseLockPath = Join-Path $targetDirectory '.pusula-database.lock'
+$restoreMarkerPath = Join-Path $targetDirectory '.pusula-restore-in-progress.json'
+
+if ($RecoverInterruptedRestore) {
+    if (-not [System.IO.Directory]::Exists($targetDirectory)) {
+        throw 'No interrupted Pusula restore marker was found.'
+    }
+    Assert-NoReparsePoints -Path $databaseLockPath -Description 'Database operation lock'
+    Assert-NoReparsePoints -Path $restoreMarkerPath -Description 'Restore marker'
+    $recoveryLock = $null
+    $recoveryStaging = $null
+    $recoveryCandidate = $null
+    try {
+        try {
+            $recoveryLock = [System.IO.File]::Open(
+                $databaseLockPath,
+                [System.IO.FileMode]::OpenOrCreate,
+                [System.IO.FileAccess]::ReadWrite,
+                [System.IO.FileShare]::None
+            )
+        }
+        catch {
+            throw 'The Pusula database is in use by the app or another restore. Close Pusula and retry.'
+        }
+        Assert-PusulaStopped
+        $marker = Read-RestoreInProgressMarker `
+            -Path $restoreMarkerPath `
+            -ExpectedTargetDatabase $targetDatabase `
+            -ExpectedRollbackRoot $rollbackRootPath `
+            -ExpectedStagingRoot $stagingRootPath
+
+        $recoveryStaging = Join-Path $stagingRootPath ('interrupted-recovery-{0}' -f [guid]::NewGuid().ToString('N'))
+        New-PrivateDirectory -Path $recoveryStaging
+        Assert-NoReparsePoints -Path $recoveryStaging -Description 'Interrupted restore recovery staging directory'
+        $recoveryHelper = Join-Path $recoveryStaging 'pusula-restore-sqlite-helper.py'
+        [System.IO.File]::WriteAllText(
+            $recoveryHelper,
+            $script:SqliteHelper,
+            (New-Object System.Text.UTF8Encoding($false))
+        )
+
+        $rollbackResult = $null
+        $rollbackEvidence = $null
+        $rollbackSha256 = $null
+        if ($marker.target_existed) {
+            $rollbackEvidence = Read-RollbackEvidence -Path $marker.rollback_evidence_path
+            $rollbackResult = Test-PusulaDatabase `
+                -Path $marker.rollback_database_path `
+                -PythonExecutable $pythonExecutable `
+                -HelperPath $recoveryHelper
+            $rollbackSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $marker.rollback_database_path).Hash.ToLowerInvariant()
+            Assert-RollbackEvidenceMatches `
+                -Evidence $rollbackEvidence `
+                -DatabaseResult $rollbackResult `
+                -DatabaseSha256 $rollbackSha256
+        }
+
+        $recoveryReport = [pscustomobject][ordered]@{
+            operation = 'interrupted_restore_recovery_ready'
+            incident_id = $marker.incident_id
+            target_database_path = $targetDatabase
+            target_existed_before_restore = $marker.target_existed
+            rollback_directory = $marker.rollback_directory
+            schema_version = if ($null -ne $rollbackResult) { [long]$rollbackResult.schema_version } else { $null }
+            integrity_check = if ($null -ne $rollbackResult) { [string]$rollbackResult.integrity_check } else { $null }
+            counts = if ($null -ne $rollbackResult) { $rollbackResult.counts } else { $null }
+            totals = if ($null -ne $rollbackResult) { $rollbackResult.totals } else { $null }
+            rollback_database_sha256 = $rollbackSha256
+        }
+        if (-not $PSCmdlet.ShouldProcess(
+            $targetDatabase,
+            'recover the verified pre-restore state recorded by the interrupted restore marker'
+        )) {
+            $recoveryReport.operation = 'interrupted_restore_recovery_what_if'
+            $recoveryReport | ConvertTo-Json -Depth 6
+            return
+        }
+
+        foreach ($path in @($targetDatabase, "$targetDatabase-wal", "$targetDatabase-shm")) {
+            Assert-ExclusiveFileAccess -Path $path
+        }
+        $forensicSuffix = [guid]::NewGuid().ToString('N')
+        foreach ($suffix in @('-wal', '-shm')) {
+            $sidecar = "$targetDatabase$suffix"
+            if ([System.IO.File]::Exists($sidecar)) {
+                [System.IO.File]::Move(
+                    $sidecar,
+                    (Join-Path $marker.rollback_directory "interrupted-target-$forensicSuffix.sqlite3$suffix")
+                )
+            }
+        }
+
+        if ($marker.target_existed) {
+            $recoveryCandidate = Join-Path $targetDirectory ('.pusula-interrupted-rollback-{0}.sqlite3' -f [guid]::NewGuid().ToString('N'))
+            [System.IO.File]::Copy($marker.rollback_database_path, $recoveryCandidate, $false)
+            Write-FileDurably -Path $recoveryCandidate
+            $candidateResult = Test-PusulaDatabase `
+                -Path $recoveryCandidate `
+                -PythonExecutable $pythonExecutable `
+                -HelperPath $recoveryHelper
+            $candidateSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $recoveryCandidate).Hash.ToLowerInvariant()
+            Assert-RollbackEvidenceMatches `
+                -Evidence $rollbackEvidence `
+                -DatabaseResult $candidateResult `
+                -DatabaseSha256 $candidateSha256
+
+            if ([System.IO.File]::Exists($targetDatabase)) {
+                [System.IO.File]::Replace(
+                    $recoveryCandidate,
+                    $targetDatabase,
+                    (Join-Path $marker.rollback_directory "interrupted-target-$forensicSuffix.sqlite3"),
+                    $true
+                )
+            }
+            else {
+                [System.IO.File]::Move($recoveryCandidate, $targetDatabase)
+            }
+            $recoveryCandidate = $null
+            $restoredResult = Test-PusulaDatabase `
+                -Path $targetDatabase `
+                -PythonExecutable $pythonExecutable `
+                -HelperPath $recoveryHelper
+            $restoredSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $targetDatabase).Hash.ToLowerInvariant()
+            Assert-RollbackEvidenceMatches `
+                -Evidence $rollbackEvidence `
+                -DatabaseResult $restoredResult `
+                -DatabaseSha256 $restoredSha256
+        }
+        else {
+            if ([System.IO.File]::Exists($targetDatabase)) {
+                [System.IO.File]::Move(
+                    $targetDatabase,
+                    (Join-Path $marker.rollback_directory "interrupted-target-$forensicSuffix.sqlite3")
+                )
+            }
+            if ([System.IO.File]::Exists($targetDatabase) -or
+                [System.IO.File]::Exists("$targetDatabase-wal") -or
+                [System.IO.File]::Exists("$targetDatabase-shm")) {
+                throw 'Clean-machine interrupted restore recovery could not verify target removal.'
+            }
+        }
+
+        if ([System.IO.File]::Exists($marker.candidate_database_path)) {
+            [System.IO.File]::Move(
+                $marker.candidate_database_path,
+                (Join-Path $marker.rollback_directory "interrupted-restore-candidate-$forensicSuffix.sqlite3")
+            )
+        }
+        Remove-PlaintextPath -Path $marker.staging_directory_path
+        if ([System.IO.File]::Exists($marker.candidate_database_path) -or
+            [System.IO.Directory]::Exists($marker.staging_directory_path)) {
+            throw 'Interrupted restore recovery could not remove all recorded plaintext artifacts.'
+        }
+
+        [System.IO.File]::Delete($restoreMarkerPath)
+        if ([System.IO.File]::Exists($restoreMarkerPath)) {
+            throw 'Interrupted restore recovery succeeded but the durable marker could not be cleared.'
+        }
+        $recoveryReport.operation = 'recovered_interrupted_restore'
+        $recoveryReport | ConvertTo-Json -Depth 6
+        return
+    }
+    finally {
+        if ($null -ne $recoveryLock) {
+            $recoveryLock.Dispose()
+        }
+        foreach ($path in @($recoveryCandidate, $recoveryStaging)) {
+            Remove-PlaintextPath -Path $path
+        }
+    }
+}
+
+if ([System.IO.File]::Exists($restoreMarkerPath)) {
+    throw "An interrupted Pusula restore is recorded at $restoreMarkerPath. Do not delete it. Run this script with -RecoverInterruptedRestore (and the same -TargetDatabasePath/-RollbackRoot if customized) to verify and recover the recorded pre-restore state."
+}
+
+$ciphertext = Resolve-ExistingFile -Path $CiphertextPath -Description 'Encrypted backup'
+$recoveryIdentity = Resolve-ExistingFile -Path $RecoveryIdentityPath -Description 'Recovery identity'
+$rageExecutable = Resolve-Executable -Path $RagePath -Description 'rage executable'
+Assert-OutsideSyncRoots -Path $recoveryIdentity -Description 'Recovery identity'
+Assert-NoReparsePoints -Path $recoveryIdentity -Description 'Recovery identity'
 
 if ([string]::Equals($ciphertext, $targetDatabase, [System.StringComparison]::OrdinalIgnoreCase)) {
     throw 'Encrypted backup and target database paths must be different.'
@@ -845,8 +1396,10 @@ try {
     $targetDirectory = [System.IO.Path]::GetDirectoryName($targetDatabase)
     [System.IO.Directory]::CreateDirectory($targetDirectory) | Out-Null
     Assert-NoReparsePoints -Path $targetDatabase -Description 'Target database'
-    $script:LockPath = Join-Path $targetDirectory '.pusula-restore.lock'
-    Assert-NoReparsePoints -Path $script:LockPath -Description 'Restore lock'
+    $script:LockPath = Join-Path $targetDirectory '.pusula-database.lock'
+    $script:MarkerPath = Join-Path $targetDirectory '.pusula-restore-in-progress.json'
+    Assert-NoReparsePoints -Path $script:LockPath -Description 'Database operation lock'
+    Assert-NoReparsePoints -Path $script:MarkerPath -Description 'Restore marker'
     try {
         $script:LockStream = [System.IO.File]::Open(
             $script:LockPath,
@@ -856,7 +1409,11 @@ try {
         )
     }
     catch {
-        throw 'Another Pusula restore appears to be running.'
+        throw 'The Pusula database is in use by the app or another restore. Close Pusula and retry.'
+    }
+
+    if ([System.IO.File]::Exists($script:MarkerPath)) {
+        throw "An interrupted Pusula restore is recorded at $($script:MarkerPath). Do not delete it. Run this script with -RecoverInterruptedRestore to verify and recover it."
     }
 
     Assert-PusulaStopped
@@ -868,6 +1425,7 @@ try {
     $targetExisted = [System.IO.File]::Exists($targetDatabase)
     $rollbackDatabase = Join-Path $rollbackDirectory 'pusula-before-restore.sqlite3'
     $rollbackResult = $null
+    $rollbackSha256 = $null
     $originalBaseSha256 = $null
 
     if ($targetExisted) {
@@ -881,6 +1439,7 @@ try {
             -Path $rollbackDatabase `
             -PythonExecutable $pythonExecutable `
             -HelperPath $helperPath
+        $rollbackSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $rollbackDatabase).Hash.ToLowerInvariant()
 
         [System.IO.File]::Copy(
             $targetDatabase,
@@ -894,7 +1453,7 @@ try {
             foreign_key_violations = [long]$rollbackResult.foreign_key_violations
             counts = $rollbackResult.counts
             totals = $rollbackResult.totals
-            database_sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $rollbackDatabase).Hash.ToLowerInvariant()
+            database_sha256 = $rollbackSha256
             created_at = (Get-Date).ToUniversalTime().ToString('o')
         }
         [System.IO.File]::WriteAllText(
@@ -902,6 +1461,7 @@ try {
             ($rollbackEvidence | ConvertTo-Json -Depth 6),
             (New-Object System.Text.UTF8Encoding($false))
         )
+        Write-FileDurably -Path (Join-Path $rollbackDirectory 'rollback-evidence.json')
     }
 
     $script:CandidatePath = Join-Path $targetDirectory ('.pusula-restore-{0}.sqlite3' -f [guid]::NewGuid().ToString('N'))
@@ -924,6 +1484,15 @@ try {
         Assert-ExclusiveFileAccess -Path $path
     }
 
+    New-RestoreInProgressMarker `
+        -Path $script:MarkerPath `
+        -IncidentId $incidentId `
+        -TargetDatabase $targetDatabase `
+        -RollbackDirectory $rollbackDirectory `
+        -TargetExisted $targetExisted `
+        -StagingDirectory $script:StagingDirectory `
+        -CandidateDatabase $script:CandidatePath
+
     $detachedSidecars = New-Object System.Collections.Generic.List[object]
     $replacementCompleted = $false
     $swapReportedErrorAfterChange = $false
@@ -941,6 +1510,13 @@ try {
                     Destination = $destinationSidecar
                 })
             }
+        }
+
+        if ($env:PUSULA_TEST_FAIL_AFTER_SIDECAR_DETACH -eq '1') {
+            throw 'Injected failure after sidecar detach.'
+        }
+        if ($env:PUSULA_TEST_LEAVE_INTERRUPTED_AFTER_SIDECAR_DETACH -eq '1') {
+            throw 'Injected interrupted restore after sidecar detach.'
         }
 
         Assert-PusulaStopped
@@ -962,6 +1538,11 @@ try {
     }
     catch {
         $replaceError = $_
+        if ($env:PUSULA_TEST_LEAVE_INTERRUPTED_AFTER_SIDECAR_DETACH -eq '1') {
+            $script:KeepRollback = $true
+            $script:PreserveInterruptedArtifacts = $true
+            throw $replaceError
+        }
         $targetShaAfterError = $null
         try {
             if ([System.IO.File]::Exists($targetDatabase)) {
@@ -992,10 +1573,29 @@ try {
                     [System.IO.File]::Move($sidecar.Destination, $sidecar.Source)
                 }
             }
+            $reunitedVerification = Join-Path $rollbackDirectory 'verified-reunited-pusula.sqlite3'
+            Invoke-SqliteHelper `
+                -PythonExecutable $pythonExecutable `
+                -HelperPath $helperPath `
+                -Arguments @('backup', $targetDatabase, $reunitedVerification) `
+                -FailureMessage 'Could not verify the reunited pre-restore SQLite database'
+            Write-FileDurably -Path $reunitedVerification
+            $reunitedResult = Test-PusulaDatabase `
+                -Path $reunitedVerification `
+                -PythonExecutable $pythonExecutable `
+                -HelperPath $helperPath
+            $reunitedSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $reunitedVerification).Hash.ToLowerInvariant()
+            if (-not (Test-DatabaseResultEqual -Left $rollbackResult -Right $reunitedResult) -or
+                -not [string]::Equals($rollbackSha256, $reunitedSha256, [System.StringComparison]::Ordinal)) {
+                $script:KeepRollback = $true
+                throw "CRITICAL: Restore replacement failed and the reunited original database did not match the verified rollback. Keep Pusula closed and recover from $rollbackDirectory."
+            }
+            Remove-RestoreInProgressMarkerAfterVerification
             $script:KeepRollback = $false
             throw $replaceError
         }
         elseif (-not $targetExisted -and -not [System.IO.File]::Exists($targetDatabase)) {
+            Remove-RestoreInProgressMarkerAfterVerification
             $script:KeepRollback = $false
             throw $replaceError
         }
@@ -1043,16 +1643,23 @@ try {
                 -Path $targetDatabase `
                 -PythonExecutable $pythonExecutable `
                 -HelperPath $helperPath
-            if (-not (Test-DatabaseResultEqual -Left $rollbackResult -Right $restoredRollbackResult)) {
+            $restoredRollbackSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $targetDatabase).Hash.ToLowerInvariant()
+            if (-not (Test-DatabaseResultEqual -Left $rollbackResult -Right $restoredRollbackResult) -or
+                -not [string]::Equals($rollbackSha256, $restoredRollbackSha256, [System.StringComparison]::Ordinal)) {
                 throw 'Post-restore validation failed and automatic rollback verification also failed.'
             }
         }
         else {
             Remove-PlaintextPath -Path $targetDatabase
+            if ([System.IO.File]::Exists($targetDatabase)) {
+                throw 'Post-restore validation failed and clean-machine rollback could not verify target removal.'
+            }
         }
+        Remove-RestoreInProgressMarkerAfterVerification
         throw "Post-restore validation failed; the previous database was restored. $($postValidationFailure.Exception.Message)"
     }
 
+    Remove-RestoreInProgressMarkerAfterVerification
     $report.operation = 'restored'
     $report.rollback_directory = if ($targetExisted) { $rollbackDirectory } else { $null }
     if (-not $targetExisted) {
@@ -1070,8 +1677,8 @@ finally {
 
     $cleanupFailures = New-Object System.Collections.Generic.List[string]
     foreach ($path in @(
-        $script:CandidatePath,
-        $script:StagingDirectory,
+        $(if (-not $script:PreserveInterruptedArtifacts) { $script:CandidatePath } else { $null }),
+        $(if (-not $script:PreserveInterruptedArtifacts) { $script:StagingDirectory } else { $null }),
         $(if (-not $script:KeepRollback) { $script:RollbackDirectory } else { $null })
     )) {
         try {
@@ -1082,15 +1689,6 @@ finally {
                 $cleanupFailures.Add($path)
             }
         }
-    }
-
-    try {
-        if (-not [string]::IsNullOrWhiteSpace($script:LockPath) -and [System.IO.File]::Exists($script:LockPath)) {
-            [System.IO.File]::Delete($script:LockPath)
-        }
-    }
-    catch {
-        $cleanupFailures.Add($script:LockPath)
     }
 
     if ($cleanupFailures.Count -gt 0) {

@@ -24,6 +24,10 @@ Pusula application-data directory. Do not move, rename, synchronize, or edit
 those files manually. OneDrive and shared network folders are not supported as
 the live database location.
 
+If the native **Pusula başlatılamadı** dialog appears, close any other Pusula
+or restore process and follow `BACKUP_RESTORE_RUNBOOK.md`. Do not delete a
+reported restore marker or edit database files merely to make the app open.
+
 ## Enable encrypted off-machine backup
 
 An administrator issues a short-lived, one-time enrollment code. With the
@@ -35,6 +39,11 @@ Select **ŞİMDİ YEDEKLE** once and require **Uzak yedek doğrulandı**. The de
 always creates and durably queues an age-encrypted SQLite snapshot before it
 tries the network. If the gateway is unavailable, local business writes keep
 working and the ciphertext is retried automatically after reconnection.
+
+If the gateway definitively rejects the stored device credential with `401` or
+`403`, **VERİ VE YEDEK** changes the status to **Yeniden kurulum gerekli** and
+shows the enrollment fields again. Obtain a new one-time code; do not delete
+queued `.age` files, because reenrollment will upload the preserved queue.
 
 The age recovery private key is not on the customer computer or gateway. Keep
 at least two access-controlled administrator copies. Losing every copy makes
@@ -50,10 +59,13 @@ Tauri downloads the lean Authenticode-signed NSIS installer directly and
 verifies its detached `.exe.sig` updater signature before Pusula asks whether
 to install. This is the same `Pusula_<version>_x64-setup.exe` published with the
 release; it is not wrapped in or extracted from an updater ZIP. If accepted,
-the Rust backend waits for active database operations, blocks new business
-writes, and creates a consistent encrypted snapshot while that exclusive
-maintenance gate remains held. Only then is the verified installer run and the
-app relaunched. A signature, backup, or installer failure stops the appropriate
+the Rust backend first reserves the short local-snapshot lane, then waits for
+active database operations, blocks new business writes, and creates a
+consistent encrypted snapshot while that exclusive maintenance gate remains
+held. It does not reserve, upload, relay, or otherwise wait on the network in
+that gate. The durable ciphertext remains queued and normal remote flushing
+resumes after relaunch. Only then is the verified installer run and the app
+relaunched. A signature, local-backup, or installer failure stops the appropriate
 phase; an install failure releases the maintenance gate so the current version
 can continue. The larger `Pusula_<version>_x64_offline-setup.exe` remains a
 separate disconnected-install option containing the offline WebView2 runtime.

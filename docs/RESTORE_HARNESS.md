@@ -5,8 +5,11 @@ encrypted Pusula backup. Validation-only is the default. Replacing the local
 production database requires `-Apply`, a high-impact PowerShell confirmation,
 and independent evidence for the selected backup.
 
-The harness supports Pusula SQLite schema version 1. A later database migration
-must update the harness and its tests before that release is shipped.
+The harness supports Pusula SQLite schema version 2, including the nullable
+unique payment request key used for idempotent payment submission. Desktop JSON
+exports preserve that optional key while legacy WordPress exports without it
+remain checksum-compatible. A later database migration must update the harness
+and its tests before that release is shipped.
 
 ## Prerequisites
 
@@ -48,7 +51,7 @@ operator selected the right backup.
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "ciphertext_sha256": "64-lowercase-or-uppercase-hex-characters",
   "ciphertext_size_bytes": 123456,
   "counts": {
@@ -117,20 +120,43 @@ automated acceptance drill.
 
 For an existing database, the harness:
 
-1. acquires an exclusive restore lock and proves the Pusula files are not open;
+1. acquires `.pusula-database.lock` with Windows `FileShare.None`, the same
+   cross-process gate held for the entire app lifetime, and proves the Pusula
+   files are not open;
 2. creates and validates a SQLite-consistent rollback with the online backup
    API, which includes committed data still present in WAL;
-3. retains the original base database and moves old `-wal`/`-shm` files into a
+3. durably writes `.pusula-restore-in-progress.json` beside the target before
+   the first live-file mutation; Pusula startup fails closed while it exists;
+4. retains the original base database and moves old `-wal`/`-shm` files into a
    private timestamped rollback directory;
-4. copies, flushes, and revalidates the candidate beside the target;
-5. replaces the base database atomically with Windows `File.Replace`; and
-6. reopens the installed database and requires the same SHA-256, schema, counts,
-   totals, integrity result, and foreign-key result.
+5. copies, flushes, and revalidates the candidate beside the target;
+6. replaces the base database atomically with Windows `File.Replace`; and
+7. reopens the installed database and requires the same SHA-256, schema, counts,
+   totals, integrity result, and foreign-key result before clearing the marker.
 
 If the final reopen check fails, the harness preserves the failed candidate,
 atomically reinstalls the verified logical rollback, verifies that rollback,
 and exits with an error. A clean-machine restore with no prior target does not
 create a meaningless rollback.
+
+The marker is cleared only after the installed candidate passes every check or
+after the previous logical database is reinstated and independently verified.
+A power loss, forced process termination, ambiguous `File.Replace` result, or
+failed rollback leaves the marker in place. Do not manually delete it: preserve
+the rollback directory and run the explicit, lock-gated recovery while Pusula
+remains closed:
+
+```powershell
+& .\scripts\Restore-PusulaBackup.ps1 -RecoverInterruptedRestore
+```
+
+Pass the same `-TargetDatabasePath`, `-StagingRoot`, and `-RollbackRoot` values
+if the interrupted run customized them. Recovery strictly validates the marker
+paths, rollback evidence and full SHA-256, restores the recorded logical
+rollback (or removes a partial clean-machine target), verifies the result, then
+moves/removes the recorded candidate and removes the incident staging directory
+before clearing the marker. A malformed, out-of-root, tampered, or incomplete
+incident remains fail-closed.
 
 The retained rollback directory contains plaintext customer data and must stay
 access-controlled:
@@ -163,8 +189,11 @@ when retention ends.
 ## Automated test
 
 The test uses temporary synthetic databases and a test-only decrypt shim. It
-covers validation-only mode, an atomic clean-machine restore, an existing live
-database with committed data only in WAL, rollback reconciliation, evidence
+covers validation-only mode, an atomic clean-machine restore, the shared
+app/restore exclusion gate, an existing live database with committed data only
+in WAL, automatic verified rollback, stale-marker refusal, explicit existing
+and clean-machine interrupted recovery, plaintext artifact cleanup, tampered
+rollback SHA rejection, malformed/out-of-root marker rejection, evidence
 mismatch, corrupt plaintext, process detection, and success/failure cleanup.
 
 ```powershell

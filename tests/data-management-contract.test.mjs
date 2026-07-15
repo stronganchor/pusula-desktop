@@ -56,6 +56,15 @@ test("backup queue degradation and retained local recovery are visible", () => {
   assert.match(source, /status\.quarantinedFileCount/);
 });
 
+test("definitive device rejection exposes the reenrollment controls", () => {
+  assert.match(source, /needsReenrollment: boolean/);
+  assert.match(source, /status\.needsReenrollment[\s\S]*Yeniden kurulum gerekli/);
+  assert.match(
+    source,
+    /pusula-backup-enrollment"\)\.hidden = status\.enrolled && !status\.needsReenrollment/,
+  );
+});
+
 test("maintenance controls are bound before an offline gateway status probe", () => {
   const maintenance = source.slice(source.indexOf("async function showMaintenance"));
   const closeHandler = maintenance.indexOf('"pusula-data-modal-close").onclick');

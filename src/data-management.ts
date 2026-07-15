@@ -53,6 +53,7 @@ type BackupRunReport = {
 
 type BackupStatusReport = {
   enrolled: boolean;
+  needsReenrollment: boolean;
   deviceId: string | null;
   pendingCount: number;
   localRecoveryCount: number;
@@ -221,7 +222,14 @@ function describeRemoteResult(value: string): string {
 
 function renderBackupStatus(status: BackupStatusReport): void {
   const rows: Array<[string, string]> = [
-    ["Uzak yedek", status.enrolled ? "Etkin" : "Etkin değil"],
+    [
+      "Uzak yedek",
+      status.needsReenrollment
+        ? "Yeniden kurulum gerekli"
+        : status.enrolled
+          ? "Etkin"
+          : "Etkin değil",
+    ],
     ["Şifreli sırada", String(status.pendingCount)],
     ["Yerel kurtarma kopyaları", String(status.localRecoveryCount)],
     [
@@ -235,7 +243,9 @@ function renderBackupStatus(status: BackupStatusReport): void {
     [
       "Ağ geçidi",
       status.gatewayReachable === true
-        ? "Erişilebilir"
+        ? status.needsReenrollment
+          ? "Erişilebilir; cihaz kimliği reddedildi"
+          : "Erişilebilir"
         : status.gatewayReachable === false
           ? "Şu anda erişilemiyor"
           : "Kurulum kodu bekleniyor",
@@ -249,7 +259,7 @@ function renderBackupStatus(status: BackupStatusReport): void {
     );
   }
   replaceDescriptionList("pusula-backup-status", rows);
-  byId("pusula-backup-enrollment").hidden = status.enrolled;
+  byId("pusula-backup-enrollment").hidden = status.enrolled && !status.needsReenrollment;
 }
 
 async function refreshBackupStatus(): Promise<BackupStatusReport> {

@@ -9,7 +9,7 @@ use std::{
 };
 
 use age::x25519;
-use chrono::{DateTime, Datelike, Duration as ChronoDuration, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, Local, NaiveDate, Utc};
 use reqwest::{
     header::{HeaderMap, HeaderName, HeaderValue},
     Client, StatusCode,
@@ -18,7 +18,7 @@ use rusqlite::{backup::Backup, Connection, DatabaseName};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tempfile::Builder as TempfileBuilder;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OwnedMutexGuard};
 use tokio_util::io::ReaderStream;
 use url::Url;
 use uuid::Uuid;
@@ -63,6 +63,9 @@ pub enum BackupError {
 
     #[error("backup gateway rejected the request ({0})")]
     GatewayRejected(u16),
+
+    #[error("backup object upload rejected the request ({0})")]
+    UploadRejected(u16),
 
     #[error("backup gateway returned an invalid response")]
     InvalidGatewayResponse,
@@ -173,6 +176,7 @@ pub struct RemoteBackupStatus {
 #[serde(rename_all = "camelCase")]
 pub struct BackupStatusReport {
     pub enrolled: bool,
+    pub needs_reenrollment: bool,
     pub device_id: Option<String>,
     pub pending_count: usize,
     pub local_recovery_count: usize,
@@ -190,9 +194,13 @@ pub struct BackupStatusReport {
 #[serde(default)]
 struct BackupScheduleState {
     device_id: Option<String>,
+    needs_reenrollment: bool,
     last_attempt_at: Option<String>,
     last_snapshot_at: Option<String>,
     last_remote_success_at: Option<String>,
+    last_daily_period: Option<String>,
+    last_monthly_period: Option<String>,
+    next_remote_retry_at: Option<String>,
     next_scheduled_at: Option<String>,
 }
 
@@ -205,6 +213,8 @@ struct QueueMetadata {
     sha256: String,
     #[serde(default)]
     local_recovery: bool,
+    #[serde(default)]
+    scheduled_period: Option<String>,
     upload: Option<PendingUpload>,
 }
 
@@ -334,6 +344,7 @@ struct UploadUrlRequest<'a> {
 #[derive(Debug, Clone, Deserialize)]
 struct UploadUrlResponse {
     backup_id: String,
+    retention_class: RetentionClass,
     method: String,
     upload_url: String,
     required_headers: BTreeMap<String, String>,
@@ -348,6 +359,26 @@ struct CompleteRequest<'a> {
 struct CompleteResponse {
     backup_id: String,
     status: String,
+    completed_at: String,
+    etag: Option<String>,
+    version_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GatewayErrorEnvelope {
+    error: GatewayErrorBody,
+}
+
+#[derive(Debug, Deserialize)]
+struct GatewayErrorBody {
+    code: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompletionProbe {
+    Completed,
+    ObjectNotPresent,
+    BindingNotFound,
 }
 
 impl GatewayClient {
@@ -395,10 +426,12 @@ impl GatewayClient {
             .await
             .map_err(|_| BackupError::GatewayUnavailable)?;
         ensure_success(response.status())?;
-        response
+        let enrollment: EnrollResponse = response
             .json()
             .await
-            .map_err(|_| BackupError::InvalidGatewayResponse)
+            .map_err(|_| BackupError::InvalidGatewayResponse)?;
+        validate_backup_id(&enrollment.device_id)?;
+        Ok(enrollment)
     }
 
     async fn reserve_upload(
@@ -419,10 +452,15 @@ impl GatewayClient {
             .await
             .map_err(|_| BackupError::GatewayUnavailable)?;
         ensure_success(response.status())?;
-        response
+        let reservation: UploadUrlResponse = response
             .json()
             .await
-            .map_err(|_| BackupError::InvalidGatewayResponse)
+            .map_err(|_| BackupError::InvalidGatewayResponse)?;
+        validate_backup_id(&reservation.backup_id)?;
+        if reservation.retention_class != queued.metadata.retention_class {
+            return Err(BackupError::InvalidGatewayResponse);
+        }
+        Ok(reservation)
     }
 
     async fn put_ciphertext(
@@ -449,7 +487,7 @@ impl GatewayClient {
             }
             Err(_) => return Err(BackupError::GatewayUnavailable),
         };
-        ensure_success(response.status())?;
+        ensure_upload_success(response.status())?;
         Ok(DirectUploadOutcome::Uploaded)
     }
 
@@ -560,16 +598,18 @@ impl GatewayClient {
         Ok((upload_url, headers))
     }
 
-    async fn complete(&self, token: &str, backup_id: &str) -> BackupResult<()> {
+    async fn complete(&self, token: &str, backup_id: &str) -> BackupResult<CompletionProbe> {
+        validate_backup_id(backup_id)?;
         let response = self
             .client
             .post(self.endpoint("v1/backups/complete")?)
             .bearer_auth(token)
             .json(&CompleteRequest { backup_id })
+            .timeout(UPLOAD_REQUEST_TIMEOUT)
             .send()
             .await
             .map_err(|_| BackupError::GatewayUnavailable)?;
-        require_completed_response(response, backup_id).await
+        completion_probe_response(response, backup_id).await
     }
 
     async fn status(&self, token: &str) -> BackupResult<RemoteBackupStatus> {
@@ -581,10 +621,15 @@ impl GatewayClient {
             .await
             .map_err(|_| BackupError::GatewayUnavailable)?;
         ensure_success(response.status())?;
-        response
+        let status: RemoteBackupStatus = response
             .json()
             .await
-            .map_err(|_| BackupError::InvalidGatewayResponse)
+            .map_err(|_| BackupError::InvalidGatewayResponse)?;
+        validate_backup_id(&status.device_id)?;
+        if let Some(latest) = status.latest_completed.as_ref() {
+            validate_backup_id(&latest.backup_id)?;
+        }
+        Ok(status)
     }
 }
 
@@ -598,15 +643,52 @@ async fn require_completed_response(
     response: reqwest::Response,
     expected_backup_id: &str,
 ) -> BackupResult<()> {
-    ensure_success(response.status())?;
-    let completion = response
-        .json::<CompleteResponse>()
-        .await
-        .map_err(|_| BackupError::InvalidGatewayResponse)?;
-    if completion.backup_id != expected_backup_id || completion.status != "completed" {
-        return Err(BackupError::InvalidGatewayResponse);
+    match completion_probe_response(response, expected_backup_id).await? {
+        CompletionProbe::Completed => Ok(()),
+        CompletionProbe::ObjectNotPresent => Err(BackupError::GatewayRejected(409)),
+        CompletionProbe::BindingNotFound => Err(BackupError::GatewayRejected(404)),
     }
-    Ok(())
+}
+
+async fn completion_probe_response(
+    response: reqwest::Response,
+    expected_backup_id: &str,
+) -> BackupResult<CompletionProbe> {
+    let status = response.status();
+    if status.is_success() {
+        let completion = response
+            .json::<CompleteResponse>()
+            .await
+            .map_err(|_| BackupError::InvalidGatewayResponse)?;
+        if completion.backup_id != expected_backup_id || completion.status != "completed" {
+            return Err(BackupError::InvalidGatewayResponse);
+        }
+        DateTime::parse_from_rfc3339(&completion.completed_at)
+            .map_err(|_| BackupError::InvalidGatewayResponse)?;
+        if completion.version_id.is_empty()
+            || completion.version_id.len() > 256
+            || completion.version_id.chars().any(char::is_control)
+            || completion
+                .etag
+                .as_deref()
+                .is_some_and(|etag| etag.len() > 256 || etag.chars().any(char::is_control))
+        {
+            return Err(BackupError::InvalidGatewayResponse);
+        }
+        return Ok(CompletionProbe::Completed);
+    }
+    if matches!(status, StatusCode::NOT_FOUND | StatusCode::CONFLICT) {
+        let error = response
+            .json::<GatewayErrorEnvelope>()
+            .await
+            .map_err(|_| BackupError::InvalidGatewayResponse)?;
+        return match (status, error.error.code.as_str()) {
+            (StatusCode::CONFLICT, "object_not_present") => Ok(CompletionProbe::ObjectNotPresent),
+            (StatusCode::NOT_FOUND, "not_found") => Ok(CompletionProbe::BindingNotFound),
+            _ => Err(BackupError::GatewayRejected(status.as_u16())),
+        };
+    }
+    Err(BackupError::GatewayRejected(status.as_u16()))
 }
 
 fn ensure_success(status: StatusCode) -> BackupResult<()> {
@@ -617,6 +699,18 @@ fn ensure_success(status: StatusCode) -> BackupResult<()> {
     }
 }
 
+fn ensure_upload_success(status: StatusCode) -> BackupResult<()> {
+    if status.is_success() {
+        Ok(())
+    } else {
+        Err(BackupError::UploadRejected(status.as_u16()))
+    }
+}
+
+fn gateway_auth_rejected(error: &BackupError) -> bool {
+    matches!(error, BackupError::GatewayRejected(401 | 403))
+}
+
 #[derive(Clone)]
 pub struct BackupService {
     database: Database,
@@ -625,7 +719,9 @@ pub struct BackupService {
     recipient: x25519::Recipient,
     gateway: GatewayClient,
     token_store: Arc<dyn TokenStore>,
-    operation_lock: Arc<Mutex<()>>,
+    snapshot_lock: Arc<Mutex<()>>,
+    flush_lock: Arc<Mutex<()>>,
+    state_lock: Arc<Mutex<()>>,
 }
 
 impl BackupService {
@@ -666,7 +762,9 @@ impl BackupService {
             recipient,
             gateway,
             token_store,
-            operation_lock: Arc::new(Mutex::new(())),
+            snapshot_lock: Arc::new(Mutex::new(())),
+            flush_lock: Arc::new(Mutex::new(())),
+            state_lock: Arc::new(Mutex::new(())),
         })
     }
 
@@ -675,7 +773,7 @@ impl BackupService {
         enrollment_code: String,
         device_name: String,
     ) -> BackupResult<BackupEnrollment> {
-        let _guard = self.operation_lock.lock().await;
+        let _guard = self.flush_lock.lock().await;
         let enrollment_code = enrollment_code.trim();
         let device_name = device_name.trim();
         if enrollment_code.is_empty()
@@ -688,8 +786,11 @@ impl BackupService {
 
         let enrollment = self.gateway.enroll(enrollment_code, device_name).await?;
         self.token_store.store(&enrollment.device_token)?;
+        let _state_guard = self.state_lock.lock().await;
         let mut state = self.read_state()?;
         state.device_id = Some(enrollment.device_id.clone());
+        state.needs_reenrollment = false;
+        state.next_remote_retry_at = Some(Utc::now().to_rfc3339());
         state.next_scheduled_at = Some(Utc::now().to_rfc3339());
         if let Err(error) = self.write_state(&state) {
             let _ = self.token_store.delete();
@@ -706,16 +807,76 @@ impl BackupService {
         &self,
         retention_class: RetentionClass,
     ) -> BackupResult<BackupRunReport> {
-        let _guard = self.operation_lock.lock().await;
-        self.create_and_flush(retention_class).await
+        let permit = self.reserve_snapshot().await;
+        let queued = self
+            .create_local_snapshot_locked(retention_class, false, None)
+            .await?;
+        self.record_snapshot(&queued, Utc::now()).await?;
+        drop(permit);
+        let (uploaded_count, remote_result) = self.flush_existing_queue().await?;
+        self.snapshot_report(&queued, uploaded_count, remote_result)
     }
 
-    pub async fn prepare_for_update(&self) -> BackupResult<BackupRunReport> {
-        self.backup_now(RetentionClass::Rolling).await
+    #[cfg(test)]
+    async fn prepare_for_update(&self) -> BackupResult<BackupRunReport> {
+        let permit = self.reserve_snapshot().await;
+        self.prepare_for_update_reserved(permit).await
     }
 
+    pub(crate) async fn reserve_snapshot(&self) -> OwnedMutexGuard<()> {
+        self.snapshot_lock.clone().lock_owned().await
+    }
+
+    pub(crate) async fn prepare_for_update_reserved(
+        &self,
+        permit: OwnedMutexGuard<()>,
+    ) -> BackupResult<BackupRunReport> {
+        let queued = self
+            .create_local_snapshot_locked(RetentionClass::Rolling, false, None)
+            .await?;
+        self.record_snapshot(&queued, Utc::now()).await?;
+        drop(permit);
+        self.prune_queue_if_flush_idle()?;
+        let remote_result = if self.token_store.load()?.is_some() {
+            RemoteResult::QueuedOffline
+        } else {
+            RemoteResult::NotEnrolled
+        };
+        self.snapshot_report(&queued, 0, remote_result)
+    }
+
+    #[cfg(test)]
     pub async fn prepare_for_destructive_import(&self) -> BackupResult<BackupRunReport> {
-        let _guard = self.operation_lock.lock().await;
+        let permit = self.reserve_snapshot().await;
+        self.prepare_for_destructive_import_reserved(permit).await
+    }
+
+    pub(crate) async fn prepare_for_destructive_import_reserved(
+        &self,
+        permit: OwnedMutexGuard<()>,
+    ) -> BackupResult<BackupRunReport> {
+        let queued = self
+            .create_local_snapshot_locked(RetentionClass::Rolling, true, None)
+            .await?;
+        self.record_snapshot(&queued, Utc::now()).await?;
+        drop(permit);
+        self.prune_queue_if_flush_idle()?;
+        self.snapshot_report(&queued, 0, RemoteResult::LocalRecovery)
+    }
+
+    fn prune_queue_if_flush_idle(&self) -> BackupResult<()> {
+        let Ok(_guard) = self.flush_lock.try_lock() else {
+            return Ok(());
+        };
+        self.prune_queue()
+    }
+
+    async fn create_local_snapshot_locked(
+        &self,
+        retention_class: RetentionClass,
+        local_recovery: bool,
+        scheduled_period: Option<String>,
+    ) -> BackupResult<QueuedBackup> {
         let database = self.database.clone();
         let queue_dir = self.queue_dir.clone();
         let recipient = self.recipient.clone();
@@ -724,92 +885,46 @@ impl BackupService {
                 &database,
                 &queue_dir,
                 &recipient,
-                RetentionClass::Rolling,
-                true,
+                retention_class,
+                local_recovery,
+                scheduled_period,
             )
         })
         .await
         .map_err(|_| BackupError::Task)??;
-
-        self.prune_queue()?;
-        let queue = self.list_queue()?;
-        let pending_count = queue
-            .iter()
-            .filter(|item| !item.metadata.local_recovery)
-            .count();
-        let local_recovery_count = queue
-            .iter()
-            .filter(|item| item.metadata.local_recovery)
-            .count();
-        let quarantined_file_count = self.quarantined_file_count()?;
-
-        let mut state = self.read_state().unwrap_or_default();
-        state.last_attempt_at = Some(Utc::now().to_rfc3339());
-        state.last_snapshot_at = Some(queued.metadata.created_at.clone());
-        let _ = self.write_state(&state);
-
-        Ok(BackupRunReport {
-            encrypted_snapshot_created: true,
-            safe_to_continue: true,
-            retention_class: RetentionClass::Rolling,
-            created_at: queued.metadata.created_at,
-            uploaded_count: 0,
-            pending_count,
-            local_recovery_count,
-            queue_healthy: quarantined_file_count == 0,
-            quarantined_file_count,
-            remote_result: RemoteResult::LocalRecovery,
-        })
+        Ok(queued)
     }
 
-    async fn create_and_flush(
+    async fn record_snapshot(
         &self,
-        retention_class: RetentionClass,
-    ) -> BackupResult<BackupRunReport> {
-        let attempted_at = Utc::now();
-        let mut state = self.read_state().unwrap_or_default();
+        queued: &QueuedBackup,
+        attempted_at: DateTime<Utc>,
+    ) -> BackupResult<()> {
+        let _state_guard = self.state_lock.lock().await;
+        let mut state = self.read_state()?;
         state.last_attempt_at = Some(attempted_at.to_rfc3339());
-        state.next_scheduled_at =
-            Some((attempted_at + ChronoDuration::hours(FAILURE_RETRY_HOURS)).to_rfc3339());
-        let _ = self.write_state(&state);
-
-        let database = self.database.clone();
-        let queue_dir = self.queue_dir.clone();
-        let recipient = self.recipient.clone();
-        let queued = tokio::task::spawn_blocking(move || {
-            create_encrypted_snapshot(&database, &queue_dir, &recipient, retention_class, false)
-        })
-        .await
-        .map_err(|_| BackupError::Task)??;
-
-        // Reaching this point means the SQLite snapshot has been encrypted, flushed,
-        // fsynced, and atomically placed in the persistent queue. Remote failures below
-        // are therefore status, not a reason to block an import, update, or local write.
-        let _ = self.prune_queue();
         state.last_snapshot_at = Some(queued.metadata.created_at.clone());
-
-        let enrolled = self.token_store.load().ok().flatten();
-        let (uploaded_count, remote_result) = if let Some(token) = enrolled {
-            match self.flush_queue(&token).await {
-                Ok(uploaded_count) if uploaded_count > 0 => {
-                    state.last_remote_success_at = Some(Utc::now().to_rfc3339());
-                    (uploaded_count, RemoteResult::Uploaded)
-                }
-                Ok(_) => (0, RemoteResult::QueuedOffline),
-                Err(_) => (0, RemoteResult::QueuedOffline),
+        if !queued.metadata.local_recovery {
+            state.next_remote_retry_at = Some(attempted_at.to_rfc3339());
+        }
+        if let Some(period) = queued.metadata.scheduled_period.as_deref() {
+            if let Some(value) = period.strip_prefix("daily:") {
+                state.last_daily_period = Some(value.to_owned());
+            } else if let Some(value) = period.strip_prefix("monthly:") {
+                state.last_monthly_period = Some(value.to_owned());
             }
-        } else {
-            (0, RemoteResult::NotEnrolled)
-        };
-
-        let next_attempt_hours = if remote_result == RemoteResult::QueuedOffline {
-            FAILURE_RETRY_HOURS
-        } else {
-            SCHEDULE_INTERVAL_HOURS
-        };
+        }
         state.next_scheduled_at =
-            Some((attempted_at + ChronoDuration::hours(next_attempt_hours)).to_rfc3339());
-        let _ = self.write_state(&state);
+            Some((attempted_at + ChronoDuration::hours(SCHEDULE_INTERVAL_HOURS)).to_rfc3339());
+        self.write_state(&state)
+    }
+
+    fn snapshot_report(
+        &self,
+        queued: &QueuedBackup,
+        uploaded_count: usize,
+        remote_result: RemoteResult,
+    ) -> BackupResult<BackupRunReport> {
         let queue = self.list_queue()?;
         let pending_count = queue
             .iter()
@@ -823,8 +938,8 @@ impl BackupService {
         Ok(BackupRunReport {
             encrypted_snapshot_created: true,
             safe_to_continue: true,
-            retention_class,
-            created_at: queued.metadata.created_at,
+            retention_class: queued.metadata.retention_class,
+            created_at: queued.metadata.created_at.clone(),
             uploaded_count,
             pending_count,
             local_recovery_count,
@@ -832,6 +947,90 @@ impl BackupService {
             quarantined_file_count,
             remote_result,
         })
+    }
+
+    async fn flush_existing_queue(&self) -> BackupResult<(usize, RemoteResult)> {
+        let _flush_guard = self.flush_lock.lock().await;
+        // Retention mutates the same queue that a remote flush consumes. Keep it
+        // in the serialized flush lane so a stalled upload can never race local
+        // pruning, while snapshot creation and update preflight remain network-free.
+        self.prune_queue()?;
+        let attempted_at = Utc::now();
+        let token = match self.token_store.load()? {
+            Some(token) => token,
+            None => {
+                let _state_guard = self.state_lock.lock().await;
+                let mut state = self.read_state()?;
+                state.next_remote_retry_at = None;
+                state.next_scheduled_at = Some(
+                    (attempted_at + ChronoDuration::hours(SCHEDULE_INTERVAL_HOURS)).to_rfc3339(),
+                );
+                self.write_state(&state)?;
+                return Ok((0, RemoteResult::NotEnrolled));
+            }
+        };
+        {
+            let _state_guard = self.state_lock.lock().await;
+            let mut state = self.read_state()?;
+            state.last_attempt_at = Some(attempted_at.to_rfc3339());
+            self.write_state(&state)?;
+        }
+
+        match self.flush_queue(&token).await {
+            Ok(uploaded_count) => {
+                let pending = self
+                    .list_queue()?
+                    .iter()
+                    .any(|item| !item.metadata.local_recovery);
+                let _state_guard = self.state_lock.lock().await;
+                let mut state = self.read_state()?;
+                if uploaded_count > 0 {
+                    state.last_remote_success_at = Some(Utc::now().to_rfc3339());
+                }
+                state.next_remote_retry_at = pending.then(|| {
+                    (attempted_at + ChronoDuration::hours(FAILURE_RETRY_HOURS)).to_rfc3339()
+                });
+                state.next_scheduled_at = Some(
+                    (attempted_at
+                        + ChronoDuration::hours(if pending {
+                            FAILURE_RETRY_HOURS
+                        } else {
+                            SCHEDULE_INTERVAL_HOURS
+                        }))
+                    .to_rfc3339(),
+                );
+                self.write_state(&state)?;
+                Ok((
+                    uploaded_count,
+                    if uploaded_count > 0 {
+                        RemoteResult::Uploaded
+                    } else {
+                        RemoteResult::QueuedOffline
+                    },
+                ))
+            }
+            Err(error) if gateway_auth_rejected(&error) => {
+                self.token_store.delete()?;
+                let _state_guard = self.state_lock.lock().await;
+                let mut state = self.read_state()?;
+                state.needs_reenrollment = true;
+                state.next_remote_retry_at = None;
+                state.next_scheduled_at = Some(
+                    (attempted_at + ChronoDuration::hours(SCHEDULE_INTERVAL_HOURS)).to_rfc3339(),
+                );
+                self.write_state(&state)?;
+                Ok((0, RemoteResult::NotEnrolled))
+            }
+            Err(_) => {
+                let retry_at = attempted_at + ChronoDuration::hours(FAILURE_RETRY_HOURS);
+                let _state_guard = self.state_lock.lock().await;
+                let mut state = self.read_state()?;
+                state.next_remote_retry_at = Some(retry_at.to_rfc3339());
+                state.next_scheduled_at = Some(retry_at.to_rfc3339());
+                self.write_state(&state)?;
+                Ok((0, RemoteResult::QueuedOffline))
+            }
+        }
     }
 
     async fn flush_queue(&self, token: &str) -> BackupResult<usize> {
@@ -844,66 +1043,147 @@ impl BackupService {
                 self.quarantine_backup(&queued, "ciphertext")?;
                 continue;
             }
+            let mut binding_resets = 0_u8;
+            loop {
+                let reservation: UploadUrlResponse;
+                if let Some(pending) = queued.metadata.upload.clone() {
+                    if validate_backup_id(&pending.backup_id).is_err() {
+                        // A malformed local sidecar must never be sent to the
+                        // gateway, but the verified ciphertext remains useful.
+                        queued.metadata.upload = None;
+                        write_json_atomic(&queued.metadata_path, &queued.metadata)?;
+                        continue;
+                    }
+                    match self.gateway.complete(token, &pending.backup_id).await? {
+                        CompletionProbe::Completed => {
+                            remove_queued_backup(&queued)?;
+                            uploaded_count += 1;
+                            break;
+                        }
+                        CompletionProbe::BindingNotFound => {
+                            binding_resets += 1;
+                            queued.metadata.upload = None;
+                            write_json_atomic(&queued.metadata_path, &queued.metadata)?;
+                            if binding_resets > 1 {
+                                return Err(BackupError::GatewayRejected(404));
+                            }
+                            continue;
+                        }
+                        CompletionProbe::ObjectNotPresent => match pending.stage {
+                            UploadStage::RelayPending => {
+                                match self
+                                    .gateway
+                                    .relay_ciphertext(token, &queued, &pending.backup_id)
+                                    .await
+                                {
+                                    Ok(()) => {
+                                        remove_queued_backup(&queued)?;
+                                        uploaded_count += 1;
+                                        break;
+                                    }
+                                    Err(BackupError::GatewayRejected(404)) => {
+                                        binding_resets += 1;
+                                        queued.metadata.upload = None;
+                                        write_json_atomic(&queued.metadata_path, &queued.metadata)?;
+                                        if binding_resets > 1 {
+                                            return Err(BackupError::GatewayRejected(404));
+                                        }
+                                        continue;
+                                    }
+                                    Err(error) => return Err(error),
+                                }
+                            }
+                            UploadStage::Reserved | UploadStage::Uploaded => {
+                                let refreshed = self.gateway.reserve_upload(token, &queued).await?;
+                                validate_backup_id(&refreshed.backup_id)?;
+                                if refreshed.backup_id != pending.backup_id {
+                                    return Err(BackupError::InvalidGatewayResponse);
+                                }
+                                reservation = refreshed;
+                            }
+                        },
+                    }
+                } else {
+                    let reserved = self.gateway.reserve_upload(token, &queued).await?;
+                    validate_backup_id(&reserved.backup_id)?;
+                    queued.metadata.upload = Some(PendingUpload {
+                        backup_id: reserved.backup_id.clone(),
+                        stage: UploadStage::Reserved,
+                    });
+                    write_json_atomic(&queued.metadata_path, &queued.metadata)?;
 
-            if let Some(pending) = &queued.metadata.upload {
-                match pending.stage {
-                    UploadStage::Uploaded => {
-                        self.gateway.complete(token, &pending.backup_id).await?;
-                        remove_queued_backup(&queued)?;
-                        uploaded_count += 1;
-                        continue;
+                    // The gateway may reuse a still-pending reservation for
+                    // this exact ciphertext. Confirm it before the first local
+                    // PUT so losing/reconstructing a sidecar cannot create a
+                    // second B2 object version.
+                    match self.gateway.complete(token, &reserved.backup_id).await? {
+                        CompletionProbe::Completed => {
+                            remove_queued_backup(&queued)?;
+                            uploaded_count += 1;
+                            break;
+                        }
+                        CompletionProbe::BindingNotFound => {
+                            return Err(BackupError::InvalidGatewayResponse);
+                        }
+                        CompletionProbe::ObjectNotPresent => reservation = reserved,
                     }
-                    UploadStage::RelayPending => {
-                        self.gateway
-                            .relay_ciphertext(token, &queued, &pending.backup_id)
-                            .await?;
-                        remove_queued_backup(&queued)?;
-                        uploaded_count += 1;
-                        continue;
-                    }
-                    UploadStage::Reserved => {}
                 }
-            }
 
-            let reservation = self.gateway.reserve_upload(token, &queued).await?;
-            validate_backup_id(&reservation.backup_id)?;
-            queued.metadata.upload = Some(PendingUpload {
-                backup_id: reservation.backup_id.clone(),
-                stage: UploadStage::Reserved,
-            });
-            write_json_atomic(&queued.metadata_path, &queued.metadata)?;
-
-            if self.gateway.put_ciphertext(&queued, &reservation).await?
-                == DirectUploadOutcome::RelayRequired
-            {
                 queued.metadata.upload = Some(PendingUpload {
                     backup_id: reservation.backup_id.clone(),
-                    stage: UploadStage::RelayPending,
+                    stage: UploadStage::Reserved,
                 });
                 write_json_atomic(&queued.metadata_path, &queued.metadata)?;
+                match self.gateway.put_ciphertext(&queued, &reservation).await? {
+                    DirectUploadOutcome::RelayRequired => {
+                        // A timeout is ambiguous: the direct PUT may have
+                        // landed. Persist relay intent and wait for an
+                        // authenticated completion probe on the next flush.
+                        queued.metadata.upload = Some(PendingUpload {
+                            backup_id: reservation.backup_id,
+                            stage: UploadStage::RelayPending,
+                        });
+                        write_json_atomic(&queued.metadata_path, &queued.metadata)?;
+                        return Err(BackupError::GatewayUnavailable);
+                    }
+                    DirectUploadOutcome::Uploaded => {
+                        queued.metadata.upload = Some(PendingUpload {
+                            backup_id: reservation.backup_id.clone(),
+                            stage: UploadStage::Uploaded,
+                        });
+                        write_json_atomic(&queued.metadata_path, &queued.metadata)?;
+                    }
+                }
 
-                self.gateway
-                    .relay_ciphertext(token, &queued, &reservation.backup_id)
-                    .await?;
-                remove_queued_backup(&queued)?;
-                uploaded_count += 1;
-                continue;
+                match self.gateway.complete(token, &reservation.backup_id).await? {
+                    CompletionProbe::Completed => {
+                        remove_queued_backup(&queued)?;
+                        uploaded_count += 1;
+                        break;
+                    }
+                    CompletionProbe::ObjectNotPresent => {
+                        // Preserve Uploaded: the next run must confirm again
+                        // before it obtains a fresh URL and repeats the PUT.
+                        return Err(BackupError::GatewayRejected(409));
+                    }
+                    CompletionProbe::BindingNotFound => {
+                        binding_resets += 1;
+                        queued.metadata.upload = None;
+                        write_json_atomic(&queued.metadata_path, &queued.metadata)?;
+                        if binding_resets > 1 {
+                            return Err(BackupError::GatewayRejected(404));
+                        }
+                    }
+                }
             }
-            queued.metadata.upload = Some(PendingUpload {
-                backup_id: reservation.backup_id.clone(),
-                stage: UploadStage::Uploaded,
-            });
-            write_json_atomic(&queued.metadata_path, &queued.metadata)?;
-
-            self.gateway.complete(token, &reservation.backup_id).await?;
-            remove_queued_backup(&queued)?;
-            uploaded_count += 1;
         }
         Ok(uploaded_count)
     }
 
     pub async fn status(&self) -> BackupResult<BackupStatusReport> {
-        let state = self.read_state()?;
+        // Queue files can be removed or rebound during a flush. Serialize the
+        // status snapshot with those mutations, but not with local DB snapshots.
+        let _flush_guard = self.flush_lock.lock().await;
         let queue = self.list_queue()?;
         let pending_count = queue
             .iter()
@@ -914,11 +1194,36 @@ impl BackupService {
             .filter(|item| item.metadata.local_recovery)
             .count();
         let quarantined_file_count = self.quarantined_file_count()?;
-        let token = self.token_store.load().ok().flatten();
-        let enrolled = token.is_some();
+        let mut state = {
+            let _state_guard = self.state_lock.lock().await;
+            self.read_state()?
+        };
+        let token = self.token_store.load()?;
+        let mut enrolled = token.is_some();
         let (remote, gateway_reachable) = if let Some(token) = token {
             match self.gateway.status(&token).await {
-                Ok(remote) => (Some(remote), Some(true)),
+                Ok(remote) => {
+                    // The authenticated gateway response is authoritative.
+                    // Reconcile a missing/stale local state file after a crash
+                    // between keyring and state persistence (or state restore).
+                    state.device_id = Some(remote.device_id.clone());
+                    state.needs_reenrollment = false;
+                    let _state_guard = self.state_lock.lock().await;
+                    self.write_state(&state)?;
+                    (Some(remote), Some(true))
+                }
+                Err(error) if gateway_auth_rejected(&error) => {
+                    self.token_store.delete()?;
+                    enrolled = false;
+                    state.needs_reenrollment = true;
+                    state.next_remote_retry_at = None;
+                    let _state_guard = self.state_lock.lock().await;
+                    self.write_state(&state)?;
+                    (None, Some(true))
+                }
+                Err(BackupError::InvalidGatewayResponse) => {
+                    return Err(BackupError::InvalidGatewayResponse);
+                }
                 Err(_) => (None, Some(false)),
             }
         } else {
@@ -926,6 +1231,7 @@ impl BackupService {
         };
         Ok(BackupStatusReport {
             enrolled,
+            needs_reenrollment: state.needs_reenrollment,
             device_id: state.device_id,
             pending_count,
             local_recovery_count,
@@ -941,24 +1247,86 @@ impl BackupService {
     }
 
     pub async fn run_scheduled_if_due(&self) {
-        let due = self
-            .read_state()
-            .ok()
-            .and_then(|state| state.next_scheduled_at)
-            .and_then(|value| DateTime::parse_from_rfc3339(&value).ok())
-            .map(|next| next.with_timezone(&Utc) <= Utc::now())
-            .unwrap_or(true);
-        if !due {
-            return;
+        let _ = self
+            .run_scheduled_at(Utc::now(), Local::now().date_naive())
+            .await;
+    }
+
+    async fn run_scheduled_at(
+        &self,
+        now: DateTime<Utc>,
+        business_date: NaiveDate,
+    ) -> BackupResult<()> {
+        let daily_period = business_date.format("%Y-%m-%d").to_string();
+        let monthly_period = business_date.format("%Y-%m").to_string();
+        let daily_key = format!("daily:{daily_period}");
+        let monthly_key = format!("monthly:{monthly_period}");
+        let permit = self.reserve_snapshot().await;
+        let mut state = {
+            let _state_guard = self.state_lock.lock().await;
+            self.read_state()?
+        };
+        let queued = self.list_queue()?;
+        let daily_materialized = state.last_daily_period.as_deref() == Some(&daily_period)
+            || queued
+                .iter()
+                .any(|item| item.metadata.scheduled_period.as_deref() == Some(daily_key.as_str()));
+        let monthly_materialized = state.last_monthly_period.as_deref() == Some(&monthly_period)
+            || queued.iter().any(|item| {
+                item.metadata.scheduled_period.as_deref() == Some(monthly_key.as_str())
+            });
+        let mut created = false;
+
+        if !daily_materialized {
+            let snapshot = self
+                .create_local_snapshot_locked(RetentionClass::Daily, false, Some(daily_key.clone()))
+                .await?;
+            self.record_snapshot(&snapshot, now).await?;
+            state.last_daily_period = Some(daily_period.clone());
+            created = true;
+        } else if state.last_daily_period.as_deref() != Some(&daily_period) {
+            state.last_daily_period = Some(daily_period.clone());
         }
 
-        let now = Utc::now();
-        let retention = if now.day() == 1 {
-            RetentionClass::Monthly
-        } else {
-            RetentionClass::Daily
-        };
-        let _ = self.backup_now(retention).await;
+        if !monthly_materialized {
+            let snapshot = self
+                .create_local_snapshot_locked(
+                    RetentionClass::Monthly,
+                    false,
+                    Some(monthly_key.clone()),
+                )
+                .await?;
+            self.record_snapshot(&snapshot, now).await?;
+            state.last_monthly_period = Some(monthly_period.clone());
+            created = true;
+        } else if state.last_monthly_period.as_deref() != Some(&monthly_period) {
+            state.last_monthly_period = Some(monthly_period.clone());
+        }
+
+        {
+            let _state_guard = self.state_lock.lock().await;
+            let mut persisted = self.read_state()?;
+            persisted.last_daily_period = state.last_daily_period;
+            persisted.last_monthly_period = state.last_monthly_period;
+            self.write_state(&persisted)?;
+            state = persisted;
+        }
+        drop(permit);
+
+        let pending = self
+            .list_queue()?
+            .iter()
+            .any(|item| !item.metadata.local_recovery);
+        let retry_due = state
+            .next_remote_retry_at
+            .as_deref()
+            .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+            .map(|retry| retry.with_timezone(&Utc) <= now)
+            .unwrap_or(pending);
+        if created || (pending && retry_due) {
+            let _ = self.flush_existing_queue().await?;
+        }
+        Ok(())
     }
 
     fn read_state(&self) -> BackupResult<BackupScheduleState> {
@@ -1084,9 +1452,11 @@ impl BackupService {
 }
 
 fn validate_backup_id(value: &str) -> BackupResult<()> {
-    Uuid::parse_str(value)
-        .map(|_| ())
-        .map_err(|_| BackupError::InvalidGatewayResponse)
+    let parsed = Uuid::parse_str(value).map_err(|_| BackupError::InvalidGatewayResponse)?;
+    if parsed.to_string() != value {
+        return Err(BackupError::InvalidGatewayResponse);
+    }
+    Ok(())
 }
 
 fn create_encrypted_snapshot(
@@ -1095,6 +1465,7 @@ fn create_encrypted_snapshot(
     recipient: &x25519::Recipient,
     retention_class: RetentionClass,
     local_recovery: bool,
+    scheduled_period: Option<String>,
 ) -> BackupResult<QueuedBackup> {
     fs::create_dir_all(queue_dir)?;
     let created_at = Utc::now();
@@ -1143,13 +1514,8 @@ fn create_encrypted_snapshot(
     encrypted_file.flush()?;
     encrypted_file.sync_all()?;
 
-    partial
-        .persist(&final_path)
-        .map_err(|error| BackupError::Io(error.error))?;
-    sync_parent_directory(queue_dir)?;
-
-    let size_bytes = fs::metadata(&final_path)?.len();
-    let sha256 = sha256_file(&final_path)?;
+    let size_bytes = partial.as_file().metadata()?.len();
+    let sha256 = sha256_file(partial.path())?;
     let metadata_path = queue_metadata_path(&final_path);
     let metadata = QueueMetadata {
         format_version: QUEUE_METADATA_VERSION,
@@ -1158,12 +1524,18 @@ fn create_encrypted_snapshot(
         size_bytes,
         sha256,
         local_recovery,
+        scheduled_period,
         upload: None,
     };
-    if let Err(error) = write_json_atomic(&metadata_path, &metadata) {
-        let _ = fs::remove_file(&final_path);
-        return Err(error);
+    // The queue scanner discovers work by ciphertext filename. Publish the
+    // durable metadata first, then atomically rename the ciphertext into view;
+    // a concurrent flush can therefore never reconstruct an incomplete item.
+    write_json_atomic(&metadata_path, &metadata)?;
+    if let Err(error) = partial.persist(&final_path) {
+        let _ = fs::remove_file(&metadata_path);
+        return Err(BackupError::Io(error.error));
     }
+    sync_parent_directory(queue_dir)?;
 
     Ok(QueuedBackup {
         path: final_path,
@@ -1229,6 +1601,7 @@ fn reconstruct_queue_metadata(path: &Path, metadata_path: &Path) -> BackupResult
         size_bytes: file_metadata.len(),
         sha256: sha256_file(path)?,
         local_recovery,
+        scheduled_period: None,
         upload: None,
     };
     write_json_atomic(metadata_path, &metadata)?;
@@ -1304,7 +1677,10 @@ fn sync_parent_directory(_path: &Path) -> BackupResult<()> {
 #[cfg(test)]
 mod tests {
     use std::{
-        sync::{Arc, Mutex as StdMutex},
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc, Mutex as StdMutex,
+        },
         time::Duration,
     };
 
@@ -1319,6 +1695,7 @@ mod tests {
     use rusqlite::params;
     use serde_json::{json, Value};
     use tempfile::TempDir;
+    use tokio::sync::Notify;
 
     use super::*;
 
@@ -1404,6 +1781,673 @@ mod tests {
         assert_ne!(production.service, isolated.service);
         assert!(PlatformTokenStore::for_app_identifier("").is_err());
         assert!(PlatformTokenStore::for_app_identifier("invalid identifier").is_err());
+    }
+
+    #[test]
+    fn definitive_gateway_auth_rejections_are_distinct_from_transient_failures() {
+        assert!(gateway_auth_rejected(&BackupError::GatewayRejected(401)));
+        assert!(gateway_auth_rejected(&BackupError::GatewayRejected(403)));
+        assert!(!gateway_auth_rejected(&BackupError::GatewayRejected(404)));
+        assert!(!gateway_auth_rejected(&BackupError::UploadRejected(403)));
+        assert!(!gateway_auth_rejected(&BackupError::GatewayUnavailable));
+    }
+
+    #[test]
+    fn gateway_identifiers_must_be_canonical_lowercase_uuids() {
+        assert!(validate_backup_id("00000000-0000-4000-8000-000000000001").is_ok());
+        assert!(validate_backup_id("AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA").is_err());
+        assert!(validate_backup_id("00000000000040008000000000000001").is_err());
+        assert!(validate_backup_id("not-a-uuid").is_err());
+    }
+
+    #[tokio::test]
+    async fn scheduler_persists_business_periods_without_duplicate_artifacts_and_catches_up_month()
+    {
+        let temp = TempDir::new().expect("temp");
+        let database = seeded_database(&temp);
+        let identity = x25519::Identity::generate();
+        let service = test_service(
+            &temp,
+            database,
+            &identity,
+            "http://127.0.0.1:9/",
+            Arc::new(MemoryTokenStore::default()),
+        );
+        let first_now = DateTime::parse_from_rfc3339("2026-07-15T05:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let first_date = NaiveDate::from_ymd_opt(2026, 7, 15).unwrap();
+
+        service
+            .run_scheduled_at(first_now, first_date)
+            .await
+            .expect("first periods");
+        let first_queue = service.list_queue().expect("first queue");
+        assert_eq!(first_queue.len(), 2);
+        assert!(first_queue
+            .iter()
+            .any(|item| { item.metadata.scheduled_period.as_deref() == Some("daily:2026-07-15") }));
+        assert!(first_queue
+            .iter()
+            .any(|item| { item.metadata.scheduled_period.as_deref() == Some("monthly:2026-07") }));
+        let state = service.read_state().expect("state");
+        assert_eq!(state.last_daily_period.as_deref(), Some("2026-07-15"));
+        assert_eq!(state.last_monthly_period.as_deref(), Some("2026-07"));
+
+        service
+            .run_scheduled_at(first_now + ChronoDuration::hours(6), first_date)
+            .await
+            .expect("same period retry");
+        assert_eq!(service.list_queue().expect("same queue").len(), 2);
+
+        let next_day = NaiveDate::from_ymd_opt(2026, 7, 16).unwrap();
+        service
+            .run_scheduled_at(first_now + ChronoDuration::days(1), next_day)
+            .await
+            .expect("next day");
+        assert_eq!(service.list_queue().expect("next-day queue").len(), 3);
+
+        let missed_month_day = NaiveDate::from_ymd_opt(2026, 8, 5).unwrap();
+        service
+            .run_scheduled_at(first_now + ChronoDuration::days(21), missed_month_day)
+            .await
+            .expect("missed month catch-up");
+        let caught_up = service.list_queue().expect("catch-up queue");
+        assert_eq!(caught_up.len(), 5);
+        assert!(caught_up
+            .iter()
+            .any(|item| { item.metadata.scheduled_period.as_deref() == Some("monthly:2026-08") }));
+        service
+            .run_scheduled_at(
+                first_now + ChronoDuration::days(21) + ChronoDuration::hours(6),
+                missed_month_day,
+            )
+            .await
+            .expect("catch-up replay");
+        assert_eq!(service.list_queue().expect("deduplicated queue").len(), 5);
+    }
+
+    #[derive(Clone, Default)]
+    struct RetryOnlyState {
+        reserve_attempts: Arc<AtomicUsize>,
+    }
+
+    async fn mock_retry_reject_reserve(
+        State(state): State<RetryOnlyState>,
+    ) -> (AxumStatus, Json<Value>) {
+        state.reserve_attempts.fetch_add(1, Ordering::SeqCst);
+        (
+            AxumStatus::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "temporarily_unavailable"})),
+        )
+    }
+
+    #[tokio::test]
+    async fn six_hour_remote_retry_flushes_existing_queue_without_new_scheduled_snapshots() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let origin = format!("http://{}", listener.local_addr().expect("address"));
+        let state = RetryOnlyState::default();
+        let app = Router::new()
+            .route("/v1/backups/upload-url", post(mock_retry_reject_reserve))
+            .with_state(state.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("mock server");
+        });
+
+        let temp = TempDir::new().expect("temp");
+        let database = seeded_database(&temp);
+        let identity = x25519::Identity::generate();
+        let service = test_service(
+            &temp,
+            database,
+            &identity,
+            &format!("{origin}/"),
+            Arc::new(MemoryTokenStore::with_token("retry-device-token")),
+        );
+        let business_date = Local::now().date_naive();
+        service
+            .run_scheduled_at(Utc::now(), business_date)
+            .await
+            .expect("first scheduled attempt");
+        assert_eq!(state.reserve_attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(service.list_queue().expect("first queue").len(), 2);
+        let retry_at = DateTime::parse_from_rfc3339(
+            service
+                .read_state()
+                .expect("state")
+                .next_remote_retry_at
+                .as_deref()
+                .expect("retry time"),
+        )
+        .unwrap()
+        .with_timezone(&Utc);
+
+        service
+            .run_scheduled_at(retry_at - ChronoDuration::seconds(1), business_date)
+            .await
+            .expect("not due");
+        assert_eq!(state.reserve_attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(service.list_queue().expect("unchanged queue").len(), 2);
+
+        service
+            .run_scheduled_at(retry_at + ChronoDuration::seconds(1), business_date)
+            .await
+            .expect("retry due");
+        assert_eq!(state.reserve_attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(service.list_queue().expect("retry queue").len(), 2);
+
+        server.abort();
+    }
+
+    async fn mock_rejected_device_status() -> (AxumStatus, Json<Value>) {
+        (
+            AxumStatus::UNAUTHORIZED,
+            Json(json!({"error": "invalid_device_token"})),
+        )
+    }
+
+    #[tokio::test]
+    async fn definitive_device_rejection_deletes_token_and_exposes_reenrollment_status() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let origin = format!("http://{}", listener.local_addr().expect("address"));
+        let app = Router::new().route("/v1/backups/status", get(mock_rejected_device_status));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("mock server");
+        });
+
+        let temp = TempDir::new().expect("temp");
+        let database = seeded_database(&temp);
+        let identity = x25519::Identity::generate();
+        let token_store = Arc::new(MemoryTokenStore::with_token("revoked-device-token"));
+        let service = test_service(
+            &temp,
+            database,
+            &identity,
+            &format!("{origin}/"),
+            token_store.clone(),
+        );
+        let status = service.status().await.expect("status");
+        assert!(!status.enrolled);
+        assert!(status.needs_reenrollment);
+        assert_eq!(status.gateway_reachable, Some(true));
+        assert_eq!(token_store.load().expect("token"), None);
+        assert!(service.read_state().expect("state").needs_reenrollment);
+
+        server.abort();
+    }
+
+    async fn mock_authoritative_device_status() -> Json<Value> {
+        Json(json!({
+            "device_id": "00000000-0000-4000-8000-000000000081",
+            "server_time": "2026-07-15T12:00:00Z",
+            "active_pending_uploads": 0,
+            "expired_pending_uploads": 0,
+            "latest_completed": null
+        }))
+    }
+
+    async fn mock_noncanonical_device_status() -> Json<Value> {
+        Json(json!({
+            "device_id": "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA",
+            "server_time": "2026-07-15T12:00:00Z",
+            "active_pending_uploads": 0,
+            "expired_pending_uploads": 0,
+            "latest_completed": null
+        }))
+    }
+
+    #[tokio::test]
+    async fn authenticated_status_reconciles_authoritative_canonical_device_identity() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let origin = format!("http://{}", listener.local_addr().expect("address"));
+        let app = Router::new().route("/v1/backups/status", get(mock_authoritative_device_status));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("mock server");
+        });
+        let temp = TempDir::new().expect("temp");
+        let database = seeded_database(&temp);
+        let identity = x25519::Identity::generate();
+        let service = test_service(
+            &temp,
+            database,
+            &identity,
+            &format!("{origin}/"),
+            Arc::new(MemoryTokenStore::with_token("valid-device-token")),
+        );
+        let mut stale = service.read_state().expect("state");
+        stale.device_id = Some("00000000-0000-4000-8000-000000000099".to_owned());
+        stale.needs_reenrollment = true;
+        service.write_state(&stale).expect("stale state");
+
+        let status = service.status().await.expect("authoritative status");
+        assert_eq!(
+            status.device_id.as_deref(),
+            Some("00000000-0000-4000-8000-000000000081")
+        );
+        assert!(!status.needs_reenrollment);
+        let persisted = service.read_state().expect("reconciled state");
+        assert_eq!(persisted.device_id, status.device_id);
+        assert!(!persisted.needs_reenrollment);
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn successful_status_with_noncanonical_device_id_is_rejected_without_state_change() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let origin = format!("http://{}", listener.local_addr().expect("address"));
+        let app = Router::new().route("/v1/backups/status", get(mock_noncanonical_device_status));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("mock server");
+        });
+        let temp = TempDir::new().expect("temp");
+        let database = seeded_database(&temp);
+        let identity = x25519::Identity::generate();
+        let service = test_service(
+            &temp,
+            database,
+            &identity,
+            &format!("{origin}/"),
+            Arc::new(MemoryTokenStore::with_token("valid-device-token")),
+        );
+        let before = service.read_state().expect("state");
+        assert!(matches!(
+            service.status().await,
+            Err(BackupError::InvalidGatewayResponse)
+        ));
+        assert_eq!(
+            serde_json::to_value(service.read_state().expect("unchanged state")).unwrap(),
+            serde_json::to_value(before).unwrap()
+        );
+
+        server.abort();
+    }
+
+    #[derive(Clone, Default)]
+    struct StalledFlushState {
+        attempts: Arc<AtomicUsize>,
+        entered: Arc<Notify>,
+        release: Arc<Notify>,
+    }
+
+    async fn mock_stalled_reserve(
+        State(state): State<StalledFlushState>,
+    ) -> (AxumStatus, Json<Value>) {
+        state.attempts.fetch_add(1, Ordering::SeqCst);
+        state.entered.notify_one();
+        state.release.notified().await;
+        (
+            AxumStatus::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "released_test_stall"})),
+        )
+    }
+
+    #[tokio::test]
+    async fn update_preflight_snapshots_locally_while_remote_flush_is_stalled() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let origin = format!("http://{}", listener.local_addr().expect("address"));
+        let state = StalledFlushState::default();
+        let app = Router::new()
+            .route("/v1/backups/upload-url", post(mock_stalled_reserve))
+            .with_state(state.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("mock server");
+        });
+
+        let temp = TempDir::new().expect("temp");
+        let database = seeded_database(&temp);
+        let identity = x25519::Identity::generate();
+        let service = test_service(
+            &temp,
+            database.clone(),
+            &identity,
+            &format!("{origin}/"),
+            Arc::new(MemoryTokenStore::with_token("stalled-device-token")),
+        );
+        let flushing_service = service.clone();
+        let flushing =
+            tokio::spawn(async move { flushing_service.backup_now(RetentionClass::Rolling).await });
+        tokio::time::timeout(Duration::from_secs(2), state.entered.notified())
+            .await
+            .expect("remote request entered");
+
+        database
+            .connect()
+            .expect("write connection")
+            .execute(
+                "INSERT INTO customers(id, name, registration_date) VALUES (99, 'During upload', '2026-07-15')",
+                [],
+            )
+            .expect("local write remains available");
+        let preflight = tokio::time::timeout(Duration::from_secs(1), service.prepare_for_update())
+            .await
+            .expect("preflight must not wait for gateway")
+            .expect("local snapshot");
+        assert!(preflight.encrypted_snapshot_created);
+        assert_eq!(preflight.remote_result, RemoteResult::QueuedOffline);
+        assert_eq!(state.attempts.load(Ordering::SeqCst), 1);
+        let mut snapshots_with_write = 0;
+        for (index, queued) in service
+            .list_queue()
+            .expect("preflight queue")
+            .iter()
+            .enumerate()
+        {
+            let plaintext = age::decrypt(
+                &identity,
+                &fs::read(&queued.path).expect("queued ciphertext"),
+            )
+            .expect("decrypt snapshot");
+            let restored_path = temp.path().join(format!("preflight-{index}.sqlite3"));
+            fs::write(&restored_path, plaintext).expect("write restored test snapshot");
+            let restored = Connection::open(restored_path).expect("restored snapshot");
+            let count: i64 = restored
+                .query_row("SELECT COUNT(*) FROM customers WHERE id = 99", [], |row| {
+                    row.get(0)
+                })
+                .expect("written customer count");
+            snapshots_with_write += usize::from(count == 1);
+        }
+        assert_eq!(snapshots_with_write, 1);
+
+        state.release.notify_one();
+        let flush_report = tokio::time::timeout(Duration::from_secs(2), flushing)
+            .await
+            .expect("flush task completed")
+            .expect("flush join")
+            .expect("local backup report");
+        assert_eq!(flush_report.remote_result, RemoteResult::QueuedOffline);
+        assert_eq!(service.list_queue().expect("queue").len(), 2);
+
+        server.abort();
+    }
+
+    const STALE_BACKUP_ID: &str = "00000000-0000-4000-8000-000000000071";
+    const REBOUND_BACKUP_ID: &str = "00000000-0000-4000-8000-000000000072";
+
+    #[derive(Clone, Default)]
+    struct StaleBindingState {
+        origin: Arc<StdMutex<String>>,
+        reserve_attempts: Arc<AtomicUsize>,
+        uploaded_sha256: Arc<StdMutex<Option<String>>>,
+    }
+
+    async fn mock_stale_reserve(
+        State(state): State<StaleBindingState>,
+        Json(body): Json<Value>,
+    ) -> (AxumStatus, Json<Value>) {
+        let attempt = state.reserve_attempts.fetch_add(1, Ordering::SeqCst) + 1;
+        if attempt == 1 {
+            return (
+                AxumStatus::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "force_binding_inspection"})),
+            );
+        }
+        let size = body["content_length"].as_u64().expect("size");
+        let sha256 = body["sha256"].as_str().expect("sha256");
+        let origin = state.origin.lock().expect("origin").clone();
+        (
+            AxumStatus::OK,
+            Json(json!({
+                "backup_id": REBOUND_BACKUP_ID,
+                "retention_class": "rolling",
+                "method": "PUT",
+                "upload_url": format!("{origin}/object"),
+                "required_headers": {
+                    "content-length": size.to_string(),
+                    "x-amz-content-sha256": "UNSIGNED-PAYLOAD",
+                    "x-amz-meta-sha256": sha256,
+                    "x-amz-server-side-encryption": "AES256"
+                },
+                "expires_at": "2026-07-15T12:15:00Z"
+            })),
+        )
+    }
+
+    async fn mock_stale_object(State(state): State<StaleBindingState>, body: Bytes) -> AxumStatus {
+        *state.uploaded_sha256.lock().expect("uploaded sha") =
+            Some(format!("{:x}", Sha256::digest(&body)));
+        AxumStatus::OK
+    }
+
+    async fn mock_stale_complete(
+        State(state): State<StaleBindingState>,
+        Json(body): Json<Value>,
+    ) -> (AxumStatus, Json<Value>) {
+        let backup_id = body["backup_id"].as_str().unwrap_or_default();
+        if backup_id == STALE_BACKUP_ID {
+            return (
+                AxumStatus::NOT_FOUND,
+                Json(json!({"error": {"code": "not_found", "message": "not found"}})),
+            );
+        }
+        if state
+            .uploaded_sha256
+            .lock()
+            .expect("uploaded sha")
+            .is_none()
+        {
+            return (
+                AxumStatus::CONFLICT,
+                Json(json!({"error": {"code": "object_not_present", "message": "not present"}})),
+            );
+        }
+        (
+            AxumStatus::OK,
+            Json(json!({
+                "backup_id": backup_id,
+                "status": "completed",
+                "completed_at": "2026-07-15T12:01:00Z",
+                "etag": "rebound-etag",
+                "version_id": "rebound-version-1"
+            })),
+        )
+    }
+
+    async fn mock_stale_relay(
+        AxumPath(backup_id): AxumPath<String>,
+        _body: Bytes,
+    ) -> (AxumStatus, Json<Value>) {
+        assert_eq!(backup_id, STALE_BACKUP_ID);
+        (
+            AxumStatus::CONFLICT,
+            Json(json!({"error": "stale_backup_id"})),
+        )
+    }
+
+    async fn exercise_stale_binding(stage: UploadStage) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let origin = format!("http://{}", listener.local_addr().expect("address"));
+        let state = StaleBindingState::default();
+        *state.origin.lock().expect("origin") = origin.clone();
+        let app = Router::new()
+            .route("/v1/backups/upload-url", post(mock_stale_reserve))
+            .route("/v1/backups/relay/{backup_id}", put(mock_stale_relay))
+            .route("/v1/backups/complete", post(mock_stale_complete))
+            .route("/object", put(mock_stale_object))
+            .with_state(state.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("mock server");
+        });
+
+        let temp = TempDir::new().expect("temp");
+        let database = seeded_database(&temp);
+        let identity = x25519::Identity::generate();
+        let service = test_service(
+            &temp,
+            database,
+            &identity,
+            &format!("{origin}/"),
+            Arc::new(MemoryTokenStore::with_token("stale-device-token")),
+        );
+        service
+            .prepare_for_update()
+            .await
+            .expect("queued local snapshot");
+        let mut queued = service.list_queue().expect("queue").remove(0);
+        let original_ciphertext = fs::read(&queued.path).expect("ciphertext");
+        let original_sha256 = format!("{:x}", Sha256::digest(&original_ciphertext));
+        queued.metadata.upload = Some(PendingUpload {
+            backup_id: STALE_BACKUP_ID.to_owned(),
+            stage,
+        });
+        write_json_atomic(&queued.metadata_path, &queued.metadata).expect("stale binding");
+
+        let first_error = service
+            .flush_queue("stale-device-token")
+            .await
+            .expect_err("the first re-reservation is forced to fail");
+        assert!(
+            matches!(first_error, BackupError::GatewayRejected(503)),
+            "unexpected first re-reservation error: {first_error:?}"
+        );
+        let rebound = service.list_queue().expect("preserved queue").remove(0);
+        assert!(rebound.metadata.upload.is_none());
+        assert_eq!(
+            fs::read(&rebound.path).expect("preserved ciphertext"),
+            original_ciphertext
+        );
+
+        assert_eq!(
+            service
+                .flush_queue("stale-device-token")
+                .await
+                .expect("re-reserved upload"),
+            1
+        );
+        assert!(service.list_queue().expect("empty queue").is_empty());
+        assert_eq!(
+            state
+                .uploaded_sha256
+                .lock()
+                .expect("uploaded sha")
+                .as_deref(),
+            Some(original_sha256.as_str())
+        );
+        assert_eq!(state.reserve_attempts.load(Ordering::SeqCst), 2);
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn stale_uploaded_404_clears_only_binding_then_re_reserves_same_ciphertext() {
+        exercise_stale_binding(UploadStage::Uploaded).await;
+    }
+
+    #[tokio::test]
+    async fn stale_relay_pending_404_clears_only_binding_then_re_reserves_same_ciphertext() {
+        exercise_stale_binding(UploadStage::RelayPending).await;
+    }
+
+    async fn mock_mismatched_retention_reserve(
+        State(state): State<StaleBindingState>,
+        Json(body): Json<Value>,
+    ) -> Json<Value> {
+        let origin = state.origin.lock().expect("origin").clone();
+        Json(json!({
+            "backup_id": REBOUND_BACKUP_ID,
+            "retention_class": "monthly",
+            "method": "PUT",
+            "upload_url": format!("{origin}/object"),
+            "required_headers": {
+                "content-length": body["content_length"].as_u64().unwrap().to_string(),
+                "x-amz-content-sha256": "UNSIGNED-PAYLOAD",
+                "x-amz-meta-sha256": body["sha256"],
+                "x-amz-server-side-encryption": "AES256"
+            },
+            "expires_at": "2026-07-15T12:15:00Z"
+        }))
+    }
+
+    #[tokio::test]
+    async fn reservation_retention_class_must_match_the_queued_lifecycle() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let origin = format!("http://{}", listener.local_addr().expect("address"));
+        let state = StaleBindingState::default();
+        *state.origin.lock().expect("origin") = origin.clone();
+        let app = Router::new()
+            .route(
+                "/v1/backups/upload-url",
+                post(mock_mismatched_retention_reserve),
+            )
+            .with_state(state);
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("mock server");
+        });
+        let temp = TempDir::new().expect("temp");
+        let database = seeded_database(&temp);
+        let identity = x25519::Identity::generate();
+        let service = test_service(
+            &temp,
+            database,
+            &identity,
+            &format!("{origin}/"),
+            Arc::new(MemoryTokenStore::with_token("device-token")),
+        );
+        service.prepare_for_update().await.expect("local snapshot");
+        assert!(matches!(
+            service.flush_queue("device-token").await,
+            Err(BackupError::InvalidGatewayResponse)
+        ));
+        assert!(service.list_queue().expect("queue")[0]
+            .metadata
+            .upload
+            .is_none());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn noncanonical_backup_id_in_local_metadata_is_never_sent_and_only_binding_is_cleared() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let origin = format!("http://{}", listener.local_addr().expect("address"));
+        let retry = RetryOnlyState::default();
+        let app = Router::new()
+            .route("/v1/backups/upload-url", post(mock_retry_reject_reserve))
+            .with_state(retry);
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("mock server");
+        });
+        let temp = TempDir::new().expect("temp");
+        let database = seeded_database(&temp);
+        let identity = x25519::Identity::generate();
+        let service = test_service(
+            &temp,
+            database,
+            &identity,
+            &format!("{origin}/"),
+            Arc::new(MemoryTokenStore::with_token("device-token")),
+        );
+        service.prepare_for_update().await.expect("local snapshot");
+        let mut queued = service.list_queue().expect("queue").remove(0);
+        queued.metadata.upload = Some(PendingUpload {
+            backup_id: "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA".to_owned(),
+            stage: UploadStage::Uploaded,
+        });
+        write_json_atomic(&queued.metadata_path, &queued.metadata).expect("metadata");
+        assert!(matches!(
+            service.flush_queue("device-token").await,
+            Err(BackupError::GatewayRejected(503))
+        ));
+        let preserved = service.list_queue().expect("preserved queue").remove(0);
+        assert!(preserved.metadata.upload.is_none());
+        assert!(preserved.path.exists());
+        server.abort();
     }
 
     #[tokio::test]
@@ -1525,7 +2569,7 @@ mod tests {
         State(state): State<MockObservations>,
         headers: AxumHeaders,
         Json(body): Json<Value>,
-    ) -> Json<Value> {
+    ) -> (AxumStatus, Json<Value>) {
         assert_eq!(
             headers
                 .get("authorization")
@@ -1533,14 +2577,23 @@ mod tests {
             Some("Bearer secret-device-token")
         );
         assert_eq!(body["backup_id"], "00000000-0000-4000-8000-000000000002");
+        if !*state.uploaded_without_bearer.lock().expect("uploaded") {
+            return (
+                AxumStatus::CONFLICT,
+                Json(json!({"error": {"code": "object_not_present", "message": "not present"}})),
+            );
+        }
         *state.completed.lock().expect("completed") = true;
-        Json(json!({
-            "backup_id": body["backup_id"],
-            "status": "completed",
-            "completed_at": "2026-07-14T12:01:00Z",
-            "etag": "test-etag",
-            "version_id": null
-        }))
+        (
+            AxumStatus::OK,
+            Json(json!({
+                "backup_id": body["backup_id"],
+                "status": "completed",
+                "completed_at": "2026-07-14T12:01:00Z",
+                "etag": "test-etag",
+                "version_id": "test-version-1"
+            })),
+        )
     }
 
     async fn mock_status(headers: AxumHeaders) -> Json<Value> {
@@ -1631,6 +2684,7 @@ mod tests {
         reserve_count: Arc<StdMutex<usize>>,
         relay_count: Arc<StdMutex<usize>>,
         complete_count: Arc<StdMutex<usize>>,
+        object_versions: Arc<StdMutex<usize>>,
         fail_first_relay: Arc<StdMutex<bool>>,
         invalid_successes_before_valid: Arc<StdMutex<usize>>,
         expected_size: Arc<StdMutex<u64>>,
@@ -1715,6 +2769,12 @@ mod tests {
             *relay_count += 1;
             *relay_count
         };
+        {
+            let mut versions = state.object_versions.lock().expect("object versions");
+            if *versions == 0 {
+                *versions = 1;
+            }
+        }
         let fail_first = *state.fail_first_relay.lock().expect("fail first relay");
         if fail_first && attempt == 1 {
             return (
@@ -1727,16 +2787,11 @@ mod tests {
             .lock()
             .expect("invalid successes");
         if attempt <= invalid_successes {
-            let (response_backup_id, response_status) = if attempt == 1 {
-                ("00000000-0000-4000-8000-000000000099", "completed")
-            } else {
-                (backup_id.as_str(), "pending")
-            };
             return (
                 AxumStatus::OK,
                 Json(json!({
-                    "backup_id": response_backup_id,
-                    "status": response_status,
+                    "backup_id": backup_id,
+                    "status": "completed",
                     "completed_at": "2026-07-15T12:01:00Z",
                     "etag": "invalid-relay-etag",
                     "version_id": null
@@ -1751,16 +2806,31 @@ mod tests {
                 "status": "completed",
                 "completed_at": "2026-07-15T12:01:00Z",
                 "etag": "relay-etag",
-                "version_id": null
+                "version_id": "relay-version-1"
             })),
         )
     }
 
-    async fn mock_relay_complete(State(state): State<RelayMockState>) -> (AxumStatus, Json<Value>) {
+    async fn mock_relay_complete(
+        State(state): State<RelayMockState>,
+        Json(body): Json<Value>,
+    ) -> (AxumStatus, Json<Value>) {
         *state.complete_count.lock().expect("complete count") += 1;
+        if *state.object_versions.lock().expect("object versions") == 0 {
+            return (
+                AxumStatus::CONFLICT,
+                Json(json!({"error": {"code": "object_not_present", "message": "not present"}})),
+            );
+        }
         (
             AxumStatus::OK,
-            Json(json!({"status": "unexpected_complete"})),
+            Json(json!({
+                "backup_id": body["backup_id"],
+                "status": "completed",
+                "completed_at": "2026-07-15T12:01:00Z",
+                "etag": "relay-etag",
+                "version_id": "relay-version-1"
+            })),
         )
     }
 
@@ -1768,8 +2838,22 @@ mod tests {
         AxumStatus::SERVICE_UNAVAILABLE
     }
 
+    async fn mock_ambiguous_direct_put(
+        State(state): State<RelayMockState>,
+        body: Bytes,
+    ) -> AxumStatus {
+        assert_eq!(
+            body.len() as u64,
+            *state.expected_size.lock().expect("size")
+        );
+        *state.object_versions.lock().expect("object versions") += 1;
+        // Model an object store/proxy that persisted the body but returned an
+        // error, leaving the client unable to infer whether the PUT landed.
+        AxumStatus::SERVICE_UNAVAILABLE
+    }
+
     #[tokio::test]
-    async fn tls_transport_failure_relay_is_ciphertext_only_and_retries_same_reservation() {
+    async fn lost_relay_response_is_confirmed_without_a_second_object_version() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("listener");
@@ -1818,11 +2902,15 @@ mod tests {
             &format!("{origin}/"),
             Arc::new(MemoryTokenStore::with_token("relay-device-token")),
         );
+        assert!(matches!(
+            restarted_service.flush_queue("relay-device-token").await,
+            Err(BackupError::GatewayRejected(502))
+        ));
         assert_eq!(
             restarted_service
                 .flush_queue("relay-device-token")
                 .await
-                .expect("relay retry"),
+                .expect("completion confirmation"),
             1
         );
         assert!(restarted_service
@@ -1830,8 +2918,9 @@ mod tests {
             .expect("empty queue")
             .is_empty());
         assert_eq!(*state.reserve_count.lock().expect("reserve count"), 1);
-        assert_eq!(*state.relay_count.lock().expect("relay count"), 2);
-        assert_eq!(*state.complete_count.lock().expect("complete count"), 0);
+        assert_eq!(*state.relay_count.lock().expect("relay count"), 1);
+        assert_eq!(*state.object_versions.lock().expect("object versions"), 1);
+        assert_eq!(*state.complete_count.lock().expect("complete count"), 3);
 
         server.abort();
     }
@@ -1877,13 +2966,63 @@ mod tests {
         );
         assert_eq!(*state.reserve_count.lock().expect("reserve count"), 1);
         assert_eq!(*state.relay_count.lock().expect("relay count"), 0);
-        assert_eq!(*state.complete_count.lock().expect("complete count"), 0);
+        assert_eq!(*state.complete_count.lock().expect("complete count"), 1);
 
         server.abort();
     }
 
     #[tokio::test]
-    async fn relay_requires_matching_completed_response_before_deleting_queue() {
+    async fn ambiguous_direct_put_is_confirmed_without_a_second_object_version() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let origin = format!("http://{}", listener.local_addr().expect("address"));
+        let state = RelayMockState::default();
+        *state.direct_upload_url.lock().expect("direct upload url") = format!("{origin}/object");
+        let app = Router::new()
+            .route("/v1/backups/upload-url", post(mock_relay_reserve))
+            .route("/object", put(mock_ambiguous_direct_put))
+            .route("/v1/backups/relay/{backup_id}", put(mock_relay_upload))
+            .route("/v1/backups/complete", post(mock_relay_complete))
+            .with_state(state.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("mock server");
+        });
+
+        let temp = TempDir::new().expect("temp");
+        let database = seeded_database(&temp);
+        let identity = x25519::Identity::generate();
+        let service = test_service(
+            &temp,
+            database,
+            &identity,
+            &format!("{origin}/"),
+            Arc::new(MemoryTokenStore::with_token("relay-device-token")),
+        );
+        let first = service
+            .backup_now(RetentionClass::Rolling)
+            .await
+            .expect("local snapshot remains queued");
+        assert_eq!(first.remote_result, RemoteResult::QueuedOffline);
+        assert_eq!(*state.object_versions.lock().expect("object versions"), 1);
+        assert_eq!(
+            service
+                .flush_queue("relay-device-token")
+                .await
+                .expect("confirm ambiguous direct PUT"),
+            1
+        );
+        assert!(service.list_queue().expect("empty queue").is_empty());
+        assert_eq!(*state.object_versions.lock().expect("object versions"), 1);
+        assert_eq!(*state.reserve_count.lock().expect("reserve count"), 1);
+        assert_eq!(*state.relay_count.lock().expect("relay count"), 0);
+        assert_eq!(*state.complete_count.lock().expect("complete count"), 2);
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn relay_requires_durable_version_evidence_before_deleting_queue() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("listener");
@@ -1894,7 +3033,7 @@ mod tests {
         *state
             .invalid_successes_before_valid
             .lock()
-            .expect("invalid successes") = 2;
+            .expect("invalid successes") = 1;
         let app = Router::new()
             .route("/v1/backups/upload-url", post(mock_relay_reserve))
             .route("/v1/backups/relay/{backup_id}", put(mock_relay_upload))
@@ -1936,8 +3075,9 @@ mod tests {
         );
         assert!(service.list_queue().expect("empty queue").is_empty());
         assert_eq!(*state.reserve_count.lock().expect("reserve count"), 1);
-        assert_eq!(*state.relay_count.lock().expect("relay count"), 3);
-        assert_eq!(*state.complete_count.lock().expect("complete count"), 0);
+        assert_eq!(*state.relay_count.lock().expect("relay count"), 1);
+        assert_eq!(*state.object_versions.lock().expect("object versions"), 1);
+        assert_eq!(*state.complete_count.lock().expect("complete count"), 3);
 
         server.abort();
     }
@@ -1960,6 +3100,7 @@ mod tests {
                 size_bytes: 3,
                 sha256: "a".repeat(64),
                 local_recovery: false,
+                scheduled_period: None,
                 upload: None,
             },
         }
@@ -1968,6 +3109,7 @@ mod tests {
     fn valid_production_reservation() -> UploadUrlResponse {
         UploadUrlResponse {
             backup_id: "00000000-0000-4000-8000-000000000002".to_owned(),
+            retention_class: RetentionClass::Rolling,
             method: "PUT".to_owned(),
             upload_url: concat!(
                 "https://s3.us-west-004.backblazeb2.com/",

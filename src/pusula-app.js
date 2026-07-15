@@ -1,6 +1,9 @@
 import { escapeHtml, formatIsoDateDashed, formatIsoDateSlashed } from './html-safety.js';
 
 (() => {
+  const pendingPaymentStorageKey = 'pusula-payment-requests-v1';
+  const pendingPaymentStorageMaxChars = 64 * 1024;
+  const pendingPaymentEntryLimit = 256;
   const state = {
     customers: [],
     customerBase: [],
@@ -26,12 +29,15 @@ import { escapeHtml, formatIsoDateDashed, formatIsoDateSlashed } from './html-sa
     currentInstallmentPayment: null,
     pendingInstallmentId: null,
     pendingPaymentId: null,
+    paymentOperations: new Set(),
+    pendingPaymentRequests: new Map(),
     offlineSnapshot: null,
     offlineLastSyncedAt: '',
     hasOfflineSnapshot: false,
     isOfflineMode: false,
     isSyncingOfflineSnapshot: false,
   };
+  restorePendingPaymentRequests();
 
   const apiBase = (window.PusulaApp && PusulaApp.apiBase) || '';
   const wpNonce = (window.PusulaApp && PusulaApp.nonce) || '';
@@ -68,10 +74,8 @@ import { escapeHtml, formatIsoDateDashed, formatIsoDateSlashed } from './html-sa
 
   function createClientRequestKey(scope) {
     const prefix = String(scope || 'request').replace(/[^a-z0-9_-]/gi, '').toLowerCase() || 'request';
-    if (window.crypto && typeof window.crypto.randomUUID === 'function') {
-      return `${prefix}-${window.crypto.randomUUID()}`;
-    }
-    return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const randomPart = secureClientRandomPart();
+    return randomPart ? `${prefix}-${randomPart}`.slice(0, 64) : null;
   }
 
   function normalizeUrl(url) {
@@ -391,7 +395,142 @@ import { escapeHtml, formatIsoDateDashed, formatIsoDateSlashed } from './html-sa
       activateTab('search');
     }
 
+    refreshPaymentOperationUi();
     updateOfflineBanner();
+  }
+
+  function paymentOperationKey(installmentId) {
+    return String(installmentId || '');
+  }
+
+  function secureClientRandomPart() {
+    try {
+      if (window.crypto && typeof window.crypto.randomUUID === 'function') {
+        return window.crypto.randomUUID();
+      }
+      if (window.crypto && typeof window.crypto.getRandomValues === 'function') {
+        const bytes = new Uint8Array(16);
+        window.crypto.getRandomValues(bytes);
+        return Array.from(bytes, (value) => value.toString(16).padStart(2, '0')).join('');
+      }
+    } catch (error) {
+      console.warn('Secure request randomness is unavailable', error);
+    }
+    return '';
+  }
+
+  function restorePendingPaymentRequests() {
+    try {
+      const serialized = window.localStorage.getItem(pendingPaymentStorageKey);
+      if (!serialized) return;
+      if (serialized.length > pendingPaymentStorageMaxChars) {
+        console.warn('Pending payment request state exceeded the safe size limit');
+        return;
+      }
+      const parsed = JSON.parse(serialized);
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return;
+      const entries = Object.entries(parsed);
+      if (entries.length > pendingPaymentEntryLimit) {
+        console.warn('Pending payment request state exceeded the safe entry limit');
+        return;
+      }
+      entries.forEach(([operationKey, pending]) => {
+        if (!/^[1-9]\d{0,18}$/.test(operationKey) || !pending || typeof pending !== 'object') return;
+        const fingerprint = String(pending.fingerprint || '');
+        const requestKey = String(pending.requestKey || '');
+        if (!/^\d{1,18}:\d{4}-\d{2}-\d{2}$/.test(fingerprint)) return;
+        if (!/^payment:[A-Za-z0-9-]+$/.test(requestKey) || requestKey.length > 64) return;
+        state.pendingPaymentRequests.set(operationKey, { fingerprint, requestKey });
+      });
+    } catch (error) {
+      console.warn('Pending payment request state could not be restored', error);
+    }
+  }
+
+  function persistPendingPaymentRequests() {
+    try {
+      const serialized = Object.fromEntries(state.pendingPaymentRequests.entries());
+      window.localStorage.setItem(pendingPaymentStorageKey, JSON.stringify(serialized));
+      return true;
+    } catch (error) {
+      console.warn('Pending payment request state could not be stored', error);
+      return false;
+    }
+  }
+
+  function paymentRequestKey(installmentId, amount, paymentDate) {
+    const operationKey = paymentOperationKey(installmentId);
+    const fingerprint = `${Math.round(Number(amount) * 100)}:${paymentDate}`;
+    const pending = state.pendingPaymentRequests.get(operationKey);
+    if (pending && pending.fingerprint === fingerprint) return pending.requestKey;
+    if (!/^[1-9]\d{0,18}$/.test(operationKey)
+      || !/^\d{1,18}:\d{4}-\d{2}-\d{2}$/.test(fingerprint)
+      || (!pending && state.pendingPaymentRequests.size >= pendingPaymentEntryLimit)) return null;
+
+    const randomPart = secureClientRandomPart();
+    if (!randomPart) return null;
+    const requestKey = `payment:${randomPart}`.slice(0, 64);
+    state.pendingPaymentRequests.set(operationKey, { fingerprint, requestKey });
+    if (!persistPendingPaymentRequests()) {
+      state.pendingPaymentRequests.delete(operationKey);
+      return null;
+    }
+    return requestKey;
+  }
+
+  function clearPaymentRequest(installmentId, requestKey) {
+    const operationKey = paymentOperationKey(installmentId);
+    const pending = state.pendingPaymentRequests.get(operationKey);
+    if (pending && pending.requestKey === requestKey) {
+      state.pendingPaymentRequests.delete(operationKey);
+      if (!persistPendingPaymentRequests()) {
+        state.pendingPaymentRequests.set(operationKey, pending);
+        console.warn('Confirmed payment intent remains stored for safe replay');
+        return false;
+      }
+    }
+    return true;
+  }
+
+  function beginPaymentOperation(installmentId) {
+    const operationKey = paymentOperationKey(installmentId);
+    if (!operationKey || state.paymentOperations.has(operationKey)) return false;
+    state.paymentOperations.add(operationKey);
+    refreshPaymentOperationUi();
+    return true;
+  }
+
+  function endPaymentOperation(installmentId) {
+    state.paymentOperations.delete(paymentOperationKey(installmentId));
+    refreshPaymentOperationUi();
+  }
+
+  function refreshPaymentOperationUi() {
+    const installment = state.currentInstallment;
+    const installmentBusy = Boolean(installment && state.paymentOperations.has(paymentOperationKey(installment.id)));
+    const installmentRemaining = installment ? installmentRemainingAmount(installment) : 0;
+    const installmentPaid = installment ? installmentPaidAmount(installment) : 0;
+    const addButton = document.getElementById('btn-add-payment');
+    const remainingButton = document.getElementById('btn-mark-paid');
+    const resetButton = document.getElementById('btn-mark-unpaid');
+    const installmentInput = document.getElementById('inst-pay-amount');
+    if (addButton) addButton.disabled = state.isOfflineMode || installmentBusy || !(installmentRemaining > 0);
+    if (remainingButton) remainingButton.disabled = state.isOfflineMode || installmentBusy || !(installmentRemaining > 0);
+    if (resetButton) resetButton.disabled = state.isOfflineMode || installmentBusy || !(installmentPaid > 0);
+    if (installmentInput) installmentInput.disabled = state.isOfflineMode || installmentBusy;
+
+    const expected = state.currentExpected;
+    const expectedBusy = Boolean(expected && state.paymentOperations.has(paymentOperationKey(expected.installment_id)));
+    const expectedRemaining = expected ? installmentRemainingAmount(expected) : 0;
+    const expectedLastPaymentDate = expected && expected.last_payment_date ? String(expected.last_payment_date) : '';
+    const canUndoExpected = Boolean(expected && expected.last_payment_id)
+      && expectedLastPaymentDate === formatISODate(new Date());
+    const expectedPayButton = document.getElementById('exp-mark-paid');
+    const expectedUndoButton = document.getElementById('exp-mark-unpaid');
+    const expectedInput = document.getElementById('exp-pay-amount');
+    if (expectedPayButton) expectedPayButton.disabled = state.isOfflineMode || expectedBusy || !(expectedRemaining > 0);
+    if (expectedUndoButton) expectedUndoButton.disabled = state.isOfflineMode || expectedBusy || !canUndoExpected;
+    if (expectedInput) expectedInput.disabled = state.isOfflineMode || expectedBusy;
   }
 
   function stopAutoRefresh() {
@@ -1888,6 +2027,11 @@ import { escapeHtml, formatIsoDateDashed, formatIsoDateSlashed } from './html-sa
           });
         }
       }
+      const saleRequestKey = createClientRequestKey('sale');
+      if (!saleRequestKey) {
+        setStatus('Satış güvenli yeniden deneme anahtarı oluşturulamadığı için işlem başlatılmadı.', true);
+        return;
+      }
       setStatus('Kaydediliyor...');
       const sale = await api('/sales', {
         method: 'POST',
@@ -1896,7 +2040,7 @@ import { escapeHtml, formatIsoDateDashed, formatIsoDateSlashed } from './html-sa
           date: saleDateISO,
           total,
           description: desc,
-          request_key: createClientRequestKey('sale'),
+          request_key: saleRequestKey,
           down_payment: effectiveDown,
           installments: instList,
         }),
@@ -2451,15 +2595,30 @@ import { escapeHtml, formatIsoDateDashed, formatIsoDateSlashed } from './html-sa
       setStatus('Tahsilat tutarı kalan borçtan büyük olamaz.', true);
       return;
     }
+    if (!beginPaymentOperation(inst.id)) return;
+    const paymentDate = formatISODate(new Date());
+    const requestKey = paymentRequestKey(inst.id, normalizedAmount, paymentDate);
+    if (!requestKey) {
+      endPaymentOperation(inst.id);
+      setStatus('Tahsilat güvenli yeniden deneme kaydı oluşturulamadığı için işlem başlatılmadı.', true);
+      return;
+    }
 
     try {
       setInstallmentsLoading(true);
       const result = await api(`/installments/${inst.id}/payments`, {
         method: 'POST',
-        body: JSON.stringify({ amount: normalizedAmount }),
+        body: JSON.stringify({
+          amount: normalizedAmount,
+          payment_date: paymentDate,
+          request_key: requestKey,
+        }),
       });
+      const paymentIntentCleared = clearPaymentRequest(inst.id, requestKey);
       const payment = result && result.payment ? result.payment : null;
-      setStatus('Tahsilat kaydedildi.');
+      setStatus(paymentIntentCleared
+        ? 'Tahsilat kaydedildi.'
+        : 'Tahsilat kaydedildi; güvenli yeniden deneme kaydı temizlenemedi ve aynı işlem tekrar doğrulanabilir.');
       state.pendingInstallmentId = inst.id;
       state.pendingPaymentId = payment && payment.id ? payment.id : null;
 
@@ -2471,9 +2630,16 @@ import { escapeHtml, formatIsoDateDashed, formatIsoDateSlashed } from './html-sa
       if (state.selected) await loadSales(state.selected.id, state.currentSale ? state.currentSale.id : null);
       scheduleOfflineSnapshotSync();
     } catch (err) {
-      setStatus(`Hata: ${trErrorMessage(err.message)}`, true);
+      let paymentIntentWarning = '';
+      if (String(err && err.message ? err.message : err).includes('istek anahtarı farklı bir tahsilat')) {
+        if (!clearPaymentRequest(inst.id, requestKey)) {
+          paymentIntentWarning = ' Güvenli yeniden deneme kaydı temizlenemedi.';
+        }
+      }
+      setStatus(`Hata: ${trErrorMessage(err.message)}${paymentIntentWarning}`, true);
     } finally {
       setInstallmentsLoading(false);
+      endPaymentOperation(inst.id);
     }
   }
 
@@ -3444,13 +3610,28 @@ import { escapeHtml, formatIsoDateDashed, formatIsoDateSlashed } from './html-sa
       setStatus('Tahsilat tutarı kalan borçtan büyük olamaz.', true);
       return;
     }
+    if (!beginPaymentOperation(instId)) return;
+    const paymentDate = formatISODate(new Date());
+    const requestKey = paymentRequestKey(instId, normalizedAmount, paymentDate);
+    if (!requestKey) {
+      endPaymentOperation(instId);
+      setStatus('Tahsilat güvenli yeniden deneme kaydı oluşturulamadığı için işlem başlatılmadı.', true);
+      return;
+    }
     try {
       setExpectedLoading(true);
       const result = await api(`/installments/${instId}/payments`, {
         method: 'POST',
-        body: JSON.stringify({ amount: normalizedAmount }),
+        body: JSON.stringify({
+          amount: normalizedAmount,
+          payment_date: paymentDate,
+          request_key: requestKey,
+        }),
       });
-      setStatus('Tahsilat kaydedildi.');
+      const paymentIntentCleared = clearPaymentRequest(instId, requestKey);
+      setStatus(paymentIntentCleared
+        ? 'Tahsilat kaydedildi.'
+        : 'Tahsilat kaydedildi; güvenli yeniden deneme kaydı temizlenemedi ve aynı işlem tekrar doğrulanabilir.');
       const payment = result && result.payment ? result.payment : null;
       const updatedInstallment = result && result.installment ? result.installment : null;
       const updatedRow = {
@@ -3480,9 +3661,16 @@ import { escapeHtml, formatIsoDateDashed, formatIsoDateSlashed } from './html-sa
       }
       scheduleOfflineSnapshotSync();
     } catch (err) {
-      setStatus(`Hata: ${trErrorMessage(err.message)}`, true);
+      let paymentIntentWarning = '';
+      if (String(err && err.message ? err.message : err).includes('istek anahtarı farklı bir tahsilat')) {
+        if (!clearPaymentRequest(instId, requestKey)) {
+          paymentIntentWarning = ' Güvenli yeniden deneme kaydı temizlenemedi.';
+        }
+      }
+      setStatus(`Hata: ${trErrorMessage(err.message)}${paymentIntentWarning}`, true);
     } finally {
       setExpectedLoading(false);
+      endPaymentOperation(instId);
     }
   }
 

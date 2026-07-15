@@ -1,0 +1,143 @@
+{
+  "schema_version": 2,
+  "repository": "stronganchor/pusula-desktop",
+  "version": "0.1.0",
+  "candidate": {
+    "tag": "v0.1.0-candidate.0000000000000000000000000000000000000000",
+    "commit": "0000000000000000000000000000000000000000",
+    "workflow_run_id": 1,
+    "assets": [
+      {
+        "name": "Pusula_0.1.0_x64_offline-setup.exe",
+        "size": 1,
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      {
+        "name": "Pusula_0.1.0_x64-setup.exe",
+        "size": 1,
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      {
+        "name": "Pusula_0.1.0_x64-setup.exe.sig",
+        "size": 1,
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      {
+        "name": "latest.json",
+        "size": 1,
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      {
+        "name": "SHA256SUMS.txt",
+        "size": 1,
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+      }
+    ]
+  },
+  "acceptance": {
+    "started_at_utc": "2026-01-01T00:00:00.0000000Z",
+    "completed_at_utc": "2026-01-01T01:00:00.0000000Z",
+    "windows": {
+      "version": "10.0.26100.1",
+      "architecture": "windows-x86_64",
+      "standard_user": true,
+      "clean_profile": true,
+      "network_disconnected": true,
+      "offline_install": true,
+      "restart_completed": true
+    },
+    "baseline": {
+      "version": "0.0.9",
+      "archive_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "installed_exe_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "publisher": "REPLACE WITH EXACT APPROVED PUBLISHER",
+      "certificate_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "authenticode_valid": true,
+      "timestamped": true
+    },
+    "candidate_install": {
+      "version": "0.1.0",
+      "installed_exe_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "publisher": "REPLACE WITH EXACT APPROVED PUBLISHER",
+      "certificate_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "authenticode_valid": true,
+      "timestamped": true
+    },
+    "fixture_restore": {
+      "fixture_manifest_sha256": "d709a52df5147bddd57d569d1de4113f76ac10f8841405d970e4e60bdd90ade6",
+      "source": {
+        "counts": {
+          "customers": 2,
+          "contacts": 1,
+          "sales": 2,
+          "installments": 1,
+          "payments": 1
+        },
+        "totals": {
+          "sales_kurus": 1234567900,
+          "installments_kurus": 5,
+          "payments_kurus": 1
+        }
+      },
+      "restored": {
+        "counts": {
+          "customers": 2,
+          "contacts": 1,
+          "sales": 2,
+          "installments": 1,
+          "payments": 1
+        },
+        "totals": {
+          "sales_kurus": 1234567900,
+          "installments_kurus": 5,
+          "payments_kurus": 1
+        }
+      }
+    },
+    "backup": {
+      "backup_id": "00000000-0000-4000-8000-000000000000",
+      "ciphertext_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "desktop_size": 1,
+      "gateway_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "gateway_size": 1,
+      "gateway_version_id": "REPLACE WITH EXACT B2 VERSION ID",
+      "gateway_verified_at_utc": "2026-01-01T00:30:00.0000000Z",
+      "b2_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "b2_size": 1,
+      "b2_version_id": "REPLACE WITH EXACT B2 VERSION ID",
+      "gateway_spool_empty": true,
+      "sqlite_integrity": "ok",
+      "foreign_keys": "ok"
+    },
+    "invalid_signature": {
+      "evidence_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "result": "pass",
+      "source_commit": "0000000000000000000000000000000000000000",
+      "candidate_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "signature_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "candidate_unchanged": true,
+      "signature_unchanged": true,
+      "original_signature_verification": "accepted",
+      "tampered_copy_signature_verification": "rejected",
+      "runtime_rejection_phase": "downloading",
+      "installation_confirmation_called": false,
+      "dangerous_updater_overrides": false,
+      "production_configuration_modified": false,
+      "installer_created_or_run": false
+    },
+    "checks": {
+      "offline_install": "pass",
+      "fixture_import": "pass",
+      "single_instance": "pass",
+      "offline_business_workflow": "pass",
+      "restart_persistence": "pass",
+      "failure_atomicity": "pass",
+      "positive_update": "pass",
+      "pre_update_backup": "pass",
+      "direct_backup_upload": "pass",
+      "relay_backup_upload": "pass",
+      "restore": "pass",
+      "invalid_signature_rejection": "pass"
+    }
+  }
+}

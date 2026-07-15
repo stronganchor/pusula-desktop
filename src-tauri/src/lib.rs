@@ -5,8 +5,9 @@ mod error;
 pub mod models;
 
 use std::{
+    fs::{File, OpenOptions},
     future::Future,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -21,11 +22,120 @@ pub use db::Database;
 pub use models::{DatabaseStatus, ExportBundle, ExportSummary, ImportSummary};
 use serde_json::Value;
 use tauri::{Manager, State};
-use tokio::sync::{Mutex, OwnedRwLockWriteGuard, RwLock};
+use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
+use tokio::sync::{Mutex, OwnedMutexGuard, OwnedRwLockWriteGuard, RwLock};
 
 struct DbState {
     database: Database,
     maintenance_gate: Arc<RwLock<()>>,
+    _process_lock: DatabaseProcessLock,
+}
+
+const DATABASE_PROCESS_LOCK_FILE: &str = ".pusula-database.lock";
+const RESTORE_IN_PROGRESS_MARKER_FILE: &str = ".pusula-restore-in-progress.json";
+const STARTUP_FAILURE_TITLE: &str = "Pusula başlatılamadı";
+
+struct DatabaseProcessLock {
+    _file: File,
+}
+
+impl DatabaseProcessLock {
+    fn acquire(database_path: &Path) -> Result<Self, String> {
+        let directory = database_path
+            .parent()
+            .ok_or_else(|| "Veritabanı dizini bulunamadı.".to_owned())?;
+        std::fs::create_dir_all(directory).map_err(|error| error.to_string())?;
+        let lock_path = directory.join(DATABASE_PROCESS_LOCK_FILE);
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            options.share_mode(0);
+        }
+        let file = options.open(lock_path).map_err(|_| {
+            "Pusula veritabanı başka bir işlem tarafından kullanılıyor. Geri yükleme aracını kapatıp yeniden deneyin."
+                .to_owned()
+        })?;
+        Ok(Self { _file: file })
+    }
+}
+
+fn restore_marker_path(database_path: &Path) -> Result<PathBuf, String> {
+    database_path
+        .parent()
+        .map(|directory| directory.join(RESTORE_IN_PROGRESS_MARKER_FILE))
+        .ok_or_else(|| "Veritabanı dizini bulunamadı.".to_owned())
+}
+
+fn initialize_guarded_database(
+    database_path: PathBuf,
+) -> Result<(Database, DatabaseProcessLock), String> {
+    let process_lock = DatabaseProcessLock::acquire(&database_path)?;
+    let marker_path = restore_marker_path(&database_path)?;
+    match marker_path.try_exists() {
+        Ok(true) => {
+            return Err(format!(
+                "Tamamlanmamış bir Pusula geri yükleme işlemi algılandı ({}). Pusula kapalıyken geri yükleme runbook'unu izleyerek doğrulanmış geri alma veya geri yüklemeyi tamamlayın.",
+                marker_path.display()
+            ));
+        }
+        Ok(false) => {}
+        Err(_) => {
+            return Err(format!(
+                "Pusula geri yükleme güvenlik işaretini doğrulayamadı ({}). Veri güvenliği için başlangıç durduruldu.",
+                marker_path.display()
+            ));
+        }
+    }
+    let database = Database::initialize(database_path).map_err(|error| error.to_string())?;
+    Ok((database, process_lock))
+}
+
+fn startup_failure_message(detail: &str) -> String {
+    format!(
+        "Pusula güvenli biçimde başlatılamadı.\n\n{detail}\n\nBaşka bir Pusula veya geri yükleme işlemi açıksa kapatın. Sorun sürerse Veri ve Yedek kurtarma yönergelerini izleyin; güvenlik işaretlerini veya veritabanı dosyalarını elle silmeyin."
+    )
+}
+
+fn show_startup_failure_dialog<R: tauri::Runtime>(app: &tauri::AppHandle<R>, detail: &str) {
+    let exit_handle = app.clone();
+    let message = startup_failure_message(detail);
+    app.dialog()
+        .message(message)
+        .title(STARTUP_FAILURE_TITLE)
+        .kind(MessageDialogKind::Error)
+        .buttons(MessageDialogButtons::OkCustom("Kapat".to_owned()))
+        .show(move |_| exit_handle.exit(1));
+}
+
+fn setup_application<R: tauri::Runtime>(app: &mut tauri::App<R>) -> Result<(), String> {
+    let app_data_dir = app
+        .path()
+        .app_local_data_dir()
+        .map_err(|error| error.to_string())?;
+    let database_path = app_data_dir.join("data").join("pusula.sqlite3");
+    let (database, process_lock) = initialize_guarded_database(database_path)?;
+    let backup_service =
+        BackupService::production(database.clone(), app_data_dir, &app.config().identifier)
+            .map_err(|error| error.to_string())?;
+    app.manage(DbState {
+        database,
+        maintenance_gate: Arc::new(RwLock::new(())),
+        _process_lock: process_lock,
+    });
+    app.manage(BackupState {
+        service: backup_service.clone(),
+    });
+    app.manage(UpdateState::new());
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        loop {
+            backup_service.run_scheduled_if_due().await;
+            tokio::time::sleep(Duration::from_secs(6 * 60 * 60)).await;
+        }
+    });
+    Ok(())
 }
 
 struct BackupState {
@@ -103,6 +213,21 @@ where
         .map_err(|_| "Veritabanı işlemi beklenmedik biçimde durdu.".to_owned())?
 }
 
+async fn reserve_snapshot_then_maintenance<F>(
+    snapshot_reservation: F,
+    maintenance_gate: Arc<RwLock<()>>,
+) -> (OwnedMutexGuard<()>, OwnedRwLockWriteGuard<()>)
+where
+    F: Future<Output = OwnedMutexGuard<()>>,
+{
+    // Every operation that needs both locks must acquire them in this order.
+    // Update preparation and destructive imports otherwise can each retain
+    // one lock while waiting indefinitely for the other.
+    let snapshot_permit = snapshot_reservation.await;
+    let maintenance_guard = maintenance_gate.write_owned().await;
+    (snapshot_permit, maintenance_guard)
+}
+
 async fn run_import_operation<T, Recovery, RecoveryFuture, Import, ImportFuture>(
     replace: bool,
     recovery: Recovery,
@@ -166,12 +291,26 @@ async fn import_data(
     let replace = replace.unwrap_or(false);
     let database = database_state.database.clone();
     let backup = backup_state.service.clone();
-    let _guard = database_state.maintenance_gate.clone().write_owned().await;
+    let (snapshot_permit, _guard) = if replace {
+        let (snapshot_permit, maintenance_guard) = reserve_snapshot_then_maintenance(
+            backup.reserve_snapshot(),
+            database_state.maintenance_gate.clone(),
+        )
+        .await;
+        (Some(snapshot_permit), maintenance_guard)
+    } else {
+        (
+            None,
+            database_state.maintenance_gate.clone().write_owned().await,
+        )
+    };
     run_import_operation(
         replace,
         move || async move {
             backup
-                .prepare_for_destructive_import()
+                .prepare_for_destructive_import_reserved(
+                    snapshot_permit.expect("replace imports reserve the snapshot lane"),
+                )
                 .await
                 .map_err(|error| error.to_string())
         },
@@ -213,12 +352,26 @@ async fn import_data_file(
     let replace = replace.unwrap_or(false);
     let database = database_state.database.clone();
     let backup = backup_state.service.clone();
-    let _guard = database_state.maintenance_gate.clone().write_owned().await;
+    let (snapshot_permit, _guard) = if replace {
+        let (snapshot_permit, maintenance_guard) = reserve_snapshot_then_maintenance(
+            backup.reserve_snapshot(),
+            database_state.maintenance_gate.clone(),
+        )
+        .await;
+        (Some(snapshot_permit), maintenance_guard)
+    } else {
+        (
+            None,
+            database_state.maintenance_gate.clone().write_owned().await,
+        )
+    };
     run_import_operation(
         replace,
         move || async move {
             backup
-                .prepare_for_destructive_import()
+                .prepare_for_destructive_import_reserved(
+                    snapshot_permit.expect("replace imports reserve the snapshot lane"),
+                )
                 .await
                 .map_err(|error| error.to_string())
         },
@@ -314,14 +467,21 @@ async fn prepare_for_update(
         return Err("Güncelleme hazırlığı zaten etkin.".to_owned());
     }
 
+    // Reserve the short local-snapshot lane before taking the database gate.
+    // A scheduled remote upload uses a separate lane, so waiting for network
+    // can never block local business writes or update preparation.
+    let backup = backup_state.service.clone();
+    let (snapshot_permit, maintenance_guard) = reserve_snapshot_then_maintenance(
+        backup.reserve_snapshot(),
+        database_state.maintenance_gate.clone(),
+    )
+    .await;
+
     // Wait for every active database operation, then retain the exclusive
     // guard across the frontend's installer call. No new business write can
-    // land between this snapshot and process replacement.
-    let maintenance_guard = database_state.maintenance_gate.clone().write_owned().await;
-    let report = backup_state
-        .service
-        .clone()
-        .prepare_for_update()
+    // land between this local snapshot and process replacement.
+    let report = backup
+        .prepare_for_update_reserved(snapshot_permit)
         .await
         .map_err(|error| error.to_string())?;
     if !report.encrypted_snapshot_created || !report.safe_to_continue {
@@ -345,9 +505,13 @@ async fn prepare_for_destructive_import(
     backup_state: State<'_, BackupState>,
 ) -> Result<BackupRunReport, String> {
     let service = backup_state.service.clone();
-    let _guard = database_state.maintenance_gate.clone().write_owned().await;
+    let (snapshot_permit, _guard) = reserve_snapshot_then_maintenance(
+        service.reserve_snapshot(),
+        database_state.maintenance_gate.clone(),
+    )
+    .await;
     service
-        .prepare_for_destructive_import()
+        .prepare_for_destructive_import_reserved(snapshot_permit)
         .await
         .map_err(|error| error.to_string())
 }
@@ -356,6 +520,9 @@ async fn prepare_for_destructive_import(
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            if app.try_state::<DbState>().is_none() {
+                return;
+            }
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.show();
                 let _ = window.unminimize();
@@ -366,31 +533,12 @@ pub fn run() {
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
-            let app_data_dir = app
-                .path()
-                .app_local_data_dir()
-                .map_err(|error| error.to_string())?;
-            let database_path = app_data_dir.join("data").join("pusula.sqlite3");
-            let database =
-                Database::initialize(database_path).map_err(|error| error.to_string())?;
-            let backup_service =
-                BackupService::production(database.clone(), app_data_dir, &app.config().identifier)
-                    .map_err(|error| error.to_string())?;
-            app.manage(DbState {
-                database,
-                maintenance_gate: Arc::new(RwLock::new(())),
-            });
-            app.manage(BackupState {
-                service: backup_service.clone(),
-            });
-            app.manage(UpdateState::new());
-            tauri::async_runtime::spawn(async move {
-                tokio::time::sleep(Duration::from_secs(30)).await;
-                loop {
-                    backup_service.run_scheduled_if_due().await;
-                    tokio::time::sleep(Duration::from_secs(6 * 60 * 60)).await;
+            if let Err(error) = setup_application(app) {
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.hide();
                 }
-            });
+                show_startup_failure_dialog(app.handle(), &error);
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -480,6 +628,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn update_and_destructive_import_share_snapshot_then_maintenance_lock_order() {
+        let snapshot_lane = Arc::new(Mutex::new(()));
+        let maintenance_gate = Arc::new(RwLock::new(()));
+        let active_database_operation = maintenance_gate.clone().read_owned().await;
+
+        let first_snapshot = snapshot_lane.clone();
+        let first_gate = maintenance_gate.clone();
+        let update = tokio::spawn(async move {
+            let (_snapshot, _maintenance) =
+                reserve_snapshot_then_maintenance(first_snapshot.lock_owned(), first_gate).await;
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while snapshot_lane.try_lock().is_ok() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("update must reserve the snapshot lane first");
+
+        let import_snapshot = snapshot_lane.clone();
+        let import_gate = maintenance_gate.clone();
+        let destructive_import = tokio::spawn(async move {
+            let (_snapshot, _maintenance) =
+                reserve_snapshot_then_maintenance(import_snapshot.lock_owned(), import_gate).await;
+        });
+
+        drop(active_database_operation);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            update.await.expect("update task");
+            destructive_import.await.expect("import task");
+        })
+        .await
+        .expect("consistent lock ordering must not deadlock");
+    }
+
+    #[tokio::test]
     async fn prepared_update_blocks_database_operations_until_cancelled() {
         let gate = Arc::new(RwLock::new(()));
         let update_state = UpdateState::new();
@@ -521,5 +706,49 @@ mod tests {
                 .await
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn startup_fails_closed_while_restore_marker_exists() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("data").join("pusula.sqlite3");
+        std::fs::create_dir_all(database_path.parent().unwrap()).unwrap();
+        let marker_path = restore_marker_path(&database_path).unwrap();
+        std::fs::write(&marker_path, b"{\"phase\":\"database_swap\"}\n").unwrap();
+
+        let error = initialize_guarded_database(database_path.clone())
+            .err()
+            .expect("marker must block startup");
+        assert!(error.contains("Tamamlanmamış"));
+        assert!(!database_path.exists());
+
+        std::fs::remove_file(marker_path).unwrap();
+        let (database, _lock) = initialize_guarded_database(database_path).unwrap();
+        assert_eq!(database.status().unwrap().integrity_check, "ok");
+    }
+
+    #[test]
+    fn startup_failure_message_preserves_actionable_guard_detail() {
+        let detail = r"Tamamlanmamış geri yükleme işareti: C:\Users\operator\AppData\Local\com.stronganchor.pusula\data\.pusula-restore-in-progress.json";
+        let message = startup_failure_message(detail);
+
+        assert!(message.starts_with("Pusula güvenli biçimde başlatılamadı."));
+        assert_eq!(message.matches(detail).count(), 1);
+        assert!(message.contains("geri yükleme işlemi"));
+        assert!(message.contains("elle silmeyin"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn database_process_lock_excludes_restore_and_second_app_open() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("data").join("pusula.sqlite3");
+        let first = DatabaseProcessLock::acquire(&database_path).unwrap();
+        let error = DatabaseProcessLock::acquire(&database_path)
+            .err()
+            .expect("second exclusive open must fail");
+        assert!(error.contains("başka bir işlem"));
+        drop(first);
+        DatabaseProcessLock::acquire(&database_path).unwrap();
     }
 }

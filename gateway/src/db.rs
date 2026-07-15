@@ -16,6 +16,11 @@ use crate::{
 };
 
 const INITIAL_MIGRATION: &str = include_str!("../migrations/0001_initial.sql");
+const RELAY_ATTEMPT_MIGRATION: &str = include_str!("../migrations/0002_relay_attempted_at.sql");
+const MIGRATIONS: &[(i64, &str, &str)] = &[
+    (1, "initial", INITIAL_MIGRATION),
+    (2, "relay_attempted_at", RELAY_ATTEMPT_MIGRATION),
+];
 
 #[derive(Clone)]
 pub struct Database {
@@ -99,33 +104,33 @@ impl Database {
             )
             .map_err(AppError::internal)?;
 
-        let checksum = hex::encode(Sha256::digest(INITIAL_MIGRATION.as_bytes()));
-        let existing = transaction
-            .query_row(
-                "SELECT checksum FROM schema_migrations WHERE version = 1",
-                [],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()
-            .map_err(AppError::internal)?;
-        match existing {
-            Some(existing) if existing != checksum => {
-                return Err(AppError::Internal(
-                    "migration 1 checksum does not match the applied schema".to_owned(),
-                ));
-            }
-            Some(_) => {}
-            None => {
-                transaction
-                    .execute_batch(INITIAL_MIGRATION)
-                    .map_err(AppError::internal)?;
-                transaction
-                    .execute(
-                        "INSERT INTO schema_migrations(version, name, checksum, applied_at)
-                         VALUES (1, 'initial', ?1, ?2)",
-                        params![checksum, now_epoch()],
-                    )
-                    .map_err(AppError::internal)?;
+        for (version, name, sql) in MIGRATIONS {
+            let checksum = hex::encode(Sha256::digest(sql.as_bytes()));
+            let existing = transaction
+                .query_row(
+                    "SELECT checksum FROM schema_migrations WHERE version = ?1",
+                    params![version],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(AppError::internal)?;
+            match existing {
+                Some(existing) if existing != checksum => {
+                    return Err(AppError::Internal(format!(
+                        "migration {version} checksum does not match the applied schema"
+                    )));
+                }
+                Some(_) => {}
+                None => {
+                    transaction.execute_batch(sql).map_err(AppError::internal)?;
+                    transaction
+                        .execute(
+                            "INSERT INTO schema_migrations(version, name, checksum, applied_at)
+                             VALUES (?1, ?2, ?3, ?4)",
+                            params![version, name, checksum, now_epoch()],
+                        )
+                        .map_err(AppError::internal)?;
+                }
             }
         }
         transaction.commit().map_err(AppError::internal)
@@ -382,6 +387,80 @@ impl Database {
         })
     }
 
+    /// Admit one relay attempt for an existing pending reservation. The token
+    /// consumed by `reserve_backup` pays for the first direct-plus-relay try;
+    /// every later relay retry consumes another persisted device token.
+    pub fn begin_relay_attempt(
+        &self,
+        device_id: &str,
+        backup_id: &str,
+        rate_capacity: u32,
+        refill_seconds: u64,
+    ) -> Result<()> {
+        validate_rate_capacity(rate_capacity)?;
+        if refill_seconds == 0 || refill_seconds > 3600 {
+            return Err(AppError::BadRequest(
+                "rate refill must be between 1 and 3600 seconds",
+            ));
+        }
+
+        let now = now_epoch();
+        let mut connection = self.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(AppError::internal)?;
+        let state = transaction
+            .query_row(
+                "SELECT b.relay_attempted_at, d.upload_tokens, d.upload_tokens_updated_at
+                 FROM backups b
+                 JOIN devices d ON d.id = b.device_id
+                 WHERE b.id = ?1 AND b.device_id = ?2 AND b.status = 'pending'
+                   AND d.revoked_at IS NULL",
+                params![backup_id, device_id],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<i64>>(0)?,
+                        row.get::<_, f64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(AppError::internal)?
+            .ok_or(AppError::Conflict(
+                "backup is no longer pending for this device",
+            ))?;
+
+        if state.0.is_none() {
+            transaction
+                .execute(
+                    "UPDATE backups SET relay_attempted_at = ?3
+                     WHERE id = ?1 AND device_id = ?2 AND relay_attempted_at IS NULL",
+                    params![backup_id, device_id, now],
+                )
+                .map_err(AppError::internal)?;
+        } else {
+            let elapsed = now.saturating_sub(state.2) as f64;
+            let available =
+                (state.1 + elapsed / refill_seconds as f64).min(f64::from(rate_capacity));
+            if available < 1.0 {
+                let retry_after = ((1.0 - available) * refill_seconds as f64).ceil() as u64;
+                return Err(AppError::RateLimited {
+                    retry_after_seconds: retry_after.max(1),
+                });
+            }
+            transaction
+                .execute(
+                    "UPDATE devices
+                     SET upload_tokens = ?2, upload_tokens_updated_at = ?3
+                     WHERE id = ?1 AND revoked_at IS NULL",
+                    params![device_id, available - 1.0, now],
+                )
+                .map_err(AppError::internal)?;
+        }
+        transaction.commit().map_err(AppError::internal)
+    }
+
     pub fn backup_for_device(&self, device_id: &str, backup_id: &str) -> Result<BackupRecord> {
         self.connect()?
             .query_row(
@@ -552,6 +631,83 @@ mod tests {
         let (_directory, database) = database();
         database.migrate().unwrap();
         database.health_check().unwrap();
+        let connection = database.connect().unwrap();
+        let mut statement = connection
+            .prepare("SELECT version FROM schema_migrations ORDER BY version")
+            .unwrap();
+        let versions = statement
+            .query_map([], |row| row.get::<_, i64>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(versions, vec![1, 2]);
+    }
+
+    #[test]
+    fn migration_upgrades_an_existing_v1_database_and_remains_idempotent() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("gateway.sqlite3");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE schema_migrations (
+                    version INTEGER PRIMARY KEY NOT NULL,
+                    name TEXT NOT NULL,
+                    checksum TEXT NOT NULL,
+                    applied_at INTEGER NOT NULL
+                ) STRICT;",
+            )
+            .unwrap();
+        connection.execute_batch(INITIAL_MIGRATION).unwrap();
+        connection
+            .execute(
+                "INSERT INTO schema_migrations(version, name, checksum, applied_at)
+                 VALUES (1, 'initial', ?1, ?2)",
+                params![
+                    hex::encode(Sha256::digest(INITIAL_MIGRATION.as_bytes())),
+                    now_epoch()
+                ],
+            )
+            .unwrap();
+        drop(connection);
+
+        let database = Database::new(
+            path,
+            Arc::from(b"test-only-pepper-at-least-32-bytes".as_slice()),
+        );
+        database.migrate().unwrap();
+        database.migrate().unwrap();
+        let connection = database.connect().unwrap();
+        let relay_column_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('backups')
+                 WHERE name = 'relay_attempted_at'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let migration_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(relay_column_count, 1);
+        assert_eq!(migration_count, 2);
+    }
+
+    #[test]
+    fn changed_applied_migration_checksum_is_rejected() {
+        let (_directory, database) = database();
+        database
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE schema_migrations SET checksum = 'tampered' WHERE version = 2",
+                [],
+            )
+            .unwrap();
+        let error = database.migrate().unwrap_err();
+        assert!(matches!(error, AppError::Internal(message) if message.contains("migration 2")));
     }
 
     #[test]

@@ -36,6 +36,34 @@ retries normal queued ciphertext on the next due pass after reconnection.
 Backblaze and the gateway never possess the age private identity and cannot
 decrypt a backup.
 
+The desktop normally uploads an artifact directly to the single presigned B2
+object URL returned for its reservation. If that direct `PUT` fails before an
+HTTP response because of a connection, TLS, transport, or timeout error, the
+desktop retries the **same reservation and backup ID** through the fixed Pusula
+gateway at `PUT /v1/backups/relay/<backup-id>`. The relay request has the device
+bearer token, `application/octet-stream`, the reservation's exact ciphertext
+length, and the raw `.age` bytes as its entire body. It never contains the
+SQLite plaintext or the age recovery identity. The gateway enforces its
+configured backup-size ceiling, spools with a hard reservation-size bound,
+verifies the reserved SHA-256, uploads to B2, and marks the reservation complete
+only after remote verification.
+
+Direct and relay upload requests have a bounded 15-minute total timeout aligned
+with Apache's 900-second relay window. A timeout never removes the local
+ciphertext; it remains queued for the next eligible retry. The gateway relay
+spool contains only age ciphertext, is private to the service account, is
+removed on normal success/error paths, and is cleaned of crash-left relay parts
+at the next startup before any request is accepted.
+
+A failed relay remains in the sidecar as `relay_pending` with the same backup
+ID, survives restart, and is retried idempotently. A successful relay already
+completes the reservation, so the desktop removes the queue item without a
+second completion call. The desktop does **not** relay after B2 returns an HTTP
+status, and it does not use relay to bypass a malformed reservation, failed
+authentication, size/checksum mismatch, or another gateway policy response.
+Those failures leave the encrypted artifact queued for diagnosis or a later
+retry.
+
 Malformed sidecars are isolated under `backup-queue\quarantine` and rebuilt
 when safe; ciphertext whose recorded size or SHA-256 no longer matches is also
 quarantined. The maintenance screen reports this degraded state. Do not delete

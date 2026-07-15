@@ -2,6 +2,7 @@ use std::{path::PathBuf, sync::Arc};
 
 use clap::{Parser, Subcommand};
 use pusula_backup_gateway::{
+    api::cleanup_stale_relay_spools,
     build_gateway,
     config::{token_pepper_from_env, ServiceConfig, DEFAULT_DATABASE_PATH},
     db::Database,
@@ -72,6 +73,13 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Command::Serve => {
             let config = ServiceConfig::from_env(Some(cli.database))?;
+            let removed_spools = cleanup_stale_relay_spools(&config.database_path).await?;
+            if removed_spools > 0 {
+                tracing::warn!(
+                    removed_spools,
+                    "removed stale encrypted relay spool files before startup"
+                );
+            }
             let bind = config.bind;
             let router = build_gateway(&config)?;
             let listener = tokio::net::TcpListener::bind(bind)

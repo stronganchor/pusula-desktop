@@ -169,6 +169,10 @@ For initial-release acceptance:
      counts/totals.
    - repeat the installed-executable signature command with
      `$expectedVersion = '0.1.0'` after the updater relaunches.
+   - run the **Controlled invalid-signature drill** with the exact candidate
+     `.exe` and `.exe.sig`. Accept only its runtime `result: pass` evidence;
+     the harness's preparation-only mode is an automated policy-test fixture,
+     not release evidence.
 7. Delete the decrypted installer and installed test profile, delete the
    workflow artifact, and remove or rotate
    `ACCEPTANCE_BASELINE_ARCHIVE_PASSWORD` after recording acceptance evidence.
@@ -188,6 +192,22 @@ Any acceptance-only build with an override must remain private and must be
 signed, version-identifiable, and compiled from the intended baseline source.
 Never patch, rename, or rebundle a candidate executable to imitate an older
 version.
+
+The invalid-signature drill is deliberately separate from that positive update
+test. It creates a one-bit-changed copy outside the repository, verifies the
+untouched candidate first, and exercises the actual updater download verifier
+in a uniquely identified, no-bundle debug app against a loopback-only
+manifest. It never changes an immutable release, replaces the production
+updater public key, enables an insecure production transport option, installs
+the changed executable, or writes to an external service. The generated app,
+payload, local manifest, and isolated app data are deleted automatically; keep
+and hash only `invalid-signature-evidence.json`.
+The harness requires the candidate's full 40-character source commit, verifies
+that exact clean `HEAD` before and after the runtime test, and records it in the
+pass evidence. Its unique application identifier also gives it a separate
+Windows Credential Manager service, so it cannot reuse the production backup
+token. Process cleanup and both loopback ports are fail-closed: cleanup failure
+prevents pass evidence from being written.
 
 Record only non-sensitive evidence. Save its final evidence JSON or worksheet
 outside the repository and calculate:

@@ -1,10 +1,11 @@
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, path::Path};
 
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use hmac::{Hmac, Mac};
 use reqwest::header::{HeaderMap, CONTENT_LENGTH, ETAG};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
+use tokio_util::io::ReaderStream;
 use url::{Host, Url};
 
 use crate::{
@@ -99,6 +100,53 @@ impl B2Client {
             headers,
             expires_at: expires_at.to_rfc3339_opts(SecondsFormat::Secs, true),
         })
+    }
+
+    /// Upload an already encrypted, locally verified spool file and then prove
+    /// the object metadata through the same signed HEAD used by direct uploads.
+    /// The presigned URL and storage credentials are never included in errors.
+    pub async fn upload_ciphertext(
+        &self,
+        object_key: &str,
+        expected_size: u64,
+        expected_sha256: &str,
+        path: &Path,
+    ) -> Result<VerifiedObject> {
+        let upload = self.presign_put(object_key, expected_size, expected_sha256, Utc::now())?;
+        let file = tokio::fs::File::open(path)
+            .await
+            .map_err(AppError::internal)?;
+        let body = reqwest::Body::wrap_stream(ReaderStream::new(file));
+        // The shared client keeps control-plane HEAD requests short. A bounded
+        // ciphertext relay can legitimately need much longer for the maximum
+        // 256 MiB object, matching the desktop and reverse-proxy upload bound.
+        let mut request = self
+            .client
+            .put(upload.url)
+            .timeout(std::time::Duration::from_secs(15 * 60));
+        for (name, value) in upload.headers {
+            request = request.header(name, value);
+        }
+
+        let response = request.body(body).send().await.map_err(|error| {
+            let kind = if error.is_timeout() {
+                "timeout"
+            } else if error.is_connect() {
+                "connection failure"
+            } else {
+                "transport failure"
+            };
+            AppError::Upstream(format!("B2 PUT {kind}"))
+        })?;
+        if !response.status().is_success() {
+            return Err(AppError::Upstream(format!(
+                "B2 PUT returned HTTP {}",
+                response.status().as_u16()
+            )));
+        }
+
+        self.verify_object(object_key, expected_size, expected_sha256)
+            .await
     }
 
     pub async fn verify_object(

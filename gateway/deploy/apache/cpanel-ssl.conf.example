@@ -10,10 +10,19 @@ ProxyPreserveHost On
 ProxyAddHeaders On
 RequestHeader set X-Forwarded-Proto "https"
 
+ProxyPass        "/v1/backups/relay/" "http://127.0.0.1:12741/v1/backups/relay/" connectiontimeout=5 timeout=900 retry=0
+ProxyPassReverse "/v1/backups/relay/" "http://127.0.0.1:12741/v1/backups/relay/"
 ProxyPass        "/" "http://127.0.0.1:12741/" connectiontimeout=5 timeout=25 retry=0
 ProxyPassReverse "/" "http://127.0.0.1:12741/"
 
 <Location "/">
     Require all granted
     LimitRequestBody 16384
+</Location>
+
+# Keep this more-specific override after the general Location section so the
+# relay does not inherit the 16 KiB JSON-body limit.
+<Location "/v1/backups/relay/">
+    Require all granted
+    LimitRequestBody 268435456
 </Location>

@@ -1,8 +1,11 @@
 # Pusula backup gateway
 
 This service gives one enrolled Pusula Desktop installation short-lived,
-single-object Backblaze B2 upload URLs. The encrypted backup body travels from
-the Windows app directly to B2; the gateway never receives or proxies it. B2
+single-object Backblaze B2 upload URLs. The normal path sends the encrypted
+backup body from Windows directly to B2. If that direct connection fails before
+an HTTP response because the local network blocks or breaks B2 transport, the
+desktop can relay the same age-encrypted ciphertext through this gateway. The
+gateway never receives SQLite plaintext or the age recovery identity. B2
 credentials remain only in the root-owned service environment on the VPS.
 
 The production target is AlmaLinux 9.8 with cPanel Apache:
@@ -23,6 +26,16 @@ The production target is AlmaLinux 9.8 with cPanel Apache:
 - Upload reservations use immutable server-generated object keys. A persistent
   token bucket allows a burst of five URL grants and refills one grant per
   minute by default.
+- The authenticated relay accepts only an existing device-owned reservation,
+  exact `Content-Length`, and `application/octet-stream`. It keeps at most one
+  relay in flight, spools with a hard reservation-size bound, verifies the
+  ciphertext SHA-256 before B2, and removes the mode-`0600` encrypted spool on
+  success or failure. Startup removes only stale relay-part files left by a
+  process or host crash before the listener is bound.
+- The reservation's token-bucket charge covers its first direct-plus-relay
+  attempt. Every later relay retry consumes another persisted device token.
+  An authenticated pending relay remains valid after its presigned direct URL
+  expires, so an offline/restarted desktop cannot become permanently stuck.
 - A grant expires after 15 minutes, covers one exact path and content length,
   and requires ciphertext SHA-256 metadata plus `AES256` SSE-B2.
 - Completion performs a signed B2 `HEAD`; size, checksum metadata, and SSE must
@@ -147,6 +160,23 @@ The desktop must send every returned header on the B2 `PUT`, must not send its
 gateway bearer token to B2, and must discard the URL after that one attempt.
 Never write a presigned URL to diagnostics because it is a temporary
 credential.
+
+### `PUT /v1/backups/relay/{backup_id}`
+
+This transport fallback is used only when the direct B2 `PUT` failed without
+an HTTP response. It requires the normal device bearer token,
+`Content-Type: application/octet-stream`, an exact `Content-Length` matching
+the reservation, and the raw `.sqlite3.age` bytes as the entire body. It does
+not accept plaintext exports, recovery keys, a new object name, or a caller
+supplied checksum.
+
+The gateway bounds and hashes the encrypted body before uploading it with the
+same object key, checksum metadata, and SSE-B2 requirement. It then performs
+the signed B2 `HEAD` verification and returns the same completed response as
+`POST /v1/backups/complete`. A completed reservation is idempotent. B2 upload
+or verification failure returns `502` and leaves the reservation pending;
+concurrent or over-rate relays return `429`. A pending reservation remains
+relayable after the 15-minute direct URL expires.
 
 ### `POST /v1/backups/complete`
 

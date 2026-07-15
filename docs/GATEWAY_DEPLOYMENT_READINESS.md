@@ -27,8 +27,38 @@ authoritative/public DNS, and exact-host AutoSSL certificate are complete. The
 Apache proxy, Backblaze resource, enrollment code, and device token remain
 absent.
 
+## 2026-07-15 relay compatibility hold
+
+The current Windows network cannot establish TLS to any advertised
+`s3.us-west-004.backblazeb2.com` IPv4 address. A raw TLS probe received a
+plaintext Türk Telekom `307` sinkhole response from `88.255.216.16`, while the
+VPS reached the same B2 endpoint with a verified TLS connection. Because the
+desktop normally uploads ciphertext directly to B2, this is a production
+transport blocker rather than a cosmetic test failure.
+
+The merged source now contains a narrowly scoped fallback: only after a direct
+B2 transport/TLS failure, the enrolled desktop can send the same age-encrypted
+ciphertext through `PUT /v1/backups/relay/{backup_id}`. The gateway bounds and
+hashes a private spool, uploads it to the reserved B2 object, performs the same
+strict `HEAD` verification, and removes the spool on every ordinary path.
+Startup removes crash-left relay parts before binding. One relay is allowed at
+a time; the reservation pays for the first fallback and later retries consume
+the persisted device token bucket. Pending relay retries remain valid after the
+presigned direct URL expires.
+
+The installed VPS binary and unit are still the earlier disabled staging build.
+They do not contain the relay endpoint or immutable migration 2. Do not activate
+that binary for this release. Rebuild the final reviewed commit on AlmaLinux,
+pass formatting, clippy, all gateway tests, and a locked release build, then
+replace the disabled staged binary and re-record its source commit and SHA-256
+before creating the production environment file.
+
 ## Outstanding production gates
 
+- [ ] Build and install the final relay-capable gateway binary from the exact
+  release commit while the unit remains disabled/inactive. Verify the binary,
+  hardened unit, Apache templates, immutable v1-to-v2 migration test, and
+  checksum/provenance readback before activation.
 - [ ] Create the private B2 bucket with SSE-B2 in Backblaze region
   `us-west-004`. The current desktop upload allow-list requires endpoint
   `https://s3.us-west-004.backblazeb2.com`, bucket
@@ -61,8 +91,11 @@ absent.
   gracefully.
 - [ ] Verify loopback and public `/healthz` return `204` while existing
   monitored sites remain healthy.
-- [ ] Enroll a test device and complete one encrypted upload through B2 `HEAD`
-  verification and status.
+- [ ] Enroll a test device and complete one encrypted upload from the actual
+  Windows network through the ciphertext relay, B2 `HEAD` verification, and
+  status. Require the relay spool to be empty afterward. Also re-test the
+  preferred direct B2 route; if the ISP sinkhole remains, record relay as the
+  expected durability path for that network.
 - [ ] Restore that ciphertext with the separately held age identity and prove
   SQLite integrity, counts, and financial totals.
 

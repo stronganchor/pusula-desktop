@@ -18,7 +18,10 @@
    Confirm the B2 key is bucket- and prefix-restricted before starting.
 4. Run `systemctl daemon-reload`, then
    `systemctl enable --now pusula-backup-gateway.service`. The unit creates the
-   state directory and runs migrations before every start.
+   state directory and runs migrations before every start. Before binding the
+   listener, `serve` removes only stale `.relay-*.sqlite3.age.part` files left
+   by an interrupted process from the private relay spool. It logs a count,
+   never a filename or object credential.
 5. Verify:
 
    ```sh
@@ -42,8 +45,11 @@ Apache vhost identifiers:
 ```
 
 The standard vhost redirects to HTTPS; only the SSL vhost proxies to loopback.
-Do not create a ModSecurity bypass. Rebuild and validate before a graceful
-reload:
+The SSL template keeps JSON routes at 16 KiB/25 seconds and grants only
+`/v1/backups/relay/` the 256 MiB body limit and 900-second upload window. Keep
+the specific relay `ProxyPass` before the general route, and keep the relay
+`Location` limit after the general `Location` so it overrides 16 KiB. Do not
+create a ModSecurity bypass. Rebuild and validate before a graceful reload:
 
 ```sh
 /scripts/rebuildhttpdconf
@@ -67,8 +73,10 @@ after the Apache reload.
    If a future release applies a schema migration, follow that release's
    explicit compatibility note; never improvise a SQLite down-migration.
 
-The initial migration is additive and idempotent. `schema_migrations` stores a
-checksum and refuses a modified already-applied migration.
+Migrations 1 and 2 are additive and idempotent. Migration 2 adds only the
+persisted relay-attempt marker used for retry rate limiting. `schema_migrations`
+stores each immutable SQL checksum and refuses a modified already-applied
+migration; never edit migration 1 to add relay state.
 
 ## Credential rotation and incident response
 
@@ -113,6 +121,12 @@ recovery private key; that key must never be placed on this gateway.
 
 - Monitor systemd state, repeated restart loops, HTTP `5xx`, `429` volume, and
   absence of recent verified backup timestamps.
+- Repeated relay traffic indicates that the customer network cannot use the
+  preferred direct B2 route. Investigate it, but do not disable the encrypted
+  fallback while it is the only working durability path.
+- With no relay active, `/var/lib/pusula-backup-gateway/relay-spool` must be
+  empty. A startup stale-spool cleanup warning means a prior relay was
+  interrupted and its reservation still needs a verified retry.
 - `/healthz` failure is warning-level. It must not page as a business-critical
   outage because the Windows app is deliberately local-first and must continue
   saving while disconnected.

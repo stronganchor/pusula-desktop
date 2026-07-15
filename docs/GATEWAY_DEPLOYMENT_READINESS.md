@@ -6,37 +6,47 @@ This checklist tracks the production deployment of the optional Pusula backup
 gateway. It does not change the desktop's local-first contract: backup or
 gateway failure must never prevent SQLite business writes.
 
-## Superseded staging snapshot on the AlmaLinux host
+## Final disabled staging on the AlmaLinux host
 
-- Gateway source commit: `5a6052b36340f07cbbb883ca013b5737fe26ff13`
+- Gateway Git tree: `12bd31eb664fc496a1c5966f0e78b34040004ebf`
 - Rust toolchain: `1.92.0-x86_64-unknown-linux-gnu`
 - Gateway version: `0.1.0`
-- Release binary SHA-256:
-  `f72c47e886c6129478a212e7dfd2f6c1cb7a113ee42530cba949b455a3ee70fa`
 - Validation: formatting, clippy with warnings denied, all unit/integration/doc
-  tests plus required-test-name audit, locked release build, ELF/dependency
-  checks, and immutable SQLite migration verification passed on AlmaLinux 9.8.
-- Migration evidence for that snapshot: pinned SQLite 3.53.2 reported integrity
-  `ok`; migrations 1 `initial` and 2 `relay_attempted_at` matched their exact
-  SQL hashes; no journal, WAL, or SHM sidecar was created.
+  tests plus the 30-name security-critical audit, locked release build,
+  ELF/dependency checks, source-archive safety checks, and immutable SQLite
+  v1-to-v3 migration verification passed on AlmaLinux 9.8.
+- Migration evidence: pinned SQLite 3.53.2 reported integrity `ok`; migrations
+  1 `initial`, 2 `relay_attempted_at`, and 3
+  `backup_admission_and_verification` matched their exact blobs and normalized
+  SQL hashes; migration 3 schema checks passed and foreign-key failures were
+  zero.
 - Installed binary:
   `/usr/local/lib/pusula-backup-gateway/pusula-backup-gateway`
 - Installed unit: `/etc/systemd/system/pusula-backup-gateway.service`
 - Installed state directory: `/var/lib/pusula-backup-gateway`, owned by the
   non-login `pusula-backup` account and mode `0700`.
 
-The service is intentionally disabled and inactive. The production environment
-file is absent and TCP 12741 has no listener. The audited cPanel subdomain,
-authoritative/public DNS, and exact-host AutoSSL certificate are complete. The
-Apache proxy, Backblaze resource, enrollment code, and device token remain
-absent.
+The exact installed commit, build UTC, binary SHA-256, migration/evidence
+hashes, release/archive paths, and rollback paths are authoritative in the
+root-owned installed `BUILD_PROVENANCE`, immutable versioned evidence tree, and
+operator handoff record. They are intentionally not duplicated as a
+self-referential release-commit value in this tracked file: a documentation-only
+commit changes the candidate SHA while leaving the gateway Git tree above
+unchanged. Before activation, independently read those live values and require
+the installed gateway tree to equal the exact candidate commit's `gateway/`
+tree.
 
-The installed binary is **not** the final integrated release binary. It predates
-migration 3 and the authenticated full-body B2 verification/admission changes,
-so it must remain disabled. Rebuild, validate, and re-stage the gateway from the
-exact final desktop release commit before any activation work. Record the new
-commit, binary SHA-256, migration 1-through-3 checksums, and immutable host
-readback here; do not carry the SHA-256 above forward as current evidence.
+The service is intentionally `disabled`, `inactive`, and `dead`, with no
+production environment file, database entry, process, listener on TCP 12741,
+or Apache userdata proxy. The audited cPanel subdomain, authoritative/public
+DNS, and exact-host AutoSSL certificate are complete. The Backblaze resource,
+enrollment code, and device token remain absent.
+
+The installed binary includes migration 3, authenticated full-body B2
+verification, exact-version recovery downloads, persistent byte admission,
+bounded database/request concurrency, and ciphertext relay. It is the final
+integrated gateway tree, but it must remain disabled until every remaining
+Backblaze, recovery-identity, activation, and live acceptance gate below passes.
 
 ## 2026-07-15 relay compatibility hold
 
@@ -59,30 +69,36 @@ attempt consumes one device token plus the full reservation size in the
 persistent 24-hour ledger. Pending relay retries remain valid after the
 presigned direct URL expires.
 
-The installed VPS binary contains the earlier reviewed relay endpoint and
-immutable migration 2 only. Live, versioned, and root-only handoff copies match
-the historical SHA-256 above; provenance and the exact 13-file evidence set
-passed independent readback for that snapshot. The earlier `0aa68d0d...` binary
-and documentation remain in both durable archives and intentional rollback
+The installed VPS binary is the final reviewed relay implementation. Live,
+versioned, and root-only handoff copies matched exactly; provenance format 2
+and the exact 13-file evidence set passed independent readback. The superseded
+binary and documentation remain in durable archives and intentional rollback
 copies. The service is still `disabled`, `inactive`, and `dead`; the production
 environment, listener, process, Apache proxy, B2 resources, enrollment, and
-gateway state remain absent. Historical staging evidence is not authorization
-to activate this superseded binary.
+gateway state remain absent. Successful disabled staging is not authorization
+to activate the service.
 
 ## Outstanding production gates
 
-- [ ] Build and install the final gateway binary from the exact final desktop
-  release commit while the unit remains disabled/inactive. Verify formatting,
-  clippy with warnings denied, all gateway tests, locked release build, the
-  hardened unit and Apache templates, immutable v1-to-v3 migration test, exact
-  migration checksums, binary SHA-256, and provenance readback before
-  activation. Replace the historical snapshot values above only after that
-  evidence exists.
+- [x] Build and install the final gateway tree while the unit remains
+  disabled/inactive/dead. Formatting, clippy with warnings denied, all gateway
+  tests, locked release build, hardened unit and Apache-template checks,
+  immutable v1-to-v3 migration verification, exact migration and evidence
+  hashes, binary SHA-256, archive/rollback preservation, cleanup, and
+  independent provenance readback passed. Re-read the live authority described
+  above against the exact candidate commit before activation.
 - [ ] Create the private B2 bucket with SSE-B2 in Backblaze region
   `us-west-004`. The current desktop upload allow-list requires endpoint
   `https://s3.us-west-004.backblazeb2.com`, bucket
   `stronganchor-pusula-desktop-backups`, and object prefix `backups/`; creating
   the bucket in another region will make the desktop reject every upload URL.
+  A credential-safe local probe found one existing authenticated `rclone`
+  remote, but it authorizes against `api002.backblazeb2.com`, is read-only and
+  restricted to one unrelated existing bucket, and cannot create or administer
+  the required resource. Do not weaken the endpoint check or reuse that key.
+  Backblaze assigns region at account creation and does not let an existing
+  account change regions, so an owner-authorized region-004 account may be
+  required.
 - [ ] Add lifecycle rules with `daysFromUploadingToHiding` set to 14 for
   `backups/rolling/`, 60 for `backups/daily/`, and 400 for
   `backups/monthly/`, plus `daysFromHidingToDeleting` set to 1 on every rule.

@@ -2,162 +2,103 @@
 
 Snapshot date: 2026-07-15
 
-This checklist tracks the production deployment of the optional Pusula backup
-gateway. It does not change the desktop's local-first contract: backup or
-gateway failure must never prevent SQLite business writes.
+This checklist tracks the production deployment of the Pusula encrypted-backup
+gateway. It does not change the local-first contract: gateway, network, or
+storage failure must never prevent SQLite business writes.
 
-## Final disabled staging on the AlmaLinux host
+## Architecture selected for the one-machine release
 
-- Gateway Git tree: `12bd31eb664fc496a1c5966f0e78b34040004ebf`
-- Rust toolchain: `1.92.0-x86_64-unknown-linux-gnu`
-- Gateway version: `0.1.0`
-- Validation: formatting, clippy with warnings denied, all unit/integration/doc
-  tests plus the 30-name security-critical audit, locked release build,
-  ELF/dependency checks, source-archive safety checks, and immutable SQLite
-  v1-to-v3 migration verification passed on AlmaLinux 9.8.
-- Migration evidence: pinned SQLite 3.53.2 reported integrity `ok`; migrations
-  1 `initial`, 2 `relay_attempted_at`, and 3
-  `backup_admission_and_verification` matched their exact blobs and normalized
-  SQL hashes; migration 3 schema checks passed and foreign-key failures were
-  zero.
-- Installed binary:
-  `/usr/local/lib/pusula-backup-gateway/pusula-backup-gateway`
-- Installed unit: `/etc/systemd/system/pusula-backup-gateway.service`
-- Installed state directory: `/var/lib/pusula-backup-gateway`, owned by the
-  non-login `pusula-backup` account and mode `0700`.
+- The Windows PC encrypts every remote backup with the embedded age recipient
+  before it leaves the machine.
+- The authenticated HTTPS gateway relays the ciphertext to immutable local
+  storage on the existing VPS.
+- The VPS stores no SQLite plaintext and no age recovery identity.
+- No external object-store account, bucket, API key, lifecycle configuration,
+  or desktop upload URL is required.
+- The gateway generates object paths, verifies exact length and SHA-256,
+  publishes atomically without overwrite, and records version
+  `fs-sha256-<ciphertext SHA-256>`.
+- Gateway retention is rolling 14 days, daily 60 days, and monthly 400 days;
+  cleanup is bounded, resumable, and preserves the newest completed object for
+  every device/class.
 
-The exact installed commit, build UTC, binary SHA-256, migration/evidence
-hashes, release/archive paths, and rollback paths are authoritative in the
-root-owned installed `BUILD_PROVENANCE`, immutable versioned evidence tree, and
-operator handoff record. They are intentionally not duplicated as a
-self-referential release-commit value in this tracked file: a documentation-only
-commit changes the candidate SHA while leaving the gateway Git tree above
-unchanged. Before activation, independently read those live values and require
-the installed gateway tree to equal the exact candidate commit's `gateway/`
-tree.
+This deliberately trades an independent storage-provider copy for a much
+simpler initial deployment that Codex can operate on the already-accessible
+VPS. The encrypted VPS object is off-machine continuity, not complete 3-2-1
+protection. The object tree and metadata must also remain in the VPS operator's
+server-backup system.
 
-The service is intentionally `disabled`, `inactive`, and `dead`, with no
-production environment file, database entry, process, listener on TCP 12741,
-or Apache userdata proxy. The audited cPanel subdomain, authoritative/public
-DNS, and exact-host AutoSSL certificate are complete. The Backblaze resource,
-enrollment code, and device token remain absent.
+## Existing host state before activation
 
-The installed binary includes migration 3, authenticated full-body B2
-verification, exact-version recovery downloads, persistent byte admission,
-bounded database/request concurrency, and ciphertext relay. It is the final
-integrated gateway tree, but it must remain disabled until every remaining
-Backblaze, recovery-identity, activation, and live acceptance gate below passes.
+- Public host: `pusula-backup.stronganchortech.com`.
+- Authoritative/public DNS resolves to `69.167.167.14`.
+- An exact-host AutoSSL certificate is installed.
+- cPanel ownership is isolated under user `satbiz5`.
+- Gateway listener target is loopback-only `127.0.0.1:12741`; do not open that
+  port in CSF.
+- The previously staged gateway is disabled and inactive. It is superseded by
+  the local-object-storage build and is not an approved rollback target.
 
-## 2026-07-15 relay compatibility hold
+The production environment file, migration 4, final binary, Apache includes,
+service activation, enrollment, and end-to-end recovery proof remain gated
+until the exact merged release commit is available. A minimal `/healthz`
+response proves only process liveness.
 
-The current Windows network cannot establish TLS to any advertised
-`s3.us-west-004.backblazeb2.com` IPv4 address. A raw TLS probe received a
-plaintext Türk Telekom `307` sinkhole response from `88.255.216.16`, while the
-VPS reached the same B2 endpoint with a verified TLS connection. Because the
-desktop normally uploads ciphertext directly to B2, this is a production
-transport blocker rather than a cosmetic test failure.
+## Activation gate
 
-The merged source now contains a narrowly scoped fallback: only after a direct
-B2 transport/TLS failure, the enrolled desktop can send the same age-encrypted
-ciphertext through `PUT /v1/backups/relay/{backup_id}`. The gateway bounds and
-hashes a private spool, uploads it to the reserved B2 object, then verifies the
-actual authenticated B2 response body, exact size, SHA-256, and nonempty object
-version ID before completion. The spool is removed on every ordinary path, and
-startup removes crash-left relay parts before binding. One relay is allowed at
-a time. Every issued direct authorization, exact re-sign, and admitted relay
-attempt consumes one device token plus the full reservation size in the
-persistent 24-hour ledger. Pending relay retries remain valid after the
-presigned direct URL expires.
-
-The installed VPS binary is the final reviewed relay implementation. Live,
-versioned, and root-only handoff copies matched exactly; provenance format 2
-and the exact 13-file evidence set passed independent readback. The superseded
-binary and documentation remain in durable archives and intentional rollback
-copies. The service is still `disabled`, `inactive`, and `dead`; the production
-environment, listener, process, Apache proxy, B2 resources, enrollment, and
-gateway state remain absent. Successful disabled staging is not authorization
-to activate the service.
-
-## Outstanding production gates
-
-- [x] Build and install the final gateway tree while the unit remains
-  disabled/inactive/dead. Formatting, clippy with warnings denied, all gateway
-  tests, locked release build, hardened unit and Apache-template checks,
-  immutable v1-to-v3 migration verification, exact migration and evidence
-  hashes, binary SHA-256, archive/rollback preservation, cleanup, and
-  independent provenance readback passed. Re-read the live authority described
-  above against the exact candidate commit before activation.
-- [ ] Create the private B2 bucket with SSE-B2 in Backblaze region
-  `us-west-004`. The current desktop upload allow-list requires endpoint
-  `https://s3.us-west-004.backblazeb2.com`, bucket
-  `stronganchor-pusula-desktop-backups`, and object prefix `backups/`; creating
-  the bucket in another region will make the desktop reject every upload URL.
-  A credential-safe local probe found one existing authenticated `rclone`
-  remote, but it authorizes against `api002.backblazeb2.com`, is read-only and
-  restricted to one unrelated existing bucket, and cannot create or administer
-  the required resource. Do not weaken the endpoint check or reuse that key.
-  Backblaze assigns region at account creation and does not let an existing
-  account change regions, so an owner-authorized region-004 account may be
-  required.
-- [ ] Add lifecycle rules with `daysFromUploadingToHiding` set to 14 for
-  `backups/rolling/`, 60 for `backups/daily/`, and 400 for
-  `backups/monthly/`, plus `daysFromHidingToDeleting` set to 1 on every rule.
-  Gateway object names are unique, so a hidden-version-only rule would never
-  retire these current objects. Read the three exact prefixes and values back
-  before activation.
-- [ ] Create a `backups/`-restricted runtime key with only `listBuckets`,
-  `listFiles`, `readFiles`, and `writeFiles`. If the web console cannot express
-  that exact set, use the Native API; verify the resulting key metadata does
-  not include `deleteFiles`, `listAllBucketNames`, or bucket-management access.
-- [ ] Confirm at least two secure, off-device copies of the age recovery
-  identity. The identity must not be stored on the gateway.
-- [x] Create and audit the cPanel domain for
-  `pusula-backup.stronganchortech.com`. It is isolated under cPanel user
-  `satbiz5` with the exact public server name.
-- [x] Add and verify authoritative/public DNS, then issue AutoSSL for the exact
-  public host. Authoritative, Google, and Cloudflare resolvers return
-  `69.167.167.14`; the publicly verified certificate covers only the exact
-  gateway host and is valid through 2026-10-12.
-- [ ] Create `/etc/pusula-backup-gateway.env` as `root:root 0600` without
-  printing or logging its values.
-- [ ] Start the service and prove that only `127.0.0.1:12741` is listening.
-- [ ] Resolve the cPanel userdata templates using the live cPanel user and
-  vhost identifiers; rebuild Apache, require `Syntax OK`, and reload
-  gracefully.
-- [ ] Verify loopback and public `/healthz` return `204` while existing
+- [ ] Merge the reviewed source and require green desktop, gateway, release
+  policy, recovery-custody, migration, and frontend tests at the exact commit.
+- [ ] Build the locked AlmaLinux release binary from that exact source and
+  record source commit, Rust version, binary SHA-256, build UTC, migration
+  hashes, and rollback paths in root-only provenance.
+- [ ] Archive the old disabled binary, unit, docs, and evidence before install.
+- [ ] Install the new binary, hardened systemd unit, and docs while the service
+  remains stopped.
+- [ ] Create `/etc/pusula-backup-gateway.env` as `root:root 0600`. Generate the
+  token pepper without printing it. No other service secret is needed.
+- [ ] Require database and object root below
+  `/var/lib/pusula-backup-gateway`, owned by the non-login service account with
+  private modes, and require relay spool/object root on the same filesystem.
+- [ ] Run migration 4 and prove migration checksums, SQLite integrity, and zero
+  foreign-key failures.
+- [ ] Resolve the cPanel userdata include locations from live configuration,
+  install the specific relay and catch-all proxy rules, rebuild Apache, and
+  require `Syntax OK` before a graceful reload.
+- [ ] Enable/start the service and prove only `127.0.0.1:12741` listens.
+- [ ] Require loopback and public `/healthz` to return `204` while existing
   monitored sites remain healthy.
-- [ ] Enroll a test device and complete one encrypted upload from the actual
-  Windows network through the ciphertext relay, authenticated full-body B2
-  `GET` verification, exact nonempty version ID, verified size/SHA-256/time, and
-  status. Require the relay spool to be empty afterward. Also re-test the
-  preferred direct B2 route; if the ISP sinkhole remains, record relay as the
-  expected durability path for that network.
-- [ ] Restore that ciphertext with the separately held age identity and prove
-  SQLite integrity, counts, and financial totals.
+- [ ] Issue a one-hour enrollment code, enroll a disposable Windows test
+  device without logging the code/token, and revoke it after acceptance.
+- [ ] Relay a real age-encrypted SQLite fixture from the Windows network and
+  require a completed record with matching reserved and verified length/hash,
+  nonempty verification time, and exact `fs-sha256-*` version.
+- [ ] Require an empty relay spool and a regular mode-`0600` immutable object
+  beneath the server-generated device/class/date path.
+- [ ] Download that exact object with the root-only recovery command, copy only
+  the ciphertext to the controlled Windows recovery directory, decrypt with
+  the separately held identity, and prove SQLite integrity, counts, and
+  integer-kuruş totals.
+- [ ] Prove a truncated body, wrong checksum, wrong content length, unknown
+  backup ID, and symlink/non-regular object are rejected without publication.
+- [ ] Run one bounded retention pass and prove it neither scans nor deletes an
+  unrelated file and does not remove the newest device/class backup.
+- [ ] Recheck shared-host load, memory, listen queues, disk free space, service
+  logs, and several existing sites after acceptance.
 
-Do not publish an initial desktop release as backup-complete until every item
-above is evidenced. A minimal `/healthz` response proves only process
-liveness; it does not prove B2 permissions, lifecycle, encryption recovery, or
-desktop upload behavior.
+Do not call the desktop release backup-complete until every applicable item is
+evidenced. Never include environment contents, enrollment codes, device
+tokens, the token pepper, recovery passphrase, private keys, production
+exports, or customer data in GitHub artifacts or tracked documentation.
 
-Migration 3 cannot retroactively prove the bytes or exact object version for a
-row completed by an older binary. Legacy completed rows whose `version_id` or
-`verified_size_bytes`, `verified_sha256`, or `verified_at` is missing are
-therefore excluded from verified list/lookup/download operations. Preserve
-them as incident/history data; recover through an independently inventoried
-exact B2 version and the restore harness as documented in `gateway/RUNBOOK.md`,
-not by fabricating verification fields.
+## Activation authority and rollback
 
-## Activation and rollback authority
+Use `gateway/RUNBOOK.md` for canonical commands. The deployment must back up
+and restore only the exact Pusula Apache userdata includes it changes. On a
+failure, stop/disable the gateway, restore the archived binary/unit/docs and
+Apache includes as appropriate, rebuild Apache, require `Syntax OK`, and reload
+gracefully. Preserve the environment, metadata, object tree, and failure logs.
 
-Use `gateway/RUNBOOK.md` for the canonical service, cPanel Apache, credential
-rotation, metadata recovery, and rollback procedure. Keep the environment and
-gateway metadata database together for recovery, but back them up through
-separate secret-safe mechanisms. Never put production exports, device tokens,
-enrollment codes, presigned URLs, the token pepper, B2 credentials, or the age
-recovery identity in GitHub artifacts or diagnostics.
-
-If activation fails, disable and stop the unit, remove only the exact Pusula
-cPanel userdata includes, rebuild and syntax-check Apache, and then reload
-gracefully. Preserve the environment and metadata for diagnosis. Do not delete
-encrypted B2 objects and do not improvise a SQLite down-migration.
+Schema migration 4 adds resumable local-storage retention state. Do not edit an
+applied migration and do not down-migrate SQLite. The former cloud-dependent
+binary cannot serve the new local objects and is not a production fallback;
+roll forward with a corrected local-storage build or keep the service stopped.

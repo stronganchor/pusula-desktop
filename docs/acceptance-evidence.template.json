@@ -1,5 +1,5 @@
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "repository": "stronganchor/pusula-desktop",
   "version": "0.1.0",
   "candidate": {
@@ -46,22 +46,25 @@
       "offline_install": true,
       "restart_completed": true
     },
+    "windows_distribution": {
+      "mode": "managed_unsigned_single_machine",
+      "install_mode": "currentUser",
+      "offline_installer_authenticode_status": "NotSigned",
+      "updater_installer_authenticode_status": "NotSigned",
+      "initial_installer_sha256_verified": true,
+      "initial_smartscreen_acknowledged": true,
+      "trusted_publisher_certificate_installed": false,
+      "tauri_updater_signature_verified": true,
+      "in_app_update_manual_prompts": 1
+    },
     "baseline": {
       "version": "0.0.9",
       "archive_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
-      "installed_exe_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
-      "publisher": "REPLACE WITH EXACT APPROVED PUBLISHER",
-      "certificate_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
-      "authenticode_valid": true,
-      "timestamped": true
+      "installed_exe_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
     },
     "candidate_install": {
       "version": "0.1.0",
-      "installed_exe_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
-      "publisher": "REPLACE WITH EXACT APPROVED PUBLISHER",
-      "certificate_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
-      "authenticode_valid": true,
-      "timestamped": true
+      "installed_exe_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
     },
     "fixture_restore": {
       "fixture_manifest_sha256": "d709a52df5147bddd57d569d1de4113f76ac10f8841405d970e4e60bdd90ade6",
@@ -100,11 +103,11 @@
       "desktop_size": 1,
       "gateway_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
       "gateway_size": 1,
-      "gateway_version_id": "REPLACE WITH EXACT B2 VERSION ID",
+      "gateway_version_id": "fs-sha256-0000000000000000000000000000000000000000000000000000000000000000",
       "gateway_verified_at_utc": "2026-01-01T00:30:00.0000000Z",
-      "b2_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
-      "b2_size": 1,
-      "b2_version_id": "REPLACE WITH EXACT B2 VERSION ID",
+      "storage_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "storage_size": 1,
+      "storage_version_id": "fs-sha256-0000000000000000000000000000000000000000000000000000000000000000",
       "gateway_spool_empty": true,
       "sqlite_integrity": "ok",
       "foreign_keys": "ok"
@@ -134,8 +137,8 @@
       "failure_atomicity": "pass",
       "positive_update": "pass",
       "pre_update_backup": "pass",
-      "direct_backup_upload": "pass",
-      "relay_backup_upload": "pass",
+      "gateway_backup_upload": "pass",
+      "gateway_backup_idempotency": "pass",
       "restore": "pass",
       "invalid_signature_rejection": "pass"
     }

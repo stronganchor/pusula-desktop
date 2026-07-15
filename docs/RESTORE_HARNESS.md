@@ -42,8 +42,8 @@ so `File.Replace` can perform the live swap atomically.
 ## Independent evidence
 
 Before a destructive restore, prepare a small JSON evidence file in a protected
-local incident directory. Take the encrypted size and SHA-256 from the gateway,
-B2 metadata, or the original queue sidecar. Take schema, counts, and totals from
+local incident directory. Take the encrypted size and SHA-256 from the gateway
+record or the original queue sidecar. Take schema, counts, and totals from
 the last recorded Pusula data-status screen, migration/export manifest, or
 incident worksheet. Do not derive the "expected" values only from the candidate
 being restored; that would confirm internal consistency but not that the

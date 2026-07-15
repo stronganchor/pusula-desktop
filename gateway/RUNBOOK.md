@@ -1,216 +1,223 @@
 # Pusula backup gateway operations
 
-## Initial installation
+The gateway stores only age-encrypted Pusula snapshots. The Windows SQLite
+database remains the production source of truth. Gateway downtime, a full VPS
+disk, or an HTTPS failure must be reported as delayed backup and must never be
+treated as a reason to block local Pusula writes.
 
-1. Confirm AlmaLinux 9.8 health and that `127.0.0.1:12741` is unused. Do not add
-   a CSF allowance for TCP 12741.
-2. Create the dedicated identity:
+## Install without activation
+
+1. Create the non-login account and private state directory:
 
    ```sh
    useradd --system --home-dir /var/lib/pusula-backup-gateway \
      --shell /sbin/nologin pusula-backup
    install -d -o root -g root -m 0755 /usr/local/lib/pusula-backup-gateway
    install -d -o root -g root -m 0755 /usr/local/share/doc/pusula-backup-gateway
+   install -d -o pusula-backup -g pusula-backup -m 0700 /var/lib/pusula-backup-gateway
    ```
 
-3. Install the release binary mode `0755`, the service unit mode `0644`, the
-   README/runbook mode `0644`, and the completed environment file mode `0600`.
-   Confirm the B2 key is bucket- and prefix-restricted before starting. Review
-   the pending, 24-hour byte, cadence, request, DB, and aggregate-rate settings;
-   do not lower the enforced 20-hour daily or 25-day monthly floors. The
-   rolling byte quota must cover at least one maximum direct grant plus one
-   maximum relay fallback.
-4. Run `systemctl daemon-reload`, then
-   `systemctl enable --now pusula-backup-gateway.service`. The unit creates the
-   state directory and runs migrations before every start. Before binding the
-   listener, `serve` removes only stale `.relay-*.sqlite3.age.part` files left
-   by an interrupted process from the private relay spool. It logs a count,
-   never a filename or object credential.
-5. Verify:
+2. Install the controlled AlmaLinux release binary as `root:root 0755`, copy
+   the unit and docs, and verify their recorded source/SHA evidence.
+
+3. Create `/etc/pusula-backup-gateway.env` as `root:root 0600`. The only secret
+   is `PUSULA_GATEWAY_TOKEN_PEPPER`; generate at least 32 random bytes and never
+   print or record the production value in a ticket or repo. No bucket or
+   external cloud-storage credential is used.
+
+4. Keep both paths beneath the same state filesystem:
+
+   ```text
+   PUSULA_GATEWAY_DATABASE=/var/lib/pusula-backup-gateway/gateway.sqlite3
+   PUSULA_GATEWAY_OBJECT_ROOT=/var/lib/pusula-backup-gateway/objects
+   ```
+
+   Atomic immutable publication relies on a hard link from the private relay
+   spool to the object tree. A cross-filesystem object root is unsupported and
+   fails closed.
+
+5. Install the Apache userdata includes. Only `/v1/backups/relay/` receives the
+   256 MiB request limit and 900-second upload window. Keep its specific
+   `ProxyPass` before the catch-all route. Rebuild Apache configuration and
+   require `apachectl -t` success before reload.
+
+6. Run migration while the service remains stopped:
 
    ```sh
-   systemctl status --no-pager pusula-backup-gateway.service
-   ss -lntp | grep '127.0.0.1:12741'
-   curl --fail --silent --show-error -o /dev/null \
-     -w '%{http_code}\n' http://127.0.0.1:12741/healthz
+   /usr/local/lib/pusula-backup-gateway/pusula-backup-gateway migrate
+   systemctl is-enabled pusula-backup-gateway.service
+   systemctl is-active pusula-backup-gateway.service
    ```
 
-   Expected HTTP status is `204`; there must be no non-loopback listener.
+   Disabled staging must still read `disabled` and `inactive`.
 
-## cPanel Apache
+## Activation and smoke test
 
-Install the two templates from `deploy/apache/` in the actual cPanel userdata
-paths, replacing `__CPANEL_USER__` and `__VHOST__` with the audited account and
-Apache vhost identifiers:
-
-```text
-/etc/apache2/conf.d/userdata/std/2_4/__CPANEL_USER__/__VHOST__/pusula-backup-gateway.conf
-/etc/apache2/conf.d/userdata/ssl/2_4/__CPANEL_USER__/__VHOST__/pusula-backup-gateway.conf
-```
-
-The standard vhost redirects to HTTPS; only the SSL vhost proxies to loopback.
-The SSL template keeps every JSON request body at 16 KiB and ordinary control
-routes at 25 seconds. The completion route gets a 900-second response window
-because it streams the full encrypted B2 object through SHA-256, but it retains
-the 16 KiB request limit. Only `/v1/backups/relay/` gets the 256 MiB body limit
-and 900-second upload window. Keep both specific `ProxyPass` rules before the
-general route, and keep the relay `Location` limit after the general `Location`
-so it overrides 16 KiB. Do not create a ModSecurity bypass. The `max`/`acquire`
-worker parameters bound each Apache child's loopback wait; the gateway's
-request/DB semaphores and aggregate
-token bucket provide the process-wide fail-fast ceiling. Rebuild and validate
-before a graceful reload:
+Only after the release checklist authorizes activation:
 
 ```sh
-/scripts/rebuildhttpdconf
-/usr/local/apache/bin/apachectl -t
-/scripts/restartsrv_httpd --graceful
-curl --fail --silent --show-error -o /dev/null -w '%{http_code}\n' \
-  https://pusula-backup.stronganchortech.com/healthz
+systemctl daemon-reload
+systemctl enable --now pusula-backup-gateway.service
+systemctl status --no-pager pusula-backup-gateway.service
+ss -lntp | grep 127.0.0.1:12741
+curl -fsS -o /dev/null -w '%{http_code}\n' http://127.0.0.1:12741/healthz
+curl -fsS -o /dev/null -w '%{http_code}\n' https://pusula-backup.stronganchortech.com/healthz
 ```
 
-Expected public status is `204`. Recheck the rest of the server health gate
-after the Apache reload.
+Both health requests should return `204`; there must be no non-loopback gateway
+listener. Health is minimal process liveness and is not backup durability proof.
 
-## Release update and rollback
+Create one short-lived enrollment code as the service account, enter it once
+in the installed desktop, and do not preserve the code afterward:
 
-1. Build and test with the commands in `README.md`; retain the old binary.
-2. Copy the new binary beside the live path, verify its checksum and ownership,
-   stop the service, atomically rename it into place, and start the service.
-3. Confirm migration, service status, loopback/public `204`, then perform a test
-   enrollment and a small encrypted upload through completion and status.
-   Confirm the completed row has `version_id`, `verified_size_bytes`,
-   `verified_sha256`, and `verified_at`, then exercise exact-version download
-   into a new mode-`0600` recovery file.
-4. If the binary fails before a migration, restore the old binary and restart.
-   If a future release applies a schema migration, follow that release's
-   explicit compatibility note; never improvise a SQLite down-migration.
+```sh
+(
+  set -a
+  . /etc/pusula-backup-gateway.env
+  set +a
+  exec runuser -u pusula-backup --preserve-environment -- \
+    /usr/local/lib/pusula-backup-gateway/pusula-backup-gateway \
+    issue-enrollment --label 'Initial Windows PC' --expires-hours 1
+)
+```
 
-Migrations 1 through 3 are additive and idempotent. Migration 2 adds the
-persisted relay-attempt marker. Migration 3 backfills `retention_class`, adds
-actual-body verification evidence, creates the persistent
-`upload_authorizations` rolling-24-hour byte ledger, and adds
-admission/cleanup indexes. Every newly issued direct URL, exact re-sign, and
-admitted relay attempt consumes one device token plus the full reservation
-size in that ledger. Expired ledger and stale pending cleanup are independently
-bounded by their configured limits.
-`schema_migrations` stores each immutable SQL checksum and refuses a modified
-already-applied migration. Never edit an applied migration; add a new numbered
-file and verify `SELECT version,name,checksum FROM schema_migrations ORDER BY
-version;` after rollout. Checksums canonicalize CRLF/LF so the same immutable
-SQL has the same evidence in Windows and AlmaLinux checkouts.
+The protected file is loaded only inside a subshell, the literal pepper never
+enters shell history or process arguments, and the CLI runs as the service user
+so it cannot leave root-owned SQLite side files.
 
-Migration 3 cannot retroactively prove bodies for rows completed by an older
-metadata-only verifier. A pre-migration completed row without a nonempty exact
-`version_id` and matching `verified_size_bytes`/`verified_sha256`/`verified_at`
-is intentionally excluded from API latest status and root
-list/lookup/download. Recover it through exact-version inventory and the
-fail-closed procedure below; do not manufacture verification columns.
+## Prove a completed backup
 
-## Credential rotation and incident response
+After the desktop reports success:
 
-- Lost device: run `revoke-device` immediately, issue a new enrollment code,
-  enroll again, and confirm an upload. Revocation does not delete prior B2
-  objects.
-- Exposed enrollment code: revoke its ID. If it was already consumed, revoke
-  the resulting device instead.
-- Exposed B2 key: revoke it in Backblaze, create another key with the same narrow
-  bucket/prefix capabilities, update the root-only environment, restart, and
-  complete a test upload. Desktop installations do not change.
-- Exposed token pepper: replace it, restart, and re-enroll every device. All old
-  device tokens and unused enrollment codes become invalid.
-- Suspected presigned URL exposure: it is path-, header-, size-, and time-bound.
-  Do not mark the backup complete; after 15 minutes, check for and quarantine
-  any unexpected object/version with that backup ID. Completion hashes the
-  actual downloaded body, so matching caller-supplied metadata alone cannot
-  turn a mutated object into a completed record.
+```sh
+pusula-backup-gateway list-backups --limit 10
+pusula-backup-gateway lookup-backup --backup-id UUID
+find /var/lib/pusula-backup-gateway/relay-spool -mindepth 1 -maxdepth 1 -print
+```
 
-For a relay retry, first use completion to establish storage state. HTTP `409`
-with `object_not_present` is the definitive missing-object result and leaves
-the reservation pending/relayable. HTTP `404` with `not_found` means the
-device-owned gateway binding is stale and must be re-reserved. HTTP `502`
-means storage state or content is indeterminate/mismatched: reconfirm it and do
-not issue a blind replacement PUT. The gateway performs its own authenticated
-B2 precheck before relay admission/body ingress, charges the relay before
-polling or spooling the body, then prechecks again immediately before PUT.
-Transport failures and HTTP `408`/`429`/`5xx` PUT responses receive a
-confirmation GET; only an authoritative `404` permits any later PUT attempt.
+Require:
 
-Do not log or paste secret-bearing CLI output, environment contents, bearer
-tokens, or presigned URLs into tickets or repository documentation.
+- a completed record with matching reserved and verified size/SHA-256;
+- `version_id` exactly `fs-sha256-<sha256>`;
+- a non-null verification time in the acceptance interval;
+- an empty relay spool;
+- a regular mode-`0600` object below the expected class/device/date key;
+- no symlink anywhere in the object path.
 
-## Metadata protection and recovery
+Independently download and hash the exact record:
 
-The SQLite database contains hashes and operational metadata, not plaintext
-device tokens or backup bodies. Preserve it and the token pepper together in
-the administrator's secure server backup. Use SQLite's online backup command or
-stop the service before a filesystem copy; never copy only the main file while
-WAL mode is active.
+```sh
+install -d -o root -g root -m 0700 /root/pusula-recovery
+pusula-backup-gateway download-backup \
+  --backup-id UUID \
+  --output /root/pusula-recovery/backup.sqlite3.age
+sha256sum /root/pusula-recovery/backup.sqlite3.age
+```
 
-After restoring metadata:
+The CLI refuses overwrite and re-hashes the stored object. Move ciphertext to
+the recovery workstation, then follow the desktop restore harness. Never put
+the age recovery identity on this VPS.
 
-1. restore owner `pusula-backup:pusula-backup` and state mode `0700`;
-2. restore the root-only environment separately at mode `0600`;
-3. run `migrate`, start the service, and verify health;
-4. confirm an existing device can read status and upload a new encrypted test;
-5. compare the latest completed IDs with the B2 prefix inventory.
+## Retention operations
 
-For a normal recovery with intact metadata, use the root-only CLI. `list-backups`
-and `lookup-backup` read only completed records with exact actual-body
-verification evidence without running migrations;
-`download-backup` refuses rows without a stored version ID, signs the exact
-`versionId` query, creates a new output without replacement, and verifies the
-streamed size/SHA-256 before leaving the file in place. Run it through a
-root-owned transient unit as shown in `README.md`. Never paste its environment,
-an object URL, or recovery private key into a command line or ticket.
+Retention defaults are rolling 14 days, daily 60 days, and monthly 400 days.
+Each run handles at most 100 objects and preserves the newest completed object
+for every device/class. It runs at startup and before authenticated reservation.
 
-### Gateway database loss: B2 inventory fallback
+Manual bounded run (stop the listener first so stale-pending cleanup cannot
+race an active relay):
 
-Loss of `gateway.sqlite3` requires device re-enrollment. Do **not** fabricate
-completed rows or weaken `download-backup` to use the current object: the lost
-database also contained the expected hash and exact completed version ID.
-Instead:
+```sh
+systemctl stop pusula-backup-gateway.service
+runuser -u pusula-backup -- \
+  /usr/local/lib/pusula-backup-gateway/pusula-backup-gateway prune-storage
+systemctl start pusula-backup-gateway.service
+```
 
-1. Preserve the private bucket and lifecycle configuration; create an inventory
-   of **all object versions** beneath `backups/rolling/`, `backups/daily/`, and
-   `backups/monthly/` with trusted Backblaze/S3 administrator tooling. Record
-   object key, version/file ID, upload time, and size in a protected incident
-   artifact. Do not use a public URL or the runtime key in a ticket.
-2. Use the key taxonomy (retention class, device UUID, UTC date, backup UUID)
-   plus any surviving desktop/local-recovery manifest to choose a candidate.
-   If one key has multiple versions, keep the exact IDs distinct; never assume
-   the newest version is the verified one.
-3. Download the chosen exact version with the trusted B2 administrator tool
-   into a create-new file under a mode-`0700` directory. Verify its SHA-256
-   against a surviving manifest/sidecar when available. If no independent hash
-   survives, retain the inventory and treat decryption plus the restore harness
-   as the recovery evidence rather than claiming gateway verification.
-4. Move the ciphertext to the offline recovery workstation, decrypt only with
-   the separately held age identity, and run the documented SQLite restore
-   integrity/row-count/financial-total checks. The recovery identity must never
-   be copied to this gateway or VPS.
-5. Initialize fresh gateway metadata through normal migrations and
-   re-enrollment. Leave prior B2 objects under lifecycle control; do not insert
-   reconstructed rows into the new gateway database.
+An interrupted cleanup is visible in the private metadata table and resumes
+automatically. Do not use `find -delete`, a generic cleanup cron, or manual
+directory pruning: those bypass the database claim and can make status and
+recovery evidence false.
 
-The root CLI intentionally cannot perform this fallback without metadata. That
-fail-closed boundary prevents an operator from silently downloading a later,
-unverified overwrite as though it were the completed backup.
+Monitor free space, not just object age:
 
-## Monitoring
+```sh
+df -h /var/lib/pusula-backup-gateway
+du -sh /var/lib/pusula-backup-gateway/objects
+```
 
-- Monitor systemd state, repeated restart loops, HTTP `5xx`, `429`/`503` volume, and
-  absence of recent verified backup timestamps.
-- Repeated relay traffic indicates that the customer network cannot use the
-  preferred direct B2 route. Investigate it, but do not disable the encrypted
-  fallback while it is the only working durability path.
-- With no relay active, `/var/lib/pusula-backup-gateway/relay-spool` must be
-  empty. A startup stale-spool cleanup warning means a prior relay was
-  interrupted and its reservation still needs a verified retry.
-- `/healthz` failure is warning-level. It must not page as a business-critical
-  outage because the Windows app is deliberately local-first and must continue
-  saving while disconnected.
-- Alert separately when a device that normally connects has no verified remote
-  backup within the agreed window. This is the actionable durability signal.
-- B2 lifecycle and bucket encryption are external controls; audit them after
-  any Backblaze configuration change.
+Ingress is rejected before reading a body unless available space covers the
+full reservation plus the configured 1 GiB safety floor. A capacity failure
+leaves the desktop ciphertext queued for retry.
+
+## Upgrade and rollback
+
+1. Preserve the current binary, unit, docs, environment, metadata database, and
+   object tree. Never expose the environment contents in the handoff.
+2. Stop the service and verify no gateway process or relay spool remains.
+3. Install the exact candidate binary and docs, run `migrate`, and confirm
+   `PRAGMA integrity_check` and migration checksums.
+4. Start the service, verify loopback/public `204`, then exercise status and one
+   encrypted relay from the installed desktop.
+5. Confirm the new object and exact-version recovery download before removing
+   the rollback binary.
+
+Schema migration 4 adds `storage_purges`. It does not rewrite completed backup
+rows or ciphertext objects. Do not edit an applied migration; ship another
+numbered migration.
+
+For rollback after migration 4, the older cloud-dependent binary is not a valid
+production fallback because it requires removed credentials and cannot serve
+local objects. Roll forward with a corrected local-storage build. Keep the
+service stopped if object/metadata invariants cannot be proven.
+
+## Metadata and object protection
+
+Protect these together in the administrator's server-backup system:
+
+- `/var/lib/pusula-backup-gateway/gateway.sqlite3` (use SQLite online backup);
+- `/var/lib/pusula-backup-gateway/objects/`;
+- the stable token pepper in `/etc/pusula-backup-gateway.env`.
+
+The database contains no plaintext customer records or bearer tokens, but it
+maps authenticated devices to recovery-authoritative object hashes and paths.
+Changing/loss of the pepper requires device reenrollment. Loss of the database
+does not decrypt objects but removes authoritative version mappings.
+
+If metadata is lost, do not fabricate completed rows. Inventory regular files
+under the three retention prefixes, hash ciphertext candidates, correlate their
+server-generated device/date/backup key with any surviving desktop sidecar or
+acceptance record, and restore only through the offline recovery harness. Build
+a fresh gateway database and reenroll the device.
+
+## Incident responses
+
+- **Device token exposed:** revoke the device, issue a new one-time enrollment,
+  and reenroll. Prior encrypted objects remain under retention.
+- **Token pepper exposed:** stop the service, replace the pepper, revoke/recreate
+  all enrollment/device credentials through controlled reenrollment, and record
+  the incident without the secret value.
+- **Relay interrupted:** confirm the mode-`0600` spool is removed. Startup removes
+  only `.relay-*.sqlite3.age.part` crash remnants before binding.
+- **Object exists but completion failed:** never overwrite it. Retry completion;
+  the gateway hashes the exact immutable file and commits only if it matches.
+- **Checksum/size conflict at an object key:** stop activation and preserve the
+  object, metadata database, and logs. Do not rename another body into its key.
+- **Low disk:** free unrelated approved space or expand the filesystem. Do not
+  weaken the safety floor or manually delete Pusula objects.
+- **Object-root symlink or wrong type:** stop the service and investigate. The
+  gateway intentionally rejects symlinks and non-regular objects.
+- **Recovery identity exposed:** this is separate from gateway credentials.
+  Replace the desktop recovery recipient through a controlled application
+  release and preserve old identity access for retained historical objects.
+
+## Routine monitoring
+
+- public and loopback health remain `204`;
+- service stays bound only to loopback;
+- latest verified backup timestamp advances within the agreed window;
+- relay spool is empty when no upload is active;
+- object filesystem has ample free space above the configured reserve;
+- retention cleanup has no repeatedly unfinished claim;
+- gateway logs contain no persistent verification, capacity, or permission
+  failures.

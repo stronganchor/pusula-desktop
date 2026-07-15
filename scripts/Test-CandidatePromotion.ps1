@@ -8,8 +8,6 @@ param(
     [Parameter(Mandatory = $true)][string] $AcceptanceEvidencePath,
     [Parameter(Mandatory = $true)][string] $Confirmation,
     [Parameter(Mandatory = $true)][string] $DownloadDirectory,
-    [Parameter(Mandatory = $true)][string] $ExpectedWindowsPublisher,
-    [Parameter(Mandatory = $true)][string] $ExpectedWindowsCertificateSha256,
     [Parameter(Mandatory = $true)][string] $ActionsToken,
     [Parameter(Mandatory = $true)][string] $MinisignPath
 )
@@ -18,7 +16,6 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 . (Join-Path $PSScriptRoot 'Release-SemVer.ps1')
-. (Join-Path $PSScriptRoot 'Release-RepositoryControls.ps1')
 $candidate = ConvertTo-StrictSemVer -Version $Version
 if ($null -ne $candidate.Prerelease) {
     throw 'A production promotion must use the final SemVer, not a prerelease suffix.'
@@ -43,12 +40,6 @@ if ($AcceptanceEvidenceSha256 -notmatch '^[0-9a-fA-F]{64}$') {
 if ($Confirmation -cne "PROMOTE v$Version") {
     throw "Confirmation must exactly equal: PROMOTE v$Version"
 }
-if ([string]::IsNullOrWhiteSpace($ExpectedWindowsPublisher)) {
-    throw 'Expected Windows publisher must be configured for promotion.'
-}
-if ($ExpectedWindowsCertificateSha256 -cnotmatch '^[0-9a-fA-F]{64}$') {
-    throw 'Expected Windows certificate SHA-256 must be configured for promotion.'
-}
 if ([string]::IsNullOrWhiteSpace($ActionsToken)) {
     throw 'An Actions-read token is required for promotion evidence verification.'
 }
@@ -62,7 +53,6 @@ if ($LASTEXITCODE -ne 0 -or $head -cne $WorkflowCommit) {
 }
 & (Join-Path $PSScriptRoot 'Test-VersionConsistency.ps1') -ExpectedVersion $Version | Out-Host
 
-$null = Assert-PusulaReleaseRepositoryControls -Repository $Repository
 $releaseApiHeader = @('-H', 'X-GitHub-Api-Version: 2026-03-10')
 
 $stableTag = "v$Version"
@@ -154,24 +144,8 @@ $offlineInstaller = Get-Item -LiteralPath (Join-Path $DownloadDirectory "Pusula_
 $leanInstaller = Get-Item -LiteralPath (Join-Path $DownloadDirectory "Pusula_${Version}_x64-setup.exe")
 foreach ($executable in @($offlineInstaller, $leanInstaller)) {
     $signature = Get-AuthenticodeSignature -LiteralPath $executable.FullName
-    if ($signature.Status -ne 'Valid') {
-        throw "Invalid Authenticode signature: $($executable.Name) [$($signature.Status)]"
-    }
-    if (-not $signature.TimeStamperCertificate) {
-        throw "Missing Authenticode timestamp: $($executable.Name)"
-    }
-    $publisher = $signature.SignerCertificate.GetNameInfo(
-        [Security.Cryptography.X509Certificates.X509NameType]::SimpleName,
-        $false
-    )
-    if (-not [string]::Equals($publisher, $ExpectedWindowsPublisher, [StringComparison]::Ordinal)) {
-        throw "Unexpected Authenticode publisher for $($executable.Name): $publisher"
-    }
-    $certificateHash = ([BitConverter]::ToString(
-            [Security.Cryptography.SHA256]::Create().ComputeHash($signature.SignerCertificate.RawData)
-        )).Replace('-', '').ToLowerInvariant()
-    if ($certificateHash -cne $ExpectedWindowsCertificateSha256.ToLowerInvariant()) {
-        throw "Unexpected Authenticode certificate for $($executable.Name): $certificateHash"
+    if ([string]$signature.Status -cne 'NotSigned') {
+        throw "Managed single-machine release requires an intentionally unsigned Authenticode installer: $($executable.Name) [$($signature.Status)]"
     }
 }
 
@@ -183,8 +157,6 @@ foreach ($executable in @($offlineInstaller, $leanInstaller)) {
     -Version $Version `
     -CandidateTag $CandidateTag `
     -CandidateCommit $candidateCommit `
-    -ExpectedWindowsPublisher $ExpectedWindowsPublisher `
-    -ExpectedWindowsCertificateSha256 $ExpectedWindowsCertificateSha256 `
     -ActionsToken $ActionsToken | Out-Host
 
 Write-Output "Immutable candidate $CandidateTag is eligible for stable publication; acceptance evidence SHA-256: $($AcceptanceEvidenceSha256.ToLowerInvariant())"

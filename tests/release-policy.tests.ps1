@@ -13,6 +13,7 @@ $repositoryControlsScript = Join-Path $repoRoot 'scripts\Release-RepositoryContr
 $candidateConfigScript = Join-Path $repoRoot 'scripts\New-CandidateUpdaterConfig.ps1'
 $manifestScript = Join-Path $repoRoot 'scripts\New-UpdateManifest.ps1'
 $assetScript = Join-Path $repoRoot 'scripts\Test-ReleaseAssets.ps1'
+$candidatePromotionScript = Join-Path $repoRoot 'scripts\Test-CandidatePromotion.ps1'
 & (Join-Path $repoRoot 'tests\invalid-updater-signature-harness.tests.ps1') | Out-Host
 & (Join-Path $repoRoot 'tests\release-acceptance-evidence.tests.ps1') | Out-Host
 & (Join-Path $repoRoot 'tests\candidate-release-resume.tests.ps1') | Out-Host
@@ -31,6 +32,10 @@ $publicationPolicy = Get-Content -Raw -LiteralPath $publicationScript
 $candidatePreparationPolicy = Get-Content -Raw -LiteralPath $candidatePreparationScript
 $stablePreparationPolicy = Get-Content -Raw -LiteralPath $stablePreparationScript
 $repositoryControlsPolicy = Get-Content -Raw -LiteralPath $repositoryControlsScript
+$candidatePromotionPolicy = Get-Content -Raw -LiteralPath $candidatePromotionScript
+if (Test-Path -LiteralPath (Join-Path $repoRoot ('scripts\Invoke-Artifact' + 'Signing.ps1'))) {
+    throw 'Obsolete Azure Artifact Signing helper must not remain in the managed single-machine release.'
+}
 $tauriConfig = Get-Content -Raw -LiteralPath (Join-Path $repoRoot 'src-tauri\tauri.conf.json') | ConvertFrom-Json
 if ([string]$tauriConfig.bundle.windows.webviewInstallMode.type -cne 'offlineInstaller') {
     throw 'Release installer must embed the offline WebView2 installer.'
@@ -95,8 +100,8 @@ function Test-OrdinalContains {
     return $Text.IndexOf($Value, [StringComparison]::Ordinal) -ge 0
 }
 
-$bundleOverrideStart = $releaseWorkflow.IndexOf('- name: Create deterministic bundle overrides', [StringComparison]::Ordinal)
-$bundleOverrideEnd = $releaseWorkflow.IndexOf('- name: Require release signing configuration', [StringComparison]::Ordinal)
+$bundleOverrideStart = $releaseWorkflow.IndexOf('- name: Create deterministic unsigned bundle overrides', [StringComparison]::Ordinal)
+$bundleOverrideEnd = $releaseWorkflow.IndexOf('- name: Freshly compile private initial-release acceptance baseline', [StringComparison]::Ordinal)
 if ($bundleOverrideStart -lt 0 -or $bundleOverrideEnd -le $bundleOverrideStart) {
     throw 'Release workflow bundle override step is missing or out of order.'
 }
@@ -107,6 +112,33 @@ if (-not (Test-OrdinalContains -Text $bundleOverrides -Value 'createUpdaterArtif
     (Test-OrdinalContains -Text $bundleOverrides -Value "type = 'skip'") -or
     (Test-OrdinalContains -Text $bundleOverrides -Value 'v1Compatible')) {
     throw 'Release workflow must build a non-updater offline installer and a modern direct-EXE online updater.'
+}
+$forbiddenReleaseValues = @(
+    ('azure/' + 'login'),
+    ('Invoke-Artifact' + 'Signing.ps1'),
+    ('ARTIFACT_' + 'SIGNING_'),
+    ('EXPECTED_' + 'WINDOWS_'),
+    ('RELEASE_ADMIN' + '_READ_TOKEN'),
+    ('sign' + 'Command')
+)
+foreach ($forbidden in $forbiddenReleaseValues) {
+    if ((Test-OrdinalContains -Text $releaseWorkflow -Value $forbidden) -or
+        (Test-OrdinalContains -Text $promotionWorkflow -Value $forbidden)) {
+        throw "Managed single-machine workflows must not require external signing or administration value: $forbidden"
+    }
+}
+if (-not (Test-OrdinalContains -Text $candidatePromotionPolicy -Value 'Get-AuthenticodeSignature') -or
+    -not (Test-OrdinalContains -Text $candidatePromotionPolicy -Value "-cne 'NotSigned'") -or
+    (Test-OrdinalContains -Text $candidatePromotionPolicy -Value 'ExpectedWindowsPublisher') -or
+    (Test-OrdinalContains -Text $candidatePromotionPolicy -Value 'ExpectedWindowsCertificateSha256')) {
+    throw 'Stable promotion must enforce the intentional NotSigned installer policy without a Windows certificate gate.'
+}
+if (-not (Test-OrdinalContains -Text $releaseWorkflow -Value 'environment: windows-release') -or
+    -not (Test-OrdinalContains -Text $releaseWorkflow -Value 'TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}') -or
+    -not (Test-OrdinalContains -Text $releaseWorkflow -Value "-cne 'NotSigned'") -or
+    -not (Test-OrdinalContains -Text $releaseWorkflow -Value 'npm run tauri -- bundle --bundles nsis --no-sign --ci') -or
+    -not (Test-OrdinalContains -Text $releaseWorkflow -Value '- name: Bundle Tauri-signed lean updater')) {
+    throw 'Release workflow must use the existing Tauri key, intentional NotSigned Authenticode policy, and current-user unsigned NSIS bundles.'
 }
 if (-not (Test-OrdinalContains -Text $ciWorkflow -Value '- name: Package Tauri v2 lean updater smoke artifact') -or
     -not (Test-OrdinalContains -Text $ciWorkflow -Value 'Tauri v2 direct NSIS updater signature is missing.') -or
@@ -119,7 +151,7 @@ if (-not (Test-OrdinalContains -Text $releaseWorkflow -Value 'validate-gateway:'
     -not (Test-OrdinalContains -Text $releaseWorkflow -Value 'cargo fmt --manifest-path gateway/Cargo.toml --check') -or
     -not (Test-OrdinalContains -Text $releaseWorkflow -Value 'cargo clippy --manifest-path gateway/Cargo.toml --all-targets -- -D warnings') -or
     -not (Test-OrdinalContains -Text $releaseWorkflow -Value 'cargo test --manifest-path gateway/Cargo.toml')) {
-    throw 'The signed-release workflow must validate the exact gateway commit before privileged signing.'
+    throw 'The release workflow must validate the exact gateway commit before updater-key access.'
 }
 
 Assert-OrderedWorkflowSteps -Workflow $releaseWorkflow -StepNames @(
@@ -150,7 +182,6 @@ $candidatePublish = $releaseWorkflow.Substring($candidatePublishStart)
 $stablePublish = $promotionWorkflow.Substring($stablePublishStart)
 foreach ($publicationStep in @($candidatePublish, $stablePublish)) {
     if (-not (Test-OrdinalContains -Text $publicationStep -Value 'GH_TOKEN: ${{ github.token }}') -or
-        -not (Test-OrdinalContains -Text $publicationStep -Value 'RELEASE_ADMIN_READ_TOKEN: ${{ secrets.RELEASE_ADMIN_READ_TOKEN }}') -or
         -not (Test-OrdinalContains -Text $publicationStep -Value '.\scripts\Publish-VerifiedRelease.ps1')) {
         throw 'Each final publication must execute the shared recheck/PATCH helper with exclusive write-token custody.'
     }
@@ -163,7 +194,6 @@ if (-not (Test-OrdinalContains -Text $publicationPolicy -Value 'releases/assets/
     -not (Test-OrdinalContains -Text $publicationPolicy -Value 'releases/$releaseId') -or
     -not (Test-OrdinalContains -Text $publicationPolicy -Value "'--method', 'PATCH'") -or
     -not (Test-OrdinalContains -Text $publicationPolicy -Value 'X-GitHub-Api-Version: 2026-03-10') -or
-    -not (Test-OrdinalContains -Text $publicationPolicy -Value 'Assert-PusulaReleaseRepositoryControls') -or
     -not (Test-OrdinalContains -Text $publicationPolicy -Value 'gh release verify') -or
     (Test-OrdinalContains -Text $publicationPolicy -Value "'DELETE'") -or
     (Test-OrdinalContains -Text $publicationPolicy -Value 'release delete')) {

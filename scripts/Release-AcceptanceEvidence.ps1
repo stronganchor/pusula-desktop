@@ -12,8 +12,8 @@ $script:PusulaAcceptanceCheckNames = @(
     'failure_atomicity',
     'positive_update',
     'pre_update_backup',
-    'direct_backup_upload',
-    'relay_backup_upload',
+    'gateway_backup_upload',
+    'gateway_backup_idempotency',
     'restore',
     'invalid_signature_rejection'
 )
@@ -260,8 +260,6 @@ function Get-PusulaCanonicalAcceptanceEvidence {
         [Parameter(Mandatory = $true)][string] $CandidateTag,
         [Parameter(Mandatory = $true)][string] $CandidateCommit,
         [Parameter(Mandatory = $true)][string] $CandidateAssetDirectory,
-        [Parameter(Mandatory = $true)][string] $ExpectedWindowsPublisher,
-        [Parameter(Mandatory = $true)][string] $ExpectedWindowsCertificateSha256,
         [Parameter(Mandatory = $true)][string] $FixturePath
     )
 
@@ -272,8 +270,8 @@ function Get-PusulaCanonicalAcceptanceEvidence {
         $Version -cnotmatch '^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)$') {
         throw 'Expected acceptance repository or final SemVer is invalid.'
     }
-    if ((Get-PusulaNonNegativeInt64 $Evidence.schema_version '$.schema_version') -ne 2) {
-        throw '$.schema_version must equal 2.'
+    if ((Get-PusulaNonNegativeInt64 $Evidence.schema_version '$.schema_version') -ne 3) {
+        throw '$.schema_version must equal 3.'
     }
     if ((Get-PusulaRequiredString $Evidence.repository '$.repository') -cne $Repository) {
         throw '$.repository does not match the release repository.'
@@ -285,11 +283,6 @@ function Get-PusulaCanonicalAcceptanceEvidence {
         $CandidateTag -cne "v$Version-candidate.$CandidateCommit") {
         throw 'Expected candidate tag or commit is invalid.'
     }
-    $expectedCertificate = $ExpectedWindowsCertificateSha256.ToLowerInvariant()
-    if ($expectedCertificate -cnotmatch '^[0-9a-f]{64}$') {
-        throw 'Expected Windows certificate SHA-256 is invalid.'
-    }
-
     Assert-PusulaExactProperties -Value $Evidence.candidate `
         -Expected @('tag', 'commit', 'workflow_run_id', 'assets') `
         -Path '$.candidate'
@@ -335,7 +328,7 @@ function Get-PusulaCanonicalAcceptanceEvidence {
 
     Assert-PusulaExactProperties -Value $Evidence.acceptance `
         -Expected @(
-            'started_at_utc', 'completed_at_utc', 'windows', 'baseline',
+            'started_at_utc', 'completed_at_utc', 'windows', 'windows_distribution', 'baseline',
             'candidate_install', 'fixture_restore', 'backup', 'invalid_signature', 'checks'
         ) `
         -Path '$.acceptance'
@@ -362,43 +355,47 @@ function Get-PusulaCanonicalAcceptanceEvidence {
         Assert-PusulaTrue $Evidence.acceptance.windows.$name "$.acceptance.windows.$name"
     }
 
-    Assert-PusulaExactProperties -Value $Evidence.acceptance.baseline `
+    Assert-PusulaExactProperties -Value $Evidence.acceptance.windows_distribution `
         -Expected @(
-            'version', 'archive_sha256', 'installed_exe_sha256', 'publisher',
-            'certificate_sha256', 'authenticode_valid', 'timestamped'
+            'mode', 'install_mode', 'offline_installer_authenticode_status',
+            'updater_installer_authenticode_status', 'initial_installer_sha256_verified',
+            'initial_smartscreen_acknowledged', 'trusted_publisher_certificate_installed',
+            'tauri_updater_signature_verified', 'in_app_update_manual_prompts'
         ) `
+        -Path '$.acceptance.windows_distribution'
+    if ((Get-PusulaRequiredString $Evidence.acceptance.windows_distribution.mode '$.acceptance.windows_distribution.mode') -cne 'managed_unsigned_single_machine' -or
+        (Get-PusulaRequiredString $Evidence.acceptance.windows_distribution.install_mode '$.acceptance.windows_distribution.install_mode') -cne 'currentUser' -or
+        (Get-PusulaRequiredString $Evidence.acceptance.windows_distribution.offline_installer_authenticode_status '$.acceptance.windows_distribution.offline_installer_authenticode_status') -cne 'NotSigned' -or
+        (Get-PusulaRequiredString $Evidence.acceptance.windows_distribution.updater_installer_authenticode_status '$.acceptance.windows_distribution.updater_installer_authenticode_status') -cne 'NotSigned') {
+        throw 'Windows distribution evidence must describe the managed unsigned current-user release mode.'
+    }
+    foreach ($name in 'initial_installer_sha256_verified', 'initial_smartscreen_acknowledged', 'tauri_updater_signature_verified') {
+        Assert-PusulaTrue $Evidence.acceptance.windows_distribution.$name "$.acceptance.windows_distribution.$name"
+    }
+    if ($Evidence.acceptance.windows_distribution.trusted_publisher_certificate_installed -isnot [bool] -or
+        [bool]$Evidence.acceptance.windows_distribution.trusted_publisher_certificate_installed) {
+        throw '$.acceptance.windows_distribution.trusted_publisher_certificate_installed must be the JSON boolean false.'
+    }
+    if ((Get-PusulaNonNegativeInt64 $Evidence.acceptance.windows_distribution.in_app_update_manual_prompts '$.acceptance.windows_distribution.in_app_update_manual_prompts') -ne 1) {
+        throw '$.acceptance.windows_distribution.in_app_update_manual_prompts must equal 1.'
+    }
+
+    Assert-PusulaExactProperties -Value $Evidence.acceptance.baseline `
+        -Expected @('version', 'archive_sha256', 'installed_exe_sha256') `
         -Path '$.acceptance.baseline'
     if ((Get-PusulaRequiredString $Evidence.acceptance.baseline.version '$.acceptance.baseline.version') -cne '0.0.9') {
         throw '$.acceptance.baseline.version must equal 0.0.9.'
     }
     $baselineArchiveHash = Get-PusulaSha256 $Evidence.acceptance.baseline.archive_sha256 '$.acceptance.baseline.archive_sha256'
     $baselineExecutableHash = Get-PusulaSha256 $Evidence.acceptance.baseline.installed_exe_sha256 '$.acceptance.baseline.installed_exe_sha256'
-    $baselinePublisher = Get-PusulaRequiredString $Evidence.acceptance.baseline.publisher '$.acceptance.baseline.publisher' '^[A-Za-z0-9][A-Za-z0-9 .,&()''-]{1,127}$'
-    $baselineCertificate = Get-PusulaSha256 $Evidence.acceptance.baseline.certificate_sha256 '$.acceptance.baseline.certificate_sha256'
-    if ($baselinePublisher -cne $ExpectedWindowsPublisher -or $baselineCertificate -cne $expectedCertificate) {
-        throw 'Baseline publisher or certificate does not match the protected release configuration.'
-    }
-    Assert-PusulaTrue $Evidence.acceptance.baseline.authenticode_valid '$.acceptance.baseline.authenticode_valid'
-    Assert-PusulaTrue $Evidence.acceptance.baseline.timestamped '$.acceptance.baseline.timestamped'
 
     Assert-PusulaExactProperties -Value $Evidence.acceptance.candidate_install `
-        -Expected @(
-            'version', 'installed_exe_sha256', 'publisher', 'certificate_sha256',
-            'authenticode_valid', 'timestamped'
-        ) `
+        -Expected @('version', 'installed_exe_sha256') `
         -Path '$.acceptance.candidate_install'
     if ((Get-PusulaRequiredString $Evidence.acceptance.candidate_install.version '$.acceptance.candidate_install.version') -cne $Version) {
         throw '$.acceptance.candidate_install.version does not match the promoted version.'
     }
     $candidateExecutableHash = Get-PusulaSha256 $Evidence.acceptance.candidate_install.installed_exe_sha256 '$.acceptance.candidate_install.installed_exe_sha256'
-    $candidatePublisher = Get-PusulaRequiredString $Evidence.acceptance.candidate_install.publisher '$.acceptance.candidate_install.publisher' '^[A-Za-z0-9][A-Za-z0-9 .,&()''-]{1,127}$'
-    $candidateCertificate = Get-PusulaSha256 $Evidence.acceptance.candidate_install.certificate_sha256 '$.acceptance.candidate_install.certificate_sha256'
-    if ($candidatePublisher -cne $ExpectedWindowsPublisher -or $candidatePublisher -cne $baselinePublisher -or
-        $candidateCertificate -cne $expectedCertificate -or $candidateCertificate -cne $baselineCertificate) {
-        throw 'Baseline and candidate publisher/certificate identities must exactly match the protected configuration.'
-    }
-    Assert-PusulaTrue $Evidence.acceptance.candidate_install.authenticode_valid '$.acceptance.candidate_install.authenticode_valid'
-    Assert-PusulaTrue $Evidence.acceptance.candidate_install.timestamped '$.acceptance.candidate_install.timestamped'
 
     Assert-PusulaExactProperties -Value $Evidence.acceptance.fixture_restore `
         -Expected @('fixture_manifest_sha256', 'source', 'restored') `
@@ -431,27 +428,28 @@ function Get-PusulaCanonicalAcceptanceEvidence {
         -Expected @(
             'backup_id', 'ciphertext_sha256', 'desktop_size', 'gateway_sha256',
             'gateway_size', 'gateway_version_id', 'gateway_verified_at_utc',
-            'b2_sha256', 'b2_size', 'b2_version_id', 'gateway_spool_empty',
+            'storage_sha256', 'storage_size', 'storage_version_id', 'gateway_spool_empty',
             'sqlite_integrity', 'foreign_keys'
         ) `
         -Path '$.acceptance.backup'
     $backupId = Get-PusulaRequiredString $Evidence.acceptance.backup.backup_id '$.acceptance.backup.backup_id' '^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
     $ciphertextHash = Get-PusulaSha256 $Evidence.acceptance.backup.ciphertext_sha256 '$.acceptance.backup.ciphertext_sha256'
     $gatewayHash = Get-PusulaSha256 $Evidence.acceptance.backup.gateway_sha256 '$.acceptance.backup.gateway_sha256'
-    $b2Hash = Get-PusulaSha256 $Evidence.acceptance.backup.b2_sha256 '$.acceptance.backup.b2_sha256'
+    $storageHash = Get-PusulaSha256 $Evidence.acceptance.backup.storage_sha256 '$.acceptance.backup.storage_sha256'
     $desktopSize = Get-PusulaNonNegativeInt64 $Evidence.acceptance.backup.desktop_size '$.acceptance.backup.desktop_size' -Positive
     $gatewaySize = Get-PusulaNonNegativeInt64 $Evidence.acceptance.backup.gateway_size '$.acceptance.backup.gateway_size' -Positive
-    $b2Size = Get-PusulaNonNegativeInt64 $Evidence.acceptance.backup.b2_size '$.acceptance.backup.b2_size' -Positive
-    if ($ciphertextHash -cne $gatewayHash -or $ciphertextHash -cne $b2Hash -or
-        $desktopSize -ne $gatewaySize -or $desktopSize -ne $b2Size) {
-        throw 'Desktop, gateway, and B2 ciphertext size/hash evidence must exactly match.'
+    $storageSize = Get-PusulaNonNegativeInt64 $Evidence.acceptance.backup.storage_size '$.acceptance.backup.storage_size' -Positive
+    if ($ciphertextHash -cne $gatewayHash -or $ciphertextHash -cne $storageHash -or
+        $desktopSize -ne $gatewaySize -or $desktopSize -ne $storageSize) {
+        throw 'Desktop, gateway, and storage ciphertext size/hash evidence must exactly match.'
     }
     $gatewayVersionId = Get-PusulaBoundedNonControlString `
         $Evidence.acceptance.backup.gateway_version_id '$.acceptance.backup.gateway_version_id'
-    $b2VersionId = Get-PusulaBoundedNonControlString `
-        $Evidence.acceptance.backup.b2_version_id '$.acceptance.backup.b2_version_id'
-    if ($gatewayVersionId -cne $b2VersionId) {
-        throw 'Gateway and B2 version IDs must exactly match.'
+    $storageVersionId = Get-PusulaBoundedNonControlString `
+        $Evidence.acceptance.backup.storage_version_id '$.acceptance.backup.storage_version_id'
+    $expectedStorageVersionId = "fs-sha256-$ciphertextHash"
+    if ($gatewayVersionId -cne $storageVersionId -or $gatewayVersionId -cne $expectedStorageVersionId) {
+        throw 'Gateway and storage version IDs must equal the deterministic fs-sha256 ciphertext identity.'
     }
     $gatewayVerifiedAtText = Get-PusulaRequiredString `
         $Evidence.acceptance.backup.gateway_verified_at_utc `
@@ -516,7 +514,7 @@ function Get-PusulaCanonicalAcceptanceEvidence {
     }
 
     return [ordered]@{
-        schema_version = 2
+        schema_version = 3
         repository = $Repository
         version = $Version
         candidate = [ordered]@{
@@ -537,22 +535,25 @@ function Get-PusulaCanonicalAcceptanceEvidence {
                 offline_install = $true
                 restart_completed = $true
             }
+            windows_distribution = [ordered]@{
+                mode = 'managed_unsigned_single_machine'
+                install_mode = 'currentUser'
+                offline_installer_authenticode_status = 'NotSigned'
+                updater_installer_authenticode_status = 'NotSigned'
+                initial_installer_sha256_verified = $true
+                initial_smartscreen_acknowledged = $true
+                trusted_publisher_certificate_installed = $false
+                tauri_updater_signature_verified = $true
+                in_app_update_manual_prompts = 1L
+            }
             baseline = [ordered]@{
                 version = '0.0.9'
                 archive_sha256 = $baselineArchiveHash
                 installed_exe_sha256 = $baselineExecutableHash
-                publisher = $baselinePublisher
-                certificate_sha256 = $baselineCertificate
-                authenticode_valid = $true
-                timestamped = $true
             }
             candidate_install = [ordered]@{
                 version = $Version
                 installed_exe_sha256 = $candidateExecutableHash
-                publisher = $candidatePublisher
-                certificate_sha256 = $candidateCertificate
-                authenticode_valid = $true
-                timestamped = $true
             }
             fixture_restore = [ordered]@{
                 fixture_manifest_sha256 = $fixtureManifestHash
@@ -567,9 +568,9 @@ function Get-PusulaCanonicalAcceptanceEvidence {
                 gateway_size = $gatewaySize
                 gateway_version_id = $gatewayVersionId
                 gateway_verified_at_utc = $gatewayVerifiedAtText
-                b2_sha256 = $b2Hash
-                b2_size = $b2Size
-                b2_version_id = $b2VersionId
+                storage_sha256 = $storageHash
+                storage_size = $storageSize
+                storage_version_id = $storageVersionId
                 gateway_spool_empty = $true
                 sqlite_integrity = 'ok'
                 foreign_keys = 'ok'

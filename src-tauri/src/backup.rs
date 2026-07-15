@@ -1,5 +1,4 @@
 use std::{
-    collections::BTreeMap,
     fs::{self, File},
     io::{BufReader, Read, Write},
     path::{Path, PathBuf},
@@ -10,10 +9,7 @@ use std::{
 
 use age::x25519;
 use chrono::{DateTime, Duration as ChronoDuration, Local, NaiveDate, Utc};
-use reqwest::{
-    header::{HeaderMap, HeaderName, HeaderValue},
-    Client, StatusCode,
-};
+use reqwest::{Client, StatusCode};
 use rusqlite::{backup::Backup, Connection, DatabaseName};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -33,16 +29,9 @@ const QUEUE_METADATA_VERSION: u32 = 1;
 const SCHEDULE_INTERVAL_HOURS: i64 = 24;
 const FAILURE_RETRY_HOURS: i64 = 6;
 const LOCAL_RECOVERY_LIMIT: usize = 3;
-const B2_UPLOAD_HOST: &str = "s3.us-west-004.backblazeb2.com";
-const B2_UPLOAD_PATH_PREFIX: &str = "/stronganchor-pusula-desktop-backups/backups/";
 const UPLOAD_REQUEST_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const QUARANTINE_DIRECTORY: &str = "quarantine";
-const REQUIRED_UPLOAD_HEADERS: [&str; 4] = [
-    "content-length",
-    "x-amz-content-sha256",
-    "x-amz-meta-sha256",
-    "x-amz-server-side-encryption",
-];
+const GATEWAY_RELAY_TRANSPORT: &str = "gateway_relay";
 
 #[derive(Debug, thiserror::Error)]
 pub enum BackupError {
@@ -63,9 +52,6 @@ pub enum BackupError {
 
     #[error("backup gateway rejected the request ({0})")]
     GatewayRejected(u16),
-
-    #[error("backup object upload rejected the request ({0})")]
-    UploadRejected(u16),
 
     #[error("backup gateway returned an invalid response")]
     InvalidGatewayResponse,
@@ -232,12 +218,6 @@ enum UploadStage {
     Uploaded,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DirectUploadOutcome {
-    Uploaded,
-    RelayRequired,
-}
-
 #[derive(Debug, Clone)]
 struct QueuedBackup {
     path: PathBuf,
@@ -318,7 +298,6 @@ impl TokenStore for PlatformTokenStore {
 struct GatewayClient {
     base_url: Url,
     client: Client,
-    allow_insecure_uploads: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -345,9 +324,7 @@ struct UploadUrlRequest<'a> {
 struct UploadUrlResponse {
     backup_id: String,
     retention_class: RetentionClass,
-    method: String,
-    upload_url: String,
-    required_headers: BTreeMap<String, String>,
+    transport: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -397,11 +374,7 @@ impl GatewayClient {
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|_| BackupError::Configuration)?;
-        Ok(Self {
-            base_url,
-            client,
-            allow_insecure_uploads,
-        })
+        Ok(Self { base_url, client })
     }
 
     fn endpoint(&self, path: &str) -> BackupResult<Url> {
@@ -460,35 +433,10 @@ impl GatewayClient {
         if reservation.retention_class != queued.metadata.retention_class {
             return Err(BackupError::InvalidGatewayResponse);
         }
+        if reservation.transport != GATEWAY_RELAY_TRANSPORT {
+            return Err(BackupError::InvalidGatewayResponse);
+        }
         Ok(reservation)
-    }
-
-    async fn put_ciphertext(
-        &self,
-        queued: &QueuedBackup,
-        reservation: &UploadUrlResponse,
-    ) -> BackupResult<DirectUploadOutcome> {
-        let (upload_url, headers) = self.validate_upload_request(queued, reservation)?;
-
-        let file = tokio::fs::File::open(&queued.path).await?;
-        let body = reqwest::Body::wrap_stream(ReaderStream::new(file));
-        let response = match self
-            .client
-            .put(upload_url)
-            .headers(headers)
-            .timeout(UPLOAD_REQUEST_TIMEOUT)
-            .body(body)
-            .send()
-            .await
-        {
-            Ok(response) => response,
-            Err(error) if direct_upload_error_allows_relay(&error) => {
-                return Ok(DirectUploadOutcome::RelayRequired);
-            }
-            Err(_) => return Err(BackupError::GatewayUnavailable),
-        };
-        ensure_upload_success(response.status())?;
-        Ok(DirectUploadOutcome::Uploaded)
     }
 
     async fn relay_ciphertext(
@@ -516,86 +464,6 @@ impl GatewayClient {
             .await
             .map_err(|_| BackupError::GatewayUnavailable)?;
         require_completed_response(response, backup_id).await
-    }
-
-    fn validate_upload_request(
-        &self,
-        queued: &QueuedBackup,
-        reservation: &UploadUrlResponse,
-    ) -> BackupResult<(Url, HeaderMap)> {
-        if reservation.method != "PUT" {
-            return Err(BackupError::InvalidGatewayResponse);
-        }
-
-        let upload_url =
-            Url::parse(&reservation.upload_url).map_err(|_| BackupError::InvalidGatewayResponse)?;
-        if !upload_url.username().is_empty()
-            || upload_url.password().is_some()
-            || upload_url.fragment().is_some()
-        {
-            return Err(BackupError::InvalidGatewayResponse);
-        }
-        if self.allow_insecure_uploads {
-            if !matches!(upload_url.scheme(), "http" | "https") {
-                return Err(BackupError::InvalidGatewayResponse);
-            }
-        } else if upload_url.scheme() != "https"
-            || upload_url.host_str() != Some(B2_UPLOAD_HOST)
-            || upload_url.port_or_known_default() != Some(443)
-            || !upload_url.path().starts_with(B2_UPLOAD_PATH_PREFIX)
-            || upload_url.path() == B2_UPLOAD_PATH_PREFIX
-            || upload_url.query().is_none()
-        {
-            return Err(BackupError::InvalidGatewayResponse);
-        }
-
-        if reservation.required_headers.len() != REQUIRED_UPLOAD_HEADERS.len() {
-            return Err(BackupError::InvalidGatewayResponse);
-        }
-
-        let mut headers = HeaderMap::new();
-        for (name, value) in &reservation.required_headers {
-            let name = HeaderName::from_bytes(name.as_bytes())
-                .map_err(|_| BackupError::InvalidGatewayResponse)?;
-            if !REQUIRED_UPLOAD_HEADERS.contains(&name.as_str()) || headers.contains_key(&name) {
-                return Err(BackupError::InvalidGatewayResponse);
-            }
-            let value =
-                HeaderValue::from_str(value).map_err(|_| BackupError::InvalidGatewayResponse)?;
-            headers.insert(name, value);
-        }
-
-        let expected_length = queued.metadata.size_bytes.to_string();
-        if headers
-            .get(reqwest::header::CONTENT_LENGTH)
-            .and_then(|value| value.to_str().ok())
-            != Some(expected_length.as_str())
-        {
-            return Err(BackupError::InvalidGatewayResponse);
-        }
-        if headers
-            .get("x-amz-meta-sha256")
-            .and_then(|value| value.to_str().ok())
-            != Some(queued.metadata.sha256.as_str())
-        {
-            return Err(BackupError::InvalidGatewayResponse);
-        }
-        if headers
-            .get("x-amz-content-sha256")
-            .and_then(|value| value.to_str().ok())
-            != Some("UNSIGNED-PAYLOAD")
-        {
-            return Err(BackupError::InvalidGatewayResponse);
-        }
-        if headers
-            .get("x-amz-server-side-encryption")
-            .and_then(|value| value.to_str().ok())
-            != Some("AES256")
-        {
-            return Err(BackupError::InvalidGatewayResponse);
-        }
-
-        Ok((upload_url, headers))
     }
 
     async fn complete(&self, token: &str, backup_id: &str) -> BackupResult<CompletionProbe> {
@@ -631,12 +499,6 @@ impl GatewayClient {
         }
         Ok(status)
     }
-}
-
-fn direct_upload_error_allows_relay(error: &reqwest::Error) -> bool {
-    error.status().is_none()
-        && !error.is_body()
-        && (error.is_timeout() || error.is_connect() || error.is_request())
 }
 
 async fn require_completed_response(
@@ -696,14 +558,6 @@ fn ensure_success(status: StatusCode) -> BackupResult<()> {
         Ok(())
     } else {
         Err(BackupError::GatewayRejected(status.as_u16()))
-    }
-}
-
-fn ensure_upload_success(status: StatusCode) -> BackupResult<()> {
-    if status.is_success() {
-        Ok(())
-    } else {
-        Err(BackupError::UploadRejected(status.as_u16()))
     }
 }
 
@@ -1045,126 +899,33 @@ impl BackupService {
             }
             let mut binding_resets = 0_u8;
             loop {
-                let reservation: UploadUrlResponse;
-                if let Some(pending) = queued.metadata.upload.clone() {
-                    if validate_backup_id(&pending.backup_id).is_err() {
-                        // A malformed local sidecar must never be sent to the
-                        // gateway, but the verified ciphertext remains useful.
-                        queued.metadata.upload = None;
-                        write_json_atomic(&queued.metadata_path, &queued.metadata)?;
-                        continue;
-                    }
-                    match self.gateway.complete(token, &pending.backup_id).await? {
-                        CompletionProbe::Completed => {
-                            remove_queued_backup(&queued)?;
-                            uploaded_count += 1;
-                            break;
-                        }
-                        CompletionProbe::BindingNotFound => {
-                            binding_resets += 1;
-                            queued.metadata.upload = None;
-                            write_json_atomic(&queued.metadata_path, &queued.metadata)?;
-                            if binding_resets > 1 {
-                                return Err(BackupError::GatewayRejected(404));
-                            }
-                            continue;
-                        }
-                        CompletionProbe::ObjectNotPresent => match pending.stage {
-                            UploadStage::RelayPending => {
-                                match self
-                                    .gateway
-                                    .relay_ciphertext(token, &queued, &pending.backup_id)
-                                    .await
-                                {
-                                    Ok(()) => {
-                                        remove_queued_backup(&queued)?;
-                                        uploaded_count += 1;
-                                        break;
-                                    }
-                                    Err(BackupError::GatewayRejected(404)) => {
-                                        binding_resets += 1;
-                                        queued.metadata.upload = None;
-                                        write_json_atomic(&queued.metadata_path, &queued.metadata)?;
-                                        if binding_resets > 1 {
-                                            return Err(BackupError::GatewayRejected(404));
-                                        }
-                                        continue;
-                                    }
-                                    Err(error) => return Err(error),
-                                }
-                            }
-                            UploadStage::Reserved | UploadStage::Uploaded => {
-                                let refreshed = self.gateway.reserve_upload(token, &queued).await?;
-                                validate_backup_id(&refreshed.backup_id)?;
-                                if refreshed.backup_id != pending.backup_id {
-                                    return Err(BackupError::InvalidGatewayResponse);
-                                }
-                                reservation = refreshed;
-                            }
-                        },
-                    }
+                let pending = if let Some(pending) = queued.metadata.upload.clone() {
+                    pending
                 } else {
                     let reserved = self.gateway.reserve_upload(token, &queued).await?;
                     validate_backup_id(&reserved.backup_id)?;
-                    queued.metadata.upload = Some(PendingUpload {
+                    let pending = PendingUpload {
                         backup_id: reserved.backup_id.clone(),
-                        stage: UploadStage::Reserved,
-                    });
+                        stage: UploadStage::RelayPending,
+                    };
+                    queued.metadata.upload = Some(pending.clone());
                     write_json_atomic(&queued.metadata_path, &queued.metadata)?;
+                    pending
+                };
 
-                    // The gateway may reuse a still-pending reservation for
-                    // this exact ciphertext. Confirm it before the first local
-                    // PUT so losing/reconstructing a sidecar cannot create a
-                    // second B2 object version.
-                    match self.gateway.complete(token, &reserved.backup_id).await? {
-                        CompletionProbe::Completed => {
-                            remove_queued_backup(&queued)?;
-                            uploaded_count += 1;
-                            break;
-                        }
-                        CompletionProbe::BindingNotFound => {
-                            return Err(BackupError::InvalidGatewayResponse);
-                        }
-                        CompletionProbe::ObjectNotPresent => reservation = reserved,
-                    }
+                if validate_backup_id(&pending.backup_id).is_err() {
+                    // A malformed local sidecar must never be sent to the
+                    // gateway, but the verified ciphertext remains useful.
+                    queued.metadata.upload = None;
+                    write_json_atomic(&queued.metadata_path, &queued.metadata)?;
+                    continue;
                 }
 
-                queued.metadata.upload = Some(PendingUpload {
-                    backup_id: reservation.backup_id.clone(),
-                    stage: UploadStage::Reserved,
-                });
-                write_json_atomic(&queued.metadata_path, &queued.metadata)?;
-                match self.gateway.put_ciphertext(&queued, &reservation).await? {
-                    DirectUploadOutcome::RelayRequired => {
-                        // A timeout is ambiguous: the direct PUT may have
-                        // landed. Persist relay intent and wait for an
-                        // authenticated completion probe on the next flush.
-                        queued.metadata.upload = Some(PendingUpload {
-                            backup_id: reservation.backup_id,
-                            stage: UploadStage::RelayPending,
-                        });
-                        write_json_atomic(&queued.metadata_path, &queued.metadata)?;
-                        return Err(BackupError::GatewayUnavailable);
-                    }
-                    DirectUploadOutcome::Uploaded => {
-                        queued.metadata.upload = Some(PendingUpload {
-                            backup_id: reservation.backup_id.clone(),
-                            stage: UploadStage::Uploaded,
-                        });
-                        write_json_atomic(&queued.metadata_path, &queued.metadata)?;
-                    }
-                }
-
-                match self.gateway.complete(token, &reservation.backup_id).await? {
+                match self.gateway.complete(token, &pending.backup_id).await? {
                     CompletionProbe::Completed => {
                         remove_queued_backup(&queued)?;
                         uploaded_count += 1;
                         break;
-                    }
-                    CompletionProbe::ObjectNotPresent => {
-                        // Preserve Uploaded: the next run must confirm again
-                        // before it obtains a fresh URL and repeats the PUT.
-                        return Err(BackupError::GatewayRejected(409));
                     }
                     CompletionProbe::BindingNotFound => {
                         binding_resets += 1;
@@ -1172,6 +933,40 @@ impl BackupService {
                         write_json_atomic(&queued.metadata_path, &queued.metadata)?;
                         if binding_resets > 1 {
                             return Err(BackupError::GatewayRejected(404));
+                        }
+                        continue;
+                    }
+                    CompletionProbe::ObjectNotPresent => {
+                        // Reserved and Uploaded are legacy direct-B2 stages.
+                        // Persist the relay-only intent before any network body
+                        // leaves the machine so a lost response is resumable.
+                        if pending.stage != UploadStage::RelayPending {
+                            queued.metadata.upload = Some(PendingUpload {
+                                backup_id: pending.backup_id.clone(),
+                                stage: UploadStage::RelayPending,
+                            });
+                            write_json_atomic(&queued.metadata_path, &queued.metadata)?;
+                        }
+                        match self
+                            .gateway
+                            .relay_ciphertext(token, &queued, &pending.backup_id)
+                            .await
+                        {
+                            Ok(()) => {
+                                remove_queued_backup(&queued)?;
+                                uploaded_count += 1;
+                                break;
+                            }
+                            Err(BackupError::GatewayRejected(404)) => {
+                                binding_resets += 1;
+                                queued.metadata.upload = None;
+                                write_json_atomic(&queued.metadata_path, &queued.metadata)?;
+                                if binding_resets > 1 {
+                                    return Err(BackupError::GatewayRejected(404));
+                                }
+                                continue;
+                            }
+                            Err(error) => return Err(error),
                         }
                     }
                 }
@@ -1788,7 +1583,6 @@ mod tests {
         assert!(gateway_auth_rejected(&BackupError::GatewayRejected(401)));
         assert!(gateway_auth_rejected(&BackupError::GatewayRejected(403)));
         assert!(!gateway_auth_rejected(&BackupError::GatewayRejected(404)));
-        assert!(!gateway_auth_rejected(&BackupError::UploadRejected(403)));
         assert!(!gateway_auth_rejected(&BackupError::GatewayUnavailable));
     }
 
@@ -2177,7 +1971,6 @@ mod tests {
 
     #[derive(Clone, Default)]
     struct StaleBindingState {
-        origin: Arc<StdMutex<String>>,
         reserve_attempts: Arc<AtomicUsize>,
         uploaded_sha256: Arc<StdMutex<Option<String>>>,
     }
@@ -2193,31 +1986,17 @@ mod tests {
                 Json(json!({"error": "force_binding_inspection"})),
             );
         }
-        let size = body["content_length"].as_u64().expect("size");
-        let sha256 = body["sha256"].as_str().expect("sha256");
-        let origin = state.origin.lock().expect("origin").clone();
+        assert!(body["content_length"].as_u64().is_some());
+        assert_eq!(body["sha256"].as_str().expect("sha256").len(), 64);
         (
             AxumStatus::OK,
             Json(json!({
                 "backup_id": REBOUND_BACKUP_ID,
                 "retention_class": "rolling",
-                "method": "PUT",
-                "upload_url": format!("{origin}/object"),
-                "required_headers": {
-                    "content-length": size.to_string(),
-                    "x-amz-content-sha256": "UNSIGNED-PAYLOAD",
-                    "x-amz-meta-sha256": sha256,
-                    "x-amz-server-side-encryption": "AES256"
-                },
+                "transport": "gateway_relay",
                 "expires_at": "2026-07-15T12:15:00Z"
             })),
         )
-    }
-
-    async fn mock_stale_object(State(state): State<StaleBindingState>, body: Bytes) -> AxumStatus {
-        *state.uploaded_sha256.lock().expect("uploaded sha") =
-            Some(format!("{:x}", Sha256::digest(&body)));
-        AxumStatus::OK
     }
 
     async fn mock_stale_complete(
@@ -2255,13 +2034,22 @@ mod tests {
     }
 
     async fn mock_stale_relay(
+        State(state): State<StaleBindingState>,
         AxumPath(backup_id): AxumPath<String>,
-        _body: Bytes,
+        body: Bytes,
     ) -> (AxumStatus, Json<Value>) {
-        assert_eq!(backup_id, STALE_BACKUP_ID);
+        assert_eq!(backup_id, REBOUND_BACKUP_ID);
+        *state.uploaded_sha256.lock().expect("uploaded sha") =
+            Some(format!("{:x}", Sha256::digest(&body)));
         (
-            AxumStatus::CONFLICT,
-            Json(json!({"error": "stale_backup_id"})),
+            AxumStatus::OK,
+            Json(json!({
+                "backup_id": backup_id,
+                "status": "completed",
+                "completed_at": "2026-07-15T12:01:00Z",
+                "etag": null,
+                "version_id": "rebound-version-1"
+            })),
         )
     }
 
@@ -2271,12 +2059,10 @@ mod tests {
             .expect("listener");
         let origin = format!("http://{}", listener.local_addr().expect("address"));
         let state = StaleBindingState::default();
-        *state.origin.lock().expect("origin") = origin.clone();
         let app = Router::new()
             .route("/v1/backups/upload-url", post(mock_stale_reserve))
             .route("/v1/backups/relay/{backup_id}", put(mock_stale_relay))
             .route("/v1/backups/complete", post(mock_stale_complete))
-            .route("/object", put(mock_stale_object))
             .with_state(state.clone());
         let server = tokio::spawn(async move {
             axum::serve(listener, app).await.expect("mock server");
@@ -2352,21 +2138,13 @@ mod tests {
     }
 
     async fn mock_mismatched_retention_reserve(
-        State(state): State<StaleBindingState>,
-        Json(body): Json<Value>,
+        State(_state): State<StaleBindingState>,
+        Json(_body): Json<Value>,
     ) -> Json<Value> {
-        let origin = state.origin.lock().expect("origin").clone();
         Json(json!({
             "backup_id": REBOUND_BACKUP_ID,
             "retention_class": "monthly",
-            "method": "PUT",
-            "upload_url": format!("{origin}/object"),
-            "required_headers": {
-                "content-length": body["content_length"].as_u64().unwrap().to_string(),
-                "x-amz-content-sha256": "UNSIGNED-PAYLOAD",
-                "x-amz-meta-sha256": body["sha256"],
-                "x-amz-server-side-encryption": "AES256"
-            },
+            "transport": "gateway_relay",
             "expires_at": "2026-07-15T12:15:00Z"
         }))
     }
@@ -2378,7 +2156,6 @@ mod tests {
             .expect("listener");
         let origin = format!("http://{}", listener.local_addr().expect("address"));
         let state = StaleBindingState::default();
-        *state.origin.lock().expect("origin") = origin.clone();
         let app = Router::new()
             .route(
                 "/v1/backups/upload-url",
@@ -2496,9 +2273,8 @@ mod tests {
     #[derive(Clone, Default)]
     struct MockObservations {
         enrolled: Arc<StdMutex<bool>>,
-        uploaded_without_bearer: Arc<StdMutex<bool>>,
+        relayed_with_bearer: Arc<StdMutex<bool>>,
         completed: Arc<StdMutex<bool>>,
-        origin: Arc<StdMutex<String>>,
     }
 
     async fn mock_enroll(
@@ -2519,7 +2295,7 @@ mod tests {
     }
 
     async fn mock_reserve(
-        State(state): State<MockObservations>,
+        State(_state): State<MockObservations>,
         headers: AxumHeaders,
         Json(body): Json<Value>,
     ) -> Json<Value> {
@@ -2529,40 +2305,49 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some("Bearer secret-device-token")
         );
-        let size = body["content_length"].as_u64().expect("size");
-        let sha = body["sha256"].as_str().expect("sha");
-        let origin = state.origin.lock().expect("origin").clone();
+        assert!(body["content_length"].as_u64().is_some());
+        assert_eq!(body["sha256"].as_str().expect("sha").len(), 64);
         Json(json!({
             "backup_id": "00000000-0000-4000-8000-000000000002",
             "retention_class": "rolling",
-            "method": "PUT",
-            "upload_url": format!("{origin}/object"),
-            "required_headers": {
-                "content-length": size.to_string(),
-                "x-amz-content-sha256": "UNSIGNED-PAYLOAD",
-                "x-amz-meta-sha256": sha,
-                "x-amz-server-side-encryption": "AES256"
-            },
+            "transport": "gateway_relay",
             "expires_at": "2026-07-14T12:15:00Z"
         }))
     }
 
-    async fn mock_upload(
+    async fn mock_gateway_relay(
         State(state): State<MockObservations>,
+        AxumPath(backup_id): AxumPath<String>,
         headers: AxumHeaders,
         body: Bytes,
-    ) -> AxumStatus {
-        assert!(headers.get("authorization").is_none());
+    ) -> (AxumStatus, Json<Value>) {
+        assert_eq!(backup_id, "00000000-0000-4000-8000-000000000002");
+        assert_eq!(
+            headers
+                .get("authorization")
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer secret-device-token")
+        );
         assert!(headers.get("cookie").is_none());
         assert_eq!(
             headers
-                .get("x-amz-server-side-encryption")
+                .get("content-type")
                 .and_then(|value| value.to_str().ok()),
-            Some("AES256")
+            Some("application/octet-stream")
         );
         assert!(!body.starts_with(b"SQLite format 3"));
-        *state.uploaded_without_bearer.lock().expect("uploaded") = true;
-        AxumStatus::OK
+        *state.relayed_with_bearer.lock().expect("relayed") = true;
+        *state.completed.lock().expect("completed") = true;
+        (
+            AxumStatus::OK,
+            Json(json!({
+                "backup_id": backup_id,
+                "status": "completed",
+                "completed_at": "2026-07-14T12:01:00Z",
+                "etag": null,
+                "version_id": "test-version-1"
+            })),
+        )
     }
 
     async fn mock_complete(
@@ -2577,7 +2362,7 @@ mod tests {
             Some("Bearer secret-device-token")
         );
         assert_eq!(body["backup_id"], "00000000-0000-4000-8000-000000000002");
-        if !*state.uploaded_without_bearer.lock().expect("uploaded") {
+        if !*state.relayed_with_bearer.lock().expect("relayed") {
             return (
                 AxumStatus::CONFLICT,
                 Json(json!({"error": {"code": "object_not_present", "message": "not present"}})),
@@ -2618,17 +2403,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gateway_flow_stores_token_outside_state_and_never_sends_it_to_object_put() {
+    async fn gateway_flow_stores_token_outside_state_and_sends_ciphertext_only_to_gateway() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("listener");
         let origin = format!("http://{}", listener.local_addr().expect("address"));
         let observations = MockObservations::default();
-        *observations.origin.lock().expect("origin") = origin.clone();
         let app = Router::new()
             .route("/v1/enroll", post(mock_enroll))
             .route("/v1/backups/upload-url", post(mock_reserve))
-            .route("/object", put(mock_upload))
+            .route("/v1/backups/relay/{backup_id}", put(mock_gateway_relay))
             .route("/v1/backups/complete", post(mock_complete))
             .route("/v1/backups/status", get(mock_status))
             .with_state(observations.clone());
@@ -2669,10 +2453,7 @@ mod tests {
         let status = service.status().await.expect("status");
         assert!(status.remote.is_some());
         assert!(*observations.enrolled.lock().expect("enrolled"));
-        assert!(*observations
-            .uploaded_without_bearer
-            .lock()
-            .expect("uploaded"));
+        assert!(*observations.relayed_with_bearer.lock().expect("relayed"));
         assert!(*observations.completed.lock().expect("completed"));
 
         server.abort();
@@ -2680,7 +2461,6 @@ mod tests {
 
     #[derive(Clone, Default)]
     struct RelayMockState {
-        direct_upload_url: Arc<StdMutex<String>>,
         reserve_count: Arc<StdMutex<usize>>,
         relay_count: Arc<StdMutex<usize>>,
         complete_count: Arc<StdMutex<usize>>,
@@ -2707,24 +2487,12 @@ mod tests {
         assert_eq!(body["retention_class"], "rolling");
         *state.reserve_count.lock().expect("reserve count") += 1;
         *state.expected_size.lock().expect("expected size") = size;
-        *state.expected_sha256.lock().expect("expected sha256") = sha256.clone();
-        let direct_upload_url = state
-            .direct_upload_url
-            .lock()
-            .expect("direct upload url")
-            .clone();
+        *state.expected_sha256.lock().expect("expected sha256") = sha256;
 
         Json(json!({
             "backup_id": "00000000-0000-4000-8000-000000000022",
             "retention_class": "rolling",
-            "method": "PUT",
-            "upload_url": direct_upload_url,
-            "required_headers": {
-                "content-length": size.to_string(),
-                "x-amz-content-sha256": "UNSIGNED-PAYLOAD",
-                "x-amz-meta-sha256": sha256,
-                "x-amz-server-side-encryption": "AES256"
-            },
+            "transport": "gateway_relay",
             "expires_at": "2026-07-15T12:15:00Z"
         }))
     }
@@ -2834,24 +2602,6 @@ mod tests {
         )
     }
 
-    async fn mock_direct_http_rejection(_body: Bytes) -> AxumStatus {
-        AxumStatus::SERVICE_UNAVAILABLE
-    }
-
-    async fn mock_ambiguous_direct_put(
-        State(state): State<RelayMockState>,
-        body: Bytes,
-    ) -> AxumStatus {
-        assert_eq!(
-            body.len() as u64,
-            *state.expected_size.lock().expect("size")
-        );
-        *state.object_versions.lock().expect("object versions") += 1;
-        // Model an object store/proxy that persisted the body but returned an
-        // error, leaving the client unable to infer whether the PUT landed.
-        AxumStatus::SERVICE_UNAVAILABLE
-    }
-
     #[tokio::test]
     async fn lost_relay_response_is_confirmed_without_a_second_object_version() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -2859,8 +2609,6 @@ mod tests {
             .expect("listener");
         let origin = format!("http://{}", listener.local_addr().expect("address"));
         let state = RelayMockState::default();
-        *state.direct_upload_url.lock().expect("direct upload url") =
-            format!("https://{}/object", listener.local_addr().expect("address"));
         *state.fail_first_relay.lock().expect("fail first relay") = true;
         let app = Router::new()
             .route("/v1/backups/upload-url", post(mock_relay_reserve))
@@ -2902,10 +2650,6 @@ mod tests {
             &format!("{origin}/"),
             Arc::new(MemoryTokenStore::with_token("relay-device-token")),
         );
-        assert!(matches!(
-            restarted_service.flush_queue("relay-device-token").await,
-            Err(BackupError::GatewayRejected(502))
-        ));
         assert_eq!(
             restarted_service
                 .flush_queue("relay-device-token")
@@ -2920,102 +2664,6 @@ mod tests {
         assert_eq!(*state.reserve_count.lock().expect("reserve count"), 1);
         assert_eq!(*state.relay_count.lock().expect("relay count"), 1);
         assert_eq!(*state.object_versions.lock().expect("object versions"), 1);
-        assert_eq!(*state.complete_count.lock().expect("complete count"), 3);
-
-        server.abort();
-    }
-
-    #[tokio::test]
-    async fn direct_b2_http_status_does_not_trigger_relay() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("listener");
-        let origin = format!("http://{}", listener.local_addr().expect("address"));
-        let state = RelayMockState::default();
-        *state.direct_upload_url.lock().expect("direct upload url") = format!("{origin}/object");
-        let app = Router::new()
-            .route("/v1/backups/upload-url", post(mock_relay_reserve))
-            .route("/object", put(mock_direct_http_rejection))
-            .route("/v1/backups/relay/{backup_id}", put(mock_relay_upload))
-            .route("/v1/backups/complete", post(mock_relay_complete))
-            .with_state(state.clone());
-        let server = tokio::spawn(async move {
-            axum::serve(listener, app).await.expect("mock server");
-        });
-
-        let temp = TempDir::new().expect("temp");
-        let database = seeded_database(&temp);
-        let identity = x25519::Identity::generate();
-        let service = test_service(
-            &temp,
-            database,
-            &identity,
-            &format!("{origin}/"),
-            Arc::new(MemoryTokenStore::with_token("relay-device-token")),
-        );
-        let report = service
-            .backup_now(RetentionClass::Rolling)
-            .await
-            .expect("local backup remains successful");
-        assert_eq!(report.remote_result, RemoteResult::QueuedOffline);
-        assert_eq!(report.pending_count, 1);
-        let queued = service.list_queue().expect("queued backup");
-        assert_eq!(
-            queued[0].metadata.upload.as_ref().expect("pending").stage,
-            UploadStage::Reserved
-        );
-        assert_eq!(*state.reserve_count.lock().expect("reserve count"), 1);
-        assert_eq!(*state.relay_count.lock().expect("relay count"), 0);
-        assert_eq!(*state.complete_count.lock().expect("complete count"), 1);
-
-        server.abort();
-    }
-
-    #[tokio::test]
-    async fn ambiguous_direct_put_is_confirmed_without_a_second_object_version() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("listener");
-        let origin = format!("http://{}", listener.local_addr().expect("address"));
-        let state = RelayMockState::default();
-        *state.direct_upload_url.lock().expect("direct upload url") = format!("{origin}/object");
-        let app = Router::new()
-            .route("/v1/backups/upload-url", post(mock_relay_reserve))
-            .route("/object", put(mock_ambiguous_direct_put))
-            .route("/v1/backups/relay/{backup_id}", put(mock_relay_upload))
-            .route("/v1/backups/complete", post(mock_relay_complete))
-            .with_state(state.clone());
-        let server = tokio::spawn(async move {
-            axum::serve(listener, app).await.expect("mock server");
-        });
-
-        let temp = TempDir::new().expect("temp");
-        let database = seeded_database(&temp);
-        let identity = x25519::Identity::generate();
-        let service = test_service(
-            &temp,
-            database,
-            &identity,
-            &format!("{origin}/"),
-            Arc::new(MemoryTokenStore::with_token("relay-device-token")),
-        );
-        let first = service
-            .backup_now(RetentionClass::Rolling)
-            .await
-            .expect("local snapshot remains queued");
-        assert_eq!(first.remote_result, RemoteResult::QueuedOffline);
-        assert_eq!(*state.object_versions.lock().expect("object versions"), 1);
-        assert_eq!(
-            service
-                .flush_queue("relay-device-token")
-                .await
-                .expect("confirm ambiguous direct PUT"),
-            1
-        );
-        assert!(service.list_queue().expect("empty queue").is_empty());
-        assert_eq!(*state.object_versions.lock().expect("object versions"), 1);
-        assert_eq!(*state.reserve_count.lock().expect("reserve count"), 1);
-        assert_eq!(*state.relay_count.lock().expect("relay count"), 0);
         assert_eq!(*state.complete_count.lock().expect("complete count"), 2);
 
         server.abort();
@@ -3028,8 +2676,6 @@ mod tests {
             .expect("listener");
         let origin = format!("http://{}", listener.local_addr().expect("address"));
         let state = RelayMockState::default();
-        *state.direct_upload_url.lock().expect("direct upload url") =
-            format!("https://{}/object", listener.local_addr().expect("address"));
         *state
             .invalid_successes_before_valid
             .lock()
@@ -3060,12 +2706,6 @@ mod tests {
         assert_eq!(report.remote_result, RemoteResult::QueuedOffline);
         assert_eq!(service.list_queue().expect("first queued retry").len(), 1);
 
-        assert!(matches!(
-            service.flush_queue("relay-device-token").await,
-            Err(BackupError::InvalidGatewayResponse)
-        ));
-        assert_eq!(service.list_queue().expect("second queued retry").len(), 1);
-
         assert_eq!(
             service
                 .flush_queue("relay-device-token")
@@ -3077,7 +2717,7 @@ mod tests {
         assert_eq!(*state.reserve_count.lock().expect("reserve count"), 1);
         assert_eq!(*state.relay_count.lock().expect("relay count"), 1);
         assert_eq!(*state.object_versions.lock().expect("object versions"), 1);
-        assert_eq!(*state.complete_count.lock().expect("complete count"), 3);
+        assert_eq!(*state.complete_count.lock().expect("complete count"), 2);
 
         server.abort();
     }
@@ -3088,103 +2728,24 @@ mod tests {
         assert!(UPLOAD_REQUEST_TIMEOUT < Duration::from_secs(60 * 60));
     }
 
-    fn queued_for_upload(temp: &TempDir) -> QueuedBackup {
-        let path = temp.path().join("test.sqlite3.age");
-        QueuedBackup {
-            metadata_path: queue_metadata_path(&path),
-            path,
-            metadata: QueueMetadata {
-                format_version: QUEUE_METADATA_VERSION,
-                created_at: "2026-07-14T12:00:00Z".to_owned(),
-                retention_class: RetentionClass::Rolling,
-                size_bytes: 3,
-                sha256: "a".repeat(64),
-                local_recovery: false,
-                scheduled_period: None,
-                upload: None,
-            },
-        }
-    }
-
-    fn valid_production_reservation() -> UploadUrlResponse {
-        UploadUrlResponse {
-            backup_id: "00000000-0000-4000-8000-000000000002".to_owned(),
-            retention_class: RetentionClass::Rolling,
-            method: "PUT".to_owned(),
-            upload_url: concat!(
-                "https://s3.us-west-004.backblazeb2.com/",
-                "stronganchor-pusula-desktop-backups/backups/rolling/",
-                "device/file.sqlite3.age?X-Amz-Signature=test"
-            )
-            .to_owned(),
-            required_headers: BTreeMap::from([
-                ("content-length".to_owned(), "3".to_owned()),
-                (
-                    "x-amz-content-sha256".to_owned(),
-                    "UNSIGNED-PAYLOAD".to_owned(),
-                ),
-                ("x-amz-meta-sha256".to_owned(), "a".repeat(64)),
-                (
-                    "x-amz-server-side-encryption".to_owned(),
-                    "AES256".to_owned(),
-                ),
-            ]),
-        }
-    }
-
     #[test]
-    fn production_uploads_are_pinned_to_the_expected_b2_destination_and_headers() {
-        let temp = TempDir::new().expect("temp");
-        let queued = queued_for_upload(&temp);
-        let gateway = GatewayClient::new(
-            "https://pusula-backup.stronganchortech.com/",
-            false,
-            Duration::from_secs(2),
-        )
-        .expect("gateway");
-        gateway
-            .validate_upload_request(&queued, &valid_production_reservation())
-            .expect("valid production upload");
+    fn reservation_schema_requires_the_relay_transport_and_no_external_url() {
+        let reservation: UploadUrlResponse = serde_json::from_value(json!({
+            "backup_id": "00000000-0000-4000-8000-000000000002",
+            "retention_class": "rolling",
+            "transport": "gateway_relay",
+            "expires_at": "2026-07-14T12:15:00Z"
+        }))
+        .expect("relay reservation");
+        assert_eq!(reservation.transport, GATEWAY_RELAY_TRANSPORT);
 
-        for invalid_url in [
-            "https://evil.example/stronganchor-pusula-desktop-backups/backups/file?sig=x",
-            "https://s3.us-west-004.backblazeb2.com/other-bucket/backups/file?sig=x",
-            "https://s3.us-west-004.backblazeb2.com:444/stronganchor-pusula-desktop-backups/backups/file?sig=x",
-            "https://s3.us-west-004.backblazeb2.com/stronganchor-pusula-desktop-backups/backups/file",
-            "http://s3.us-west-004.backblazeb2.com/stronganchor-pusula-desktop-backups/backups/file?sig=x",
-        ] {
-            let mut reservation = valid_production_reservation();
-            reservation.upload_url = invalid_url.to_owned();
-            assert!(matches!(
-                gateway.validate_upload_request(&queued, &reservation),
-                Err(BackupError::InvalidGatewayResponse)
-            ));
-        }
-
-        let mut extra_header = valid_production_reservation();
-        extra_header
-            .required_headers
-            .insert("authorization".to_owned(), "secret".to_owned());
-        assert!(matches!(
-            gateway.validate_upload_request(&queued, &extra_header),
-            Err(BackupError::InvalidGatewayResponse)
-        ));
-
-        for (header, invalid_value) in [
-            ("content-length", "4"),
-            ("x-amz-content-sha256", "payload-hash"),
-            ("x-amz-meta-sha256", "wrong"),
-            ("x-amz-server-side-encryption", "none"),
-        ] {
-            let mut reservation = valid_production_reservation();
-            reservation
-                .required_headers
-                .insert(header.to_owned(), invalid_value.to_owned());
-            assert!(matches!(
-                gateway.validate_upload_request(&queued, &reservation),
-                Err(BackupError::InvalidGatewayResponse)
-            ));
-        }
+        assert!(serde_json::from_value::<UploadUrlResponse>(json!({
+            "backup_id": "00000000-0000-4000-8000-000000000002",
+            "retention_class": "rolling",
+            "method": "PUT",
+            "upload_url": "https://object-storage.example/file"
+        }))
+        .is_err());
     }
 
     #[tokio::test]

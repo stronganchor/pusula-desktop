@@ -45,8 +45,6 @@ $version = '0.1.0'
 $repository = 'stronganchor/pusula-desktop'
 $commit = 'a' * 40
 $candidateTag = "v$version-candidate.$commit"
-$publisher = 'Test Publisher'
-$certificate = 'b' * 64
 $workflowRunId = 123456789L
 $global:PusulaEvidenceRunCommit = $commit
 
@@ -96,7 +94,7 @@ try {
     $checks = [ordered]@{}
     foreach ($name in $script:PusulaAcceptanceCheckNames) { $checks[$name] = 'pass' }
     $baseEvidence = [pscustomobject][ordered]@{
-        schema_version = 2
+        schema_version = 3
         repository = $repository
         version = $version
         candidate = [ordered]@{
@@ -117,22 +115,25 @@ try {
                 offline_install = $true
                 restart_completed = $true
             }
+            windows_distribution = [ordered]@{
+                mode = 'managed_unsigned_single_machine'
+                install_mode = 'currentUser'
+                offline_installer_authenticode_status = 'NotSigned'
+                updater_installer_authenticode_status = 'NotSigned'
+                initial_installer_sha256_verified = $true
+                initial_smartscreen_acknowledged = $true
+                trusted_publisher_certificate_installed = $false
+                tauri_updater_signature_verified = $true
+                in_app_update_manual_prompts = 1
+            }
             baseline = [ordered]@{
                 version = '0.0.9'
                 archive_sha256 = 'c' * 64
                 installed_exe_sha256 = 'd' * 64
-                publisher = $publisher
-                certificate_sha256 = $certificate
-                authenticode_valid = $true
-                timestamped = $true
             }
             candidate_install = [ordered]@{
                 version = $version
                 installed_exe_sha256 = 'e' * 64
-                publisher = $publisher
-                certificate_sha256 = $certificate
-                authenticode_valid = $true
-                timestamped = $true
             }
             fixture_restore = [ordered]@{
                 fixture_manifest_sha256 = 'd709a52df5147bddd57d569d1de4113f76ac10f8841405d970e4e60bdd90ade6'
@@ -145,11 +146,11 @@ try {
                 desktop_size = 987654L
                 gateway_sha256 = 'f' * 64
                 gateway_size = 987654L
-                gateway_version_id = '4_z0123456789abcdef_f0000000000000001_d20260101_m003000_c001_v0000001_t0001'
+                gateway_version_id = "fs-sha256-$('f' * 64)"
                 gateway_verified_at_utc = '2026-01-01T00:30:00.0000000Z'
-                b2_sha256 = 'f' * 64
-                b2_size = 987654L
-                b2_version_id = '4_z0123456789abcdef_f0000000000000001_d20260101_m003000_c001_v0000001_t0001'
+                storage_sha256 = 'f' * 64
+                storage_size = 987654L
+                storage_version_id = "fs-sha256-$('f' * 64)"
                 gateway_spool_empty = $true
                 sqlite_integrity = 'ok'
                 foreign_keys = 'ok'
@@ -184,9 +185,7 @@ try {
         -Repository $repository `
         -Version $version `
         -CandidateTag $candidateTag `
-        -CandidateCommit $commit `
-        -ExpectedWindowsPublisher $publisher `
-        -ExpectedWindowsCertificateSha256 $certificate)
+        -CandidateCommit $commit)
     @($producerOutput | Where-Object { $_ -notlike 'workflow_dispatch base64:*' }) | Out-Host
     $canonicalHash = Get-LowerSha256 $canonicalPath
 
@@ -198,8 +197,6 @@ try {
         -Version $version `
         -CandidateTag $candidateTag `
         -CandidateCommit $commit `
-        -ExpectedWindowsPublisher $publisher `
-        -ExpectedWindowsCertificateSha256 $certificate `
         -ActionsToken 'test-actions-token' | Out-Host
 
     $canonicalBytes = [IO.File]::ReadAllBytes($canonicalPath)
@@ -238,7 +235,6 @@ try {
             & $verifierScript `
                 -EvidencePath $path -ExpectedSha256 $hash -CandidateAssetDirectory $assetDirectory `
                 -Repository $repository -Version $version -CandidateTag $candidateTag -CandidateCommit $commit `
-                -ExpectedWindowsPublisher $publisher -ExpectedWindowsCertificateSha256 $certificate `
                 -ActionsToken 'test-actions-token'
         }
     }
@@ -259,9 +255,29 @@ try {
     $wrongAsset.candidate.assets[0].sha256 = '2' * 64
     Invoke-MutatedEvidence $wrongAsset '*asset bytes differ*'
 
-    $wrongPublisher = Copy-JsonValue $baseEvidence
-    $wrongPublisher.acceptance.baseline.publisher = 'Other Publisher'
-    Invoke-MutatedEvidence $wrongPublisher '*publisher or certificate*'
+    $wrongDistribution = Copy-JsonValue $baseEvidence
+    $wrongDistribution.acceptance.windows_distribution.mode = 'public_signed_distribution'
+    Invoke-MutatedEvidence $wrongDistribution '*managed unsigned current-user release mode*'
+
+    $signedInstaller = Copy-JsonValue $baseEvidence
+    $signedInstaller.acceptance.windows_distribution.updater_installer_authenticode_status = 'Valid'
+    Invoke-MutatedEvidence $signedInstaller '*managed unsigned current-user release mode*'
+
+    $missingSmartScreenAcknowledgement = Copy-JsonValue $baseEvidence
+    $missingSmartScreenAcknowledgement.acceptance.windows_distribution.initial_smartscreen_acknowledged = $false
+    Invoke-MutatedEvidence $missingSmartScreenAcknowledgement '*initial_smartscreen_acknowledged must be the JSON boolean true*'
+
+    $trustedSelfSignedCertificate = Copy-JsonValue $baseEvidence
+    $trustedSelfSignedCertificate.acceptance.windows_distribution.trusted_publisher_certificate_installed = $true
+    Invoke-MutatedEvidence $trustedSelfSignedCertificate '*trusted_publisher_certificate_installed must be the JSON boolean false*'
+
+    $missingUpdateConfirmation = Copy-JsonValue $baseEvidence
+    $missingUpdateConfirmation.acceptance.windows_distribution.in_app_update_manual_prompts = 0
+    Invoke-MutatedEvidence $missingUpdateConfirmation '*in_app_update_manual_prompts must equal 1*'
+
+    $extraUpdatePrompts = Copy-JsonValue $baseEvidence
+    $extraUpdatePrompts.acceptance.windows_distribution.in_app_update_manual_prompts = 2
+    Invoke-MutatedEvidence $extraUpdatePrompts '*in_app_update_manual_prompts must equal 1*'
 
     $wrongBaseline = Copy-JsonValue $baseEvidence
     $wrongBaseline.acceptance.baseline.version = '0.0.8'
@@ -276,21 +292,21 @@ try {
     Invoke-MutatedEvidence $wrongRestore '*restored.counts.sales does not match*'
 
     $wrongBackup = Copy-JsonValue $baseEvidence
-    $wrongBackup.acceptance.backup.b2_size = 987655
+    $wrongBackup.acceptance.backup.storage_size = 987655
     Invoke-MutatedEvidence $wrongBackup '*ciphertext size/hash evidence must exactly match*'
 
     $wrongVersion = Copy-JsonValue $baseEvidence
-    $wrongVersion.acceptance.backup.b2_version_id = 'different-version'
-    Invoke-MutatedEvidence $wrongVersion '*version IDs must exactly match*'
+    $wrongVersion.acceptance.backup.storage_version_id = 'different-version'
+    Invoke-MutatedEvidence $wrongVersion '*version IDs must equal the deterministic*'
 
     $controlVersion = Copy-JsonValue $baseEvidence
     $controlVersion.acceptance.backup.gateway_version_id = "version`nwith-control"
-    $controlVersion.acceptance.backup.b2_version_id = "version`nwith-control"
+    $controlVersion.acceptance.backup.storage_version_id = "version`nwith-control"
     Invoke-MutatedEvidence $controlVersion '*must not contain control characters*'
 
     $longVersion = Copy-JsonValue $baseEvidence
     $longVersion.acceptance.backup.gateway_version_id = 'v' * 257
-    $longVersion.acceptance.backup.b2_version_id = 'v' * 257
+    $longVersion.acceptance.backup.storage_version_id = 'v' * 257
     Invoke-MutatedEvidence $longVersion '*must contain at most 256 characters*'
 
     $nonCanonicalVerification = Copy-JsonValue $baseEvidence
@@ -316,22 +332,20 @@ try {
         & $verifierScript `
             -EvidencePath $prettyPath -ExpectedSha256 $prettyHash -CandidateAssetDirectory $assetDirectory `
             -Repository $repository -Version $version -CandidateTag $candidateTag -CandidateCommit $commit `
-            -ExpectedWindowsPublisher $publisher -ExpectedWindowsCertificateSha256 $certificate `
             -ActionsToken 'test-actions-token'
     }
 
     $duplicatePath = Join-Path $tempRoot 'duplicate.json'
     $duplicateText = ([IO.File]::ReadAllText($canonicalPath)).Replace(
-        '{"schema_version":2,',
-        '{"schema_version":2,"schema_version":2,'
+        '{"schema_version":3,',
+        '{"schema_version":3,"schema_version":3,'
     )
     Write-Utf8NoBom -Path $duplicatePath -Text $duplicateText
     Assert-ThrowsLike -Pattern '*Duplicate JSON property is forbidden*' -Action {
         & $verifierScript `
             -EvidencePath $duplicatePath -ExpectedSha256 (Get-LowerSha256 $duplicatePath) `
             -CandidateAssetDirectory $assetDirectory -Repository $repository -Version $version `
-            -CandidateTag $candidateTag -CandidateCommit $commit -ExpectedWindowsPublisher $publisher `
-            -ExpectedWindowsCertificateSha256 $certificate -ActionsToken 'test-actions-token'
+            -CandidateTag $candidateTag -CandidateCommit $commit -ActionsToken 'test-actions-token'
     }
 
     $oversizedPath = Join-Path $tempRoot 'oversized.json'
@@ -345,7 +359,6 @@ try {
         & $verifierScript `
             -EvidencePath $canonicalPath -ExpectedSha256 $canonicalHash -CandidateAssetDirectory $assetDirectory `
             -Repository $repository -Version $version -CandidateTag $candidateTag -CandidateCommit $commit `
-            -ExpectedWindowsPublisher $publisher -ExpectedWindowsCertificateSha256 $certificate `
             -ActionsToken 'test-actions-token'
     }
     $global:PusulaEvidenceRunCommit = $commit
@@ -359,11 +372,11 @@ try {
     $lfCanonical = Get-PusulaCanonicalAcceptanceEvidence `
         -Evidence (Copy-JsonValue $baseEvidence) -Repository $repository -Version $version `
         -CandidateTag $candidateTag -CandidateCommit $commit -CandidateAssetDirectory $assetDirectory `
-        -ExpectedWindowsPublisher $publisher -ExpectedWindowsCertificateSha256 $certificate -FixturePath $lfFixture
+        -FixturePath $lfFixture
     $crlfCanonical = Get-PusulaCanonicalAcceptanceEvidence `
         -Evidence (Copy-JsonValue $baseEvidence) -Repository $repository -Version $version `
         -CandidateTag $candidateTag -CandidateCommit $commit -CandidateAssetDirectory $assetDirectory `
-        -ExpectedWindowsPublisher $publisher -ExpectedWindowsCertificateSha256 $certificate -FixturePath $crlfFixture
+        -FixturePath $crlfFixture
     if ((ConvertTo-PusulaCanonicalJson $lfCanonical) -cne (ConvertTo-PusulaCanonicalJson $crlfCanonical)) {
         throw 'Logical fixture evidence changed between LF and CRLF representations.'
     }

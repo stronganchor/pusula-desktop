@@ -13,7 +13,7 @@ RequestHeader set X-Forwarded-Proto "https"
 # Per-Apache-child backend pools fail within one second instead of accumulating
 # an unbounded proxy wait queue. The gateway independently enforces process-wide
 # request, DB, aggregate-rate, and single-relay limits. Completion streams the
-# entire encrypted B2 object through SHA-256, so it needs the bounded long
+# entire encrypted local object through SHA-256, so it retains a bounded long
 # response window without receiving the relay route's large request-body limit.
 ProxyPass        "/v1/backups/complete" "http://127.0.0.1:12741/v1/backups/complete" connectiontimeout=5 timeout=900 retry=0 max=2 acquire=1000
 ProxyPassReverse "/v1/backups/complete" "http://127.0.0.1:12741/v1/backups/complete"

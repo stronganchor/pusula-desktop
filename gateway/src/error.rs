@@ -96,7 +96,9 @@ impl IntoResponse for AppError {
 
         match &self {
             Self::Internal(detail) => tracing::error!(error = %detail, "gateway internal error"),
-            Self::Upstream(detail) => tracing::warn!(error = %detail, "B2 verification failed"),
+            Self::Upstream(detail) => {
+                tracing::warn!(error = %detail, "object storage verification failed")
+            }
             _ => tracing::debug!(error = %self, "request rejected"),
         }
 

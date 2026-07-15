@@ -78,7 +78,6 @@ function ConvertTo-RemoteReleaseJson {
 }
 
 $savedToken = $env:GH_TOKEN
-$savedAdminToken = $env:RELEASE_ADMIN_READ_TOKEN
 try {
     [IO.Directory]::CreateDirectory($assetDirectory) | Out-Null
     $files = [ordered]@{
@@ -290,7 +289,6 @@ try {
     }
 
     $env:GH_TOKEN = 'write-token'
-    $env:RELEASE_ADMIN_READ_TOKEN = 'admin-read-token'
     & $publishScript -Mode Stable -Repository $repository -Tag $stableTag -ExpectedCommit $commit `
         -ExpectedVersion $version -AssetDirectory $assetDirectory -CandidateTag $candidateTag `
         -AcceptanceEvidenceAssetName $evidenceName -AcceptanceEvidenceSha256 $evidenceHash | Out-Host
@@ -329,7 +327,6 @@ try {
 }
 finally {
     $env:GH_TOKEN = $savedToken
-    $env:RELEASE_ADMIN_READ_TOKEN = $savedAdminToken
     Remove-Item Function:\gh -ErrorAction SilentlyContinue
     foreach ($name in @(
             'PusulaPrepareTagExists', 'PusulaPrepareTagCommit', 'PusulaPrepareReleaseExists',

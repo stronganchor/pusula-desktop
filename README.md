@@ -1,6 +1,6 @@
 # Pusula Desktop
 
-Pusula Desktop is the offline-first Windows version of Pusula Lite. One Windows PC and its local SQLite database are the production source of truth; internet access is optional and used only for signed application updates and encrypted off-machine backups.
+Pusula Desktop is the offline-first Windows version of Pusula Lite. One Windows PC and its local SQLite database are the production source of truth; internet access is optional and used only for Tauri-signed application updates and encrypted off-machine backups.
 
 The desktop app preserves the existing Turkish customer, contact, sale, installment, payment, receipt, expected-payment, and daily-report workflows without requiring WordPress, Apache, PHP, MySQL, or a browser login.
 
@@ -33,19 +33,26 @@ cargo clippy --manifest-path gateway/Cargo.toml --all-targets -- -D warnings
 cargo test --manifest-path gateway/Cargo.toml
 ```
 
-An unsigned local installer can be built for testing with:
+The managed single-machine installer is intentionally not Authenticode signed:
 
 ```powershell
 npm run tauri -- build --bundles nsis --no-sign
 ```
 
-Production artifacts must be Authenticode signed and must also carry a valid Tauri updater signature.
+Production updater artifacts must carry a valid Tauri updater signature. The
+offline and updater NSIS installers must report Authenticode `NotSigned`, use
+current-user installation, and pass the documented one-time SmartScreen and
+baseline-to-candidate acceptance drill. See
+[`docs/CODE_SIGNING.md`](docs/CODE_SIGNING.md) and
+[`docs/INSTALLATION_AND_UPDATES.md`](docs/INSTALLATION_AND_UPDATES.md). The
+portable recovery copy for both private keys is documented in
+[`docs/RECOVERY_KEY_CUSTODY.md`](docs/RECOVERY_KEY_CUSTODY.md).
 
 ## Repository Layout
 
 - `src/`: existing Pusula interface adapted to the Tauri compatibility bridge
 - `src-tauri/`: local SQLite service, migration/import, backup client, updater, and Windows packaging
-- `gateway/`: VPS enrollment and presigned Backblaze B2 upload service
+- `gateway/`: VPS enrollment and immutable encrypted local-storage service
 - `docs/`: installation, migration, backup/restore, testing, and release runbooks
 
 No credentials or production customer exports belong in this repository.

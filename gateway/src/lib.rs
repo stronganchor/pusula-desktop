@@ -1,27 +1,27 @@
 pub mod api;
-pub mod b2;
 pub mod config;
 pub mod crypto;
 pub mod db;
 pub mod error;
+pub mod storage;
 
 use api::{GatewayLimits, GatewayState};
-use b2::B2Client;
 use config::ServiceConfig;
 use db::{AdmissionPolicy, Database};
 use error::Result;
+use storage::LocalObjectStore;
 
 pub fn build_gateway(config: &ServiceConfig) -> Result<axum::Router> {
     let database = Database::new(config.database_path.clone(), config.token_pepper.clone());
     database.migrate()?;
-    let b2 = B2Client::new(config.b2.clone(), config.http_client.clone());
+    let storage = LocalObjectStore::new(config.object_root.clone(), config.min_free_bytes)?;
     Ok(api::router(GatewayState::new(
         database,
-        b2,
-        config.b2.prefix.clone(),
+        storage,
+        "backups/",
         GatewayLimits {
             max_backup_bytes: config.max_backup_bytes,
-            upload_ttl: config.b2.presign_ttl,
+            reservation_ttl: config.reservation_ttl,
             admission_policy: AdmissionPolicy {
                 rate_capacity: config.rate_capacity,
                 rate_refill_seconds: config.rate_refill.as_secs(),
@@ -33,6 +33,7 @@ pub fn build_gateway(config: &ServiceConfig) -> Result<axum::Router> {
                 daily_min_interval_seconds: config.daily_min_interval.as_secs(),
                 monthly_min_interval_seconds: config.monthly_min_interval.as_secs(),
             },
+            retention_policy: config.retention_policy,
             max_request_concurrency: config.max_request_concurrency,
             max_db_concurrency: config.max_db_concurrency,
             global_request_capacity: config.global_request_capacity,

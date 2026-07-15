@@ -1,6 +1,6 @@
 # Gateway deployment readiness
 
-Snapshot date: 2026-07-14
+Snapshot date: 2026-07-15
 
 This checklist tracks the production deployment of the optional Pusula backup
 gateway. It does not change the desktop's local-first contract: backup or
@@ -8,13 +8,17 @@ gateway failure must never prevent SQLite business writes.
 
 ## Staged on the AlmaLinux host
 
-- Source commit: `0aa68d0d4059d2c3dec5ab251540ee472dbc83c7`
+- Gateway source commit: `5a6052b36340f07cbbb883ca013b5737fe26ff13`
 - Rust toolchain: `1.92.0-x86_64-unknown-linux-gnu`
 - Gateway version: `0.1.0`
 - Release binary SHA-256:
-  `6eb765dec66836cc9e06744e3e3bf1d3e294b2221e24c76e3c37ea1c897e5b4c`
-- Validation: formatting, clippy with warnings denied, 9 unit tests, 3 API
-  tests, and locked release build passed on AlmaLinux 9.8.
+  `f72c47e886c6129478a212e7dfd2f6c1cb7a113ee42530cba949b455a3ee70fa`
+- Validation: formatting, clippy with warnings denied, all unit/integration/doc
+  tests plus required-test-name audit, locked release build, ELF/dependency
+  checks, and immutable SQLite migration verification passed on AlmaLinux 9.8.
+- Migration evidence: pinned SQLite 3.53.2 reported integrity `ok`; migrations
+  1 `initial` and 2 `relay_attempted_at` matched their exact SQL hashes; no
+  journal, WAL, or SHM sidecar was created.
 - Installed binary:
   `/usr/local/lib/pusula-backup-gateway/pusula-backup-gateway`
 - Installed unit: `/etc/systemd/system/pusula-backup-gateway.service`
@@ -46,19 +50,21 @@ a time; the reservation pays for the first fallback and later retries consume
 the persisted device token bucket. Pending relay retries remain valid after the
 presigned direct URL expires.
 
-The installed VPS binary and unit are still the earlier disabled staging build.
-They do not contain the relay endpoint or immutable migration 2. Do not activate
-that binary for this release. Rebuild the final reviewed commit on AlmaLinux,
-pass formatting, clippy, all gateway tests, and a locked release build, then
-replace the disabled staged binary and re-record its source commit and SHA-256
-before creating the production environment file.
+The installed VPS binary now contains the reviewed relay endpoint and immutable
+migration 2. Live, versioned, and root-only handoff copies match the SHA-256
+above; provenance and the exact 13-file evidence set passed independent
+readback. The earlier `0aa68d0d...` binary and documentation remain in both
+durable archives and intentional rollback copies. The service is still
+`disabled`, `inactive`, and `dead`; the production environment, listener,
+process, Apache proxy, B2 resources, enrollment, and gateway state remain
+absent. Completing this staging gate is not authorization to activate it.
 
 ## Outstanding production gates
 
-- [ ] Build and install the final relay-capable gateway binary from the exact
-  release commit while the unit remains disabled/inactive. Verify the binary,
-  hardened unit, Apache templates, immutable v1-to-v2 migration test, and
-  checksum/provenance readback before activation.
+- [x] Build and install the final relay-capable gateway binary from the exact
+  staged gateway source commit while the unit remains disabled/inactive.
+  Verify the binary, hardened unit, Apache templates, immutable v1-to-v2
+  migration test, and checksum/provenance readback before activation.
 - [ ] Create the private B2 bucket with SSE-B2 in Backblaze region
   `us-west-004`. The current desktop upload allow-list requires endpoint
   `https://s3.us-west-004.backblazeb2.com`, bucket

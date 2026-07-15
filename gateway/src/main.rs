@@ -3,11 +3,14 @@ use std::{path::PathBuf, sync::Arc};
 use clap::{Parser, Subcommand};
 use pusula_backup_gateway::{
     api::cleanup_stale_relay_spools,
-    b2::B2Client,
     build_gateway,
-    config::{token_pepper_from_env, ServiceConfig, DEFAULT_DATABASE_PATH},
+    config::{
+        object_root_from_env, retention_policy_from_env, token_pepper_from_env, ServiceConfig,
+        DEFAULT_DATABASE_PATH,
+    },
     db::Database,
     error::{AppError, Result},
+    storage::{prune_retention, LocalObjectStore},
 };
 use serde_json::json;
 use tracing_subscriber::EnvFilter;
@@ -65,13 +68,15 @@ enum Command {
         #[arg(long)]
         backup_id: String,
     },
-    /// Download and verify one exact completed B2 object version (Unix root only).
+    /// Download and verify one exact completed local object version (Unix root only).
     DownloadBackup {
         #[arg(long)]
         backup_id: String,
         #[arg(long)]
         output: PathBuf,
     },
+    /// Run bounded local object retention immediately.
+    PruneStorage,
 }
 
 #[tokio::main]
@@ -97,6 +102,20 @@ async fn run(cli: Cli) -> Result<()> {
                     removed_spools,
                     "removed stale encrypted relay spool files before startup"
                 );
+            }
+            let retention_database =
+                Database::new(config.database_path.clone(), config.token_pepper.clone());
+            retention_database.migrate()?;
+            let retention_storage =
+                LocalObjectStore::new(config.object_root.clone(), config.min_free_bytes)?;
+            let removed_objects = prune_retention(
+                retention_database,
+                retention_storage,
+                config.retention_policy,
+            )
+            .await?;
+            if removed_objects > 0 {
+                tracing::info!(removed_objects, "expired encrypted backup objects removed");
             }
             let bind = config.bind;
             let router = build_gateway(&config)?;
@@ -181,14 +200,14 @@ async fn run(cli: Cli) -> Result<()> {
         Command::DownloadBackup { backup_id, output } => {
             require_root()?;
             validate_backup_id(&backup_id)?;
-            let config = ServiceConfig::from_env(Some(cli.database))?;
-            let database = Database::new(config.database_path.clone(), config.token_pepper.clone());
+            let object_root = object_root_from_env(&cli.database)?;
+            let database = migration_database(cli.database);
             let backup = database.completed_backup(&backup_id)?;
             let version_id = backup.version_id.as_deref().ok_or(AppError::Conflict(
                 "completed backup has no verified storage version",
             ))?;
-            let b2 = B2Client::new(config.b2, config.http_client);
-            let verified = b2
+            let storage = LocalObjectStore::open_existing(object_root)?;
+            let verified = storage
                 .download_verified(
                     &backup.object_key,
                     version_id,
@@ -207,6 +226,15 @@ async fn run(cli: Cli) -> Result<()> {
                     "sha256": verified.sha256
                 })
             );
+        }
+        Command::PruneStorage => {
+            let object_root = object_root_from_env(&cli.database)?;
+            let retention_policy = retention_policy_from_env()?;
+            let database = migration_database(cli.database);
+            database.migrate()?;
+            let storage = LocalObjectStore::new(object_root, 0)?;
+            let removed = prune_retention(database, storage, retention_policy).await?;
+            println!("{}", json!({ "status": "ok", "removed": removed }));
         }
     }
     Ok(())

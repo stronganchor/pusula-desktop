@@ -1,5 +1,5 @@
 [Unit]
-Description=Pusula Desktop backup credential gateway
+Description=Pusula Desktop encrypted backup gateway and local object store
 Documentation=file:/usr/local/share/doc/pusula-backup-gateway/README.md
 After=network-online.target
 Wants=network-online.target
@@ -43,6 +43,8 @@ RestrictRealtime=true
 RestrictSUIDSGID=true
 RestrictNamespaces=true
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+IPAddressDeny=any
+IPAddressAllow=localhost
 RemoveIPC=true
 SystemCallArchitectures=native
 

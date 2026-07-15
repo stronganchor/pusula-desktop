@@ -14,8 +14,9 @@ The parent `Documents/GitHub/AGENTS.md` rules also apply.
 
 ## Security and Secrets
 
-- Never commit updater private keys, Authenticode credentials, Backblaze keys, enrollment codes, device tokens, recovery private keys, production exports, or customer data.
-- The desktop app must not receive Backblaze credentials. It may receive only a short-lived single-object upload URL.
+- Never commit updater private keys, enrollment codes, device tokens, token peppers, recovery private keys, production exports, or customer data.
+- The desktop may send only age-encrypted backup ciphertext to the authenticated gateway. It must never send plaintext SQLite bytes or the age recovery identity.
+- The gateway stores immutable ciphertext locally on the existing VPS. Do not add a cloud-storage credential or external object-store dependency without an explicit architecture review.
 - Example configuration files must contain placeholders only.
 
 ## Required Validation
@@ -41,4 +42,4 @@ Changes to installation, updates, migrations, backups, or restore behavior must 
 
 ## Release Gate
 
-An initial release is not ready until a clean Windows profile can install it, import a fixture export, complete the offline workflow drill, update from the previous signed build, upload an encrypted backup, and restore that backup with matching row counts and financial totals.
+An initial release is not ready until a clean Windows profile can install it, import a fixture export, complete the offline workflow drill, accept a Tauri-signed update from the acceptance baseline, upload an encrypted backup, and restore that backup with matching row counts and financial totals.

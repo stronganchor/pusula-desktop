@@ -7,8 +7,6 @@ param(
     [Parameter(Mandatory = $true)][string] $Version,
     [Parameter(Mandatory = $true)][string] $CandidateTag,
     [Parameter(Mandatory = $true)][string] $CandidateCommit,
-    [Parameter(Mandatory = $true)][string] $ExpectedWindowsPublisher,
-    [Parameter(Mandatory = $true)][string] $ExpectedWindowsCertificateSha256,
     [Parameter(Mandatory = $true)][string] $ActionsToken,
     [string] $FixturePath = ''
 )
@@ -44,8 +42,6 @@ $canonical = Get-PusulaCanonicalAcceptanceEvidence `
     -CandidateTag $CandidateTag `
     -CandidateCommit $CandidateCommit `
     -CandidateAssetDirectory $CandidateAssetDirectory `
-    -ExpectedWindowsPublisher $ExpectedWindowsPublisher `
-    -ExpectedWindowsCertificateSha256 $ExpectedWindowsCertificateSha256 `
     -FixturePath $FixturePath
 $canonicalText = ConvertTo-PusulaCanonicalJson $canonical
 if (-not [string]::Equals($strictFile.text, $canonicalText, [StringComparison]::Ordinal)) {

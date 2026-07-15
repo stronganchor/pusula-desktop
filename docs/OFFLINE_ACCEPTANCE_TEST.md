@@ -6,8 +6,12 @@ each production release.
 
 ## Installation and migration
 
-- [ ] Windows shows a valid Strong Anchor Authenticode signature on the offline
-  installer.
+- [ ] The full offline and lean updater installers both report Authenticode
+  `NotSigned`; the full installer's SHA-256 exactly matches `SHA256SUMS.txt`.
+- [ ] From the browser-downloaded full installer, Windows shows the expected
+  **Unknown publisher** SmartScreen warning. After confirming the exact hashed
+  filename, select **More info** and **Run anyway** once. Do not import a
+  certificate or disable SmartScreen.
 - [ ] Installation succeeds without internet access or administrator rights.
 - [ ] First launch offers import or an explicitly confirmed empty start.
 - [ ] The empty-start acknowledgement is bound to that SQLite database; moving
@@ -62,30 +66,33 @@ Disable Wi-Fi and Ethernet and confirm Windows has no route to the internet.
   be replayed.
 - [ ] Revoke a device token and require **Yeniden kurulum gerekli** plus visible
   enrollment controls; reenrollment uploads the preserved ciphertext queue.
-- [ ] Reconnect the network; the desktop uploads ciphertext directly through a
-  short-lived single-object URL and reports server confirmation.
-- [ ] On a network where the direct B2 TLS connection fails before any HTTP
-  response, the desktop retries the same backup ID through the authenticated
-  gateway relay; B2 receives only the existing `.age` ciphertext, the gateway
-  spool is empty afterward, and a B2 HTTP rejection does not trigger the relay.
-- [ ] The desktop queue sidecar, gateway verification record, and exact B2
-  object version agree on ciphertext size and SHA-256. The nonempty gateway and
-  B2 version IDs match exactly, and the gateway verification timestamp falls
-  within the recorded acceptance interval.
-- [ ] Force `uploaded`/`relay_pending` `404 not_found`; Pusula clears only the
-  stale binding, re-reserves, and uploads byte-identical ciphertext. Force
-  `409 object_not_present`; it preserves the same binding and stage-appropriate
-  retry. Force `502 storage_verification_failed`; it confirms later without a
-  blind PUT/relay. Lost direct/relay responses must still yield exactly one B2
-  object version.
+- [ ] Reconnect the network; the desktop uploads the existing `.age` ciphertext
+  through the authenticated gateway and reports verified durable storage.
+- [ ] The desktop queue sidecar, gateway verification record, and independent
+  root-only `download-backup` readback agree on ciphertext size and SHA-256.
+  The gateway and storage version IDs both equal
+  `fs-sha256-<ciphertext-sha256>`, the verification timestamp falls within the
+  recorded acceptance interval, and the gateway spool is empty afterward.
+- [ ] Lose the upload or completion response and retry the same backup ID. The
+  gateway returns the same deterministic version ID and retains exactly one
+  stored object. A changed body for that backup ID is rejected rather than
+  replacing the immutable object.
+- [ ] Force `uploaded` `404 not_found`; Pusula clears only the stale binding,
+  re-reserves, and uploads byte-identical ciphertext. Force
+  `409 object_not_present`; it preserves the same binding and retries the
+  appropriate stage. Force `502 storage_verification_failed`; it confirms
+  later without a blind replacement upload.
 - [ ] Leave the computer off across the first of a month. On the next launch,
   require one daily and one catch-up monthly artifact for the local business
   periods. Re-run the six-hour scheduler in the same periods and require no
   duplicate artifacts; remote retries only drain the existing queue.
 - [ ] Restore that object into a clean test profile using the recovery runbook;
   SQLite integrity, row counts, and financial totals match the source.
-- [ ] Install the previous signed version, make an offline write, reconnect, and
-  update in-app to the candidate version.
+- [ ] Install the private 0.0.9 baseline, make an offline write, reconnect, and
+  update in-app to the candidate version. The updater's detached Tauri
+  signature is verified, the user confirms once inside Pusula, no publisher
+  certificate is installed, and the update completes with zero manual
+  Windows/SmartScreen prompts.
 - [ ] The controlled invalid-signature harness reports `result: pass`, fetches
   the deliberately changed copy, and rejects it before installation
   confirmation without changing the candidate artifact.
@@ -159,7 +166,7 @@ installer_created_or_run: false
 Hash the evidence file and record its SHA-256 in the acceptance worksheet. Do
 not treat preparation-only test output, a verifier-only failure, or a missing
 runtime observation as a pass. This negative-path drill complements, but does
-not replace, the signed previous-version-to-candidate update drill.
+not replace, the Tauri-signed previous-version-to-candidate update drill.
 
 ## Release evidence
 
@@ -169,10 +176,11 @@ Use only the closed schema in `acceptance-evidence.template.json`, then run
 UTF-8/no-BOM JSON and attaches those exact bytes as
 `Pusula_<version>_acceptance-evidence.json`.
 
-The evidence may contain installer/update hashes, exact signer identity, test
-versions, the committed logical fixture-manifest checksum and exact
-counts/totals, gateway backup ID, ciphertext size/hash metadata, the exact
-matching gateway/B2 object version ID, the gateway verification timestamp, and
-enumerated pass results. Never add free-text notes, names, filesystem paths,
-customer exports, tokens, keys, credentials, database files, or other sensitive
-fields.
+The evidence may contain installer/update hashes, the explicit managed
+unsigned Windows distribution state, the one-time SmartScreen acknowledgement,
+Tauri updater verification, test versions, the committed logical
+fixture-manifest checksum and exact counts/totals, gateway backup ID,
+ciphertext size/hash metadata, the exact matching deterministic gateway/storage
+version ID, the gateway verification timestamp, and enumerated pass results.
+Never add free-text notes, names, filesystem paths, customer exports, tokens,
+keys, credentials, database files, or other sensitive fields.

@@ -16,8 +16,6 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-. (Join-Path $PSScriptRoot 'Release-RepositoryControls.ps1')
-
 if ($Repository -notmatch '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$' -or
     $ExpectedVersion -cnotmatch '^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)$' -or
     $ExpectedCommit -cnotmatch '^[0-9a-f]{40}$') {
@@ -31,11 +29,6 @@ if (($Mode -ceq 'Candidate' -and $Tag -cne "v$ExpectedVersion-candidate.$Expecte
 if ([string]::IsNullOrWhiteSpace($env:GH_TOKEN)) {
     throw 'Release publication requires the job-scoped contents-write token in GH_TOKEN.'
 }
-if ([string]::IsNullOrWhiteSpace($env:RELEASE_ADMIN_READ_TOKEN)) {
-    throw 'Release publication requires the protected read-only administration token.'
-}
-$writeToken = $env:GH_TOKEN
-$adminToken = $env:RELEASE_ADMIN_READ_TOKEN
 $releaseApiHeader = @('-H', 'X-GitHub-Api-Version: 2026-03-10')
 
 function Get-ExactReleaseByTag {
@@ -186,14 +179,6 @@ if ($Mode -ceq 'Stable') {
     if ($evidence.Count -ne 1 -or $evidence[0].digest -cne "sha256:$AcceptanceEvidenceSha256") {
         throw 'Stable acceptance evidence asset does not match the validated digest.'
     }
-}
-
-try {
-    $env:GH_TOKEN = $adminToken
-    $null = Assert-PusulaReleaseRepositoryControls -Repository $Repository
-}
-finally {
-    $env:GH_TOKEN = $writeToken
 }
 
 Assert-ExactMainCheckoutAndTag

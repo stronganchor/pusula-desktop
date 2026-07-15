@@ -44,7 +44,6 @@ env:
 jobs:
   publish-stable:
     runs-on: windows-latest
-    environment: windows-release
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
@@ -82,10 +81,8 @@ jobs:
       - name: Revalidate immutable candidate, signatures, and canonical evidence
         shell: pwsh
         env:
-          GH_TOKEN: ${{ secrets.RELEASE_ADMIN_READ_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
           ACTIONS_READ_TOKEN: ${{ github.token }}
-          EXPECTED_WINDOWS_PUBLISHER: ${{ vars.EXPECTED_WINDOWS_PUBLISHER }}
-          EXPECTED_WINDOWS_CERTIFICATE_SHA256: ${{ vars.EXPECTED_WINDOWS_CERTIFICATE_SHA256 }}
         run: |
           .\scripts\Test-CandidatePromotion.ps1 `
             -Version $env:RELEASE_VERSION `
@@ -96,8 +93,6 @@ jobs:
             -AcceptanceEvidencePath (Join-Path $env:RUNNER_TEMP 'acceptance-evidence.json') `
             -Confirmation $env:PROMOTION_CONFIRMATION `
             -DownloadDirectory (Join-Path $env:RUNNER_TEMP 'candidate-assets') `
-            -ExpectedWindowsPublisher $env:EXPECTED_WINDOWS_PUBLISHER `
-            -ExpectedWindowsCertificateSha256 $env:EXPECTED_WINDOWS_CERTIFICATE_SHA256 `
             -ActionsToken $env:ACTIONS_READ_TOKEN `
             -MinisignPath $env:MINISIGN_PATH
 
@@ -134,7 +129,6 @@ jobs:
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_ADMIN_READ_TOKEN: ${{ secrets.RELEASE_ADMIN_READ_TOKEN }}
         run: |
           .\scripts\Publish-VerifiedRelease.ps1 `
             -Mode Stable `

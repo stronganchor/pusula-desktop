@@ -1,97 +1,115 @@
-# Pusula Desktop Installation and Updates
+# Installation and updates
 
-Pusula Desktop is installed for one Windows user on one designated Windows
-10/11 x64 computer. It does not need WordPress, a local web server, a browser
-login, or administrator rights. The local SQLite database remains usable when
-every network adapter is disconnected.
+Pusula is installed for one Windows user and stores its production SQLite
+database on that computer. The full installer contains the WebView2 runtime and
+works without internet access. Internet is needed only for optional updates and
+encrypted off-machine backup.
 
-## Initial installation
+## First installation on the managed computer
 
-1. Obtain `Pusula_<version>_x64_offline-setup.exe` from the private handoff or
-   the official `stronganchor/pusula-desktop` GitHub release.
-2. In File Explorer, open **Properties -> Digital Signatures** and require a
-   valid Strong Anchor publisher signature and timestamp. Stop if Windows
-   reports an unknown publisher, an invalid signature, or no signature.
-3. Disconnect the computer from the internet for the offline-install test.
-4. Run the installer. The offline package includes the WebView2 runtime and
-   installs only for the current Windows user.
-5. Start Pusula. Import the final WordPress JSON export, or use the twice-
-   confirmed empty start only for a genuinely new database.
-6. Complete `OFFLINE_ACCEPTANCE_TEST.md` before entering production records.
+Use only the stable GitHub release at:
 
-The database and encrypted backup queue live under the current user's local
-Pusula application-data directory. Do not move, rename, synchronize, or edit
-those files manually. OneDrive and shared network folders are not supported as
-the live database location.
+<https://github.com/stronganchor/pusula-desktop/releases/latest>
 
-If the native **Pusula başlatılamadı** dialog appears, close any other Pusula
-or restore process and follow `BACKUP_RESTORE_RUNBOOK.md`. Do not delete a
-reported restore marker or edit database files merely to make the app open.
+1. Download `Pusula_<version>_x64_offline-setup.exe` and
+   `SHA256SUMS.txt` from the same release.
+2. Open PowerShell in the download folder and run:
 
-## Enable encrypted off-machine backup
+   ```powershell
+   Get-FileHash -Algorithm SHA256 .\Pusula_<version>_x64_offline-setup.exe
+   Get-Content .\SHA256SUMS.txt
+   ```
 
-An administrator issues a short-lived, one-time enrollment code. With the
-internet connected, open **VERİ VE YEDEK**, enter that code and a recognizable
-computer name, and select **YEDEĞİ ETKİNLEŞTİR**. The code is discarded after
-enrollment and the device credential is stored in Windows Credential Manager.
+3. Confirm the displayed installer hash exactly matches the line for that
+   filename. Stop if it does not.
+4. Double-click the offline installer.
+5. Windows may display **Windows protected your PC** because this one-machine
+   installer is intentionally not Authenticode signed. Confirm that the shown
+   filename is the file just hashed, select **More info**, then select
+   **Run anyway**.
+6. Complete the current-user installation. Do not install a certificate, start
+   PowerShell as administrator, or disable SmartScreen.
+7. Start Pusula while disconnected from the network and complete the first-run
+   blank-start or import choice.
 
-Select **ŞİMDİ YEDEKLE** once and require **Uzak yedek doğrulandı**. The desktop
-always creates and durably queues an age-encrypted SQLite snapshot before it
-tries the network. If the gateway is unavailable, local business writes keep
-working and the ciphertext is retried automatically after reconnection.
+That SmartScreen acknowledgement is the only expected manual trust step.
+If Windows shows a different filename, says the file is corrupt, or prevents
+the hash check, stop and obtain a fresh copy from the official release.
 
-If the gateway definitively rejects the stored device credential with `401` or
-`403`, **VERİ VE YEDEK** changes the status to **Yeniden kurulum gerekli** and
-shows the enrollment fields again. Obtain a new one-time code; do not delete
-queued `.age` files, because reenrollment will upload the preserved queue.
+## Why the installer says Unknown publisher
 
-The age recovery private key is not on the customer computer or gateway. Keep
-at least two access-controlled administrator copies. Losing every copy makes
-the encrypted off-machine backups unrecoverable.
+The initial one-machine release deliberately avoids Azure Artifact Signing and
+a self-signed certificate. A self-signed certificate is also untrusted on a new
+computer and would require adding a permanent local trust anchor. The
+first-install SHA-256 check, official immutable GitHub release, and controlled
+handoff identify the initial bytes.
 
-## Normal signed updates
+This exception applies only to the managed Pusula installer from the official
+release. It is not permission to bypass SmartScreen for other programs.
 
-Pusula checks the official GitHub update manifest shortly after launch and
-every six hours while it is running. No internet connection is required until
-an update is available.
+## Normal in-app updates
 
-Tauri downloads the lean Authenticode-signed NSIS installer directly and
-verifies its detached `.exe.sig` updater signature before Pusula asks whether
-to install. This is the same `Pusula_<version>_x64-setup.exe` published with the
-release; it is not wrapped in or extracted from an updater ZIP. If accepted,
-the Rust backend first reserves the short local-snapshot lane, then waits for
-active database operations, blocks new business writes, and creates a
-consistent encrypted snapshot while that exclusive maintenance gate remains
-held. It does not reserve, upload, relay, or otherwise wait on the network in
-that gate. The durable ciphertext remains queued and normal remote flushing
-resumes after relaunch. Only then is the verified installer run and the app
-relaunched. A signature, local-backup, or installer failure stops the appropriate
-phase; an install failure releases the maintenance gate so the current version
-can continue. The larger `Pusula_<version>_x64_offline-setup.exe` remains a
-separate disconnected-install option containing the offline WebView2 runtime.
-The release workflow separately refuses to publish installers whose Windows
-publisher signature or timestamp is invalid.
+Pusula checks:
 
-For remote support, the operator normally only needs to connect the computer
-to the internet, leave Pusula open, and approve the update prompt. If the
-in-app route is unavailable, the signed offline installer can be run over the
-existing installation; take and verify a backup first.
+```text
+https://github.com/stronganchor/pusula-desktop/releases/latest/download/latest.json
+```
 
-The Windows installer refuses to replace Pusula with an older version. SQLite
-schema migrations move forward, so an older retained installer must never be
-used as an application rollback against a database opened by a newer release.
-Recover records through the documented backup/restore procedure and install a
-same-or-newer signed version instead.
+The update check never blocks customer, sale, installment, payment, report, or
+receipt work. If the computer is offline, Pusula continues normally and checks
+again after connectivity returns.
 
-## Before repair, replacement, or uninstall
+When an update is available:
 
-1. Open **VERİ VE YEDEK** and require a fresh verified remote backup.
-2. Create a manual JSON export to approved encrypted removable media.
-3. Record the application version, database counts/totals, export SHA-256, and
-   latest gateway backup ID in the private handoff worksheet.
-4. Follow `BACKUP_RESTORE_RUNBOOK.md` for a replacement computer. Never create
-   records independently on both old and replacement computers.
+1. Pusula downloads the direct lean NSIS installer.
+2. Tauri verifies the mandatory detached signature with the public key embedded
+   in the installed application.
+3. Pusula creates and verifies an encrypted pre-update snapshot. Failure stops
+   the update without blocking normal local work.
+4. The user confirms the Pusula update.
+5. The current-user passive installer runs and relaunches Pusula.
 
-Do not rely on uninstall behavior as a backup policy. Preserve verified
-exports and encrypted off-machine backups before changing the Windows profile
-or application installation.
+The acceptance gate requires this path to complete without importing a
+certificate and without another Windows/SmartScreen prompt. Tauri writes the
+verified updater to its own temporary directory rather than using a
+browser-downloaded file. If a future Windows policy does display a prompt, do
+not weaken Windows security; record it and use the full offline installer as
+the managed fallback until the release procedure is updated.
+
+The updater signature is separate from Authenticode and cannot be disabled.
+The release workflow independently verifies the same `.exe.sig` with pinned
+Minisign and refuses to publish an installer whose Authenticode status is
+anything other than the documented `NotSigned` state.
+
+## Offline update fallback
+
+If the in-app route is unavailable:
+
+1. On a connected trusted computer, download the new full offline installer and
+   `SHA256SUMS.txt` from the official stable release.
+2. Copy both files to the Pusula computer with a USB drive.
+3. Verify the SHA-256 exactly as in the first-install procedure.
+4. Close Pusula and run the installer. Windows may require the same **More
+   info** / **Run anyway** acknowledgement because the file arrived through an
+   external transfer.
+5. Start Pusula and verify the displayed version and existing records.
+
+The installer rejects downgrades. SQLite migrations are forward-only, so never
+use an older installer as application rollback after a newer version has opened
+the database. Use the guarded data restore procedure with the same or a newer
+application version.
+
+## Data locations
+
+The production location is:
+
+```text
+%LOCALAPPDATA%\com.stronganchor.pusula\data\pusula.sqlite3
+```
+
+Nearby files include encrypted backup queue metadata and recovery markers.
+Never copy or replace the live SQLite file while Pusula is running. Use the
+in-app export/backup path or `scripts\Restore-PusulaBackup.ps1`.
+
+The gateway stores only encrypted `.age` ciphertext. The recovery private
+key is not installed on the customer computer or gateway.

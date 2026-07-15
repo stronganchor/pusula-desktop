@@ -19,6 +19,8 @@ const INITIAL_MIGRATION: &str = include_str!("../migrations/0001_initial.sql");
 const RELAY_ATTEMPT_MIGRATION: &str = include_str!("../migrations/0002_relay_attempted_at.sql");
 const BACKUP_ADMISSION_MIGRATION: &str =
     include_str!("../migrations/0003_backup_admission_and_verification.sql");
+const LOCAL_STORAGE_RETENTION_MIGRATION: &str =
+    include_str!("../migrations/0004_local_storage_retention.sql");
 const MIGRATIONS: &[(i64, &str, &str)] = &[
     (1, "initial", INITIAL_MIGRATION),
     (2, "relay_attempted_at", RELAY_ATTEMPT_MIGRATION),
@@ -26,6 +28,11 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         3,
         "backup_admission_and_verification",
         BACKUP_ADMISSION_MIGRATION,
+    ),
+    (
+        4,
+        "local_storage_retention",
+        LOCAL_STORAGE_RETENTION_MIGRATION,
     ),
 ];
 
@@ -79,6 +86,16 @@ pub struct AdmissionPolicy {
     pub monthly_min_interval_seconds: u64,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct RetentionPolicy {
+    pub rolling_seconds: u64,
+    pub daily_seconds: u64,
+    pub monthly_seconds: u64,
+    pub pending_max_age_seconds: u64,
+    pub pending_cleanup_limit: u32,
+    pub cleanup_limit: u32,
+}
+
 #[derive(Clone)]
 pub struct Database {
     path: Arc<PathBuf>,
@@ -129,6 +146,12 @@ pub struct BackupSummary {
     pub latest_completed: Option<BackupRecord>,
     pub active_pending: u64,
     pub expired_pending: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct StoragePurgeCandidate {
+    pub backup_id: String,
+    pub object_key: String,
 }
 
 impl Database {
@@ -410,6 +433,9 @@ impl Database {
                  FROM backups
                  WHERE device_id = ?1 AND status = 'pending'
                    AND retention_class = ?2 AND size_bytes = ?3 AND sha256 = ?4
+                   AND NOT EXISTS (
+                       SELECT 1 FROM storage_purges p WHERE p.backup_id = backups.id
+                   )
                  ORDER BY created_at DESC, id DESC
                  LIMIT 1",
                 params![device_id, retention_class.as_str(), database_size, sha256],
@@ -432,26 +458,14 @@ impl Database {
             .map_err(AppError::internal)?;
 
         if reusable.is_none() {
-            let stale_before = now.saturating_sub(
-                i64::try_from(policy.pending_max_age_seconds).map_err(AppError::internal)?,
-            );
-            transaction
-                .execute(
-                    "DELETE FROM backups
-                     WHERE id IN (
-                         SELECT id FROM backups
-                         WHERE status = 'pending' AND upload_expires_at < ?1
-                         ORDER BY upload_expires_at ASC, id ASC
-                         LIMIT ?2
-                     )",
-                    params![stale_before, policy.pending_cleanup_limit],
-                )
-                .map_err(AppError::internal)?;
-
             let pending_count = transaction
                 .query_row(
                     "SELECT COUNT(*) FROM backups
-                     WHERE device_id = ?1 AND status = 'pending'",
+                     WHERE device_id = ?1 AND status = 'pending'
+                       AND NOT EXISTS (
+                           SELECT 1 FROM storage_purges p
+                           WHERE p.backup_id = backups.id
+                       )",
                     params![device_id],
                     |row| row.get::<_, u64>(0),
                 )
@@ -471,7 +485,11 @@ impl Database {
                 let last_reserved = transaction
                     .query_row(
                         "SELECT MAX(created_at) FROM backups
-                         WHERE device_id = ?1 AND retention_class = ?2",
+                         WHERE device_id = ?1 AND retention_class = ?2
+                           AND NOT EXISTS (
+                               SELECT 1 FROM storage_purges p
+                               WHERE p.backup_id = backups.id
+                           )",
                         params![device_id, retention_class.as_str()],
                         |row| row.get::<_, Option<i64>>(0),
                     )
@@ -712,7 +730,10 @@ impl Database {
                         retention_class, status, created_at, upload_expires_at,
                         completed_at, etag, version_id, verified_size_bytes,
                         verified_sha256, verified_at
-                 FROM backups WHERE id = ?1 AND device_id = ?2",
+                 FROM backups b WHERE id = ?1 AND device_id = ?2
+                   AND NOT EXISTS (
+                       SELECT 1 FROM storage_purges p WHERE p.backup_id = b.id
+                   )",
                 params![backup_id, device_id],
                 map_backup,
             )
@@ -805,6 +826,9 @@ impl Database {
                         verified_sha256, verified_at
                  FROM backups
                  WHERE device_id = ?1 AND status = 'completed'
+                   AND NOT EXISTS (
+                       SELECT 1 FROM storage_purges p WHERE p.backup_id = backups.id
+                   )
                    AND version_id IS NOT NULL AND length(version_id) BETWEEN 1 AND 256
                    AND verified_size_bytes = size_bytes
                    AND verified_sha256 = sha256
@@ -842,6 +866,9 @@ impl Database {
                         verified_sha256, verified_at
                  FROM backups
                  WHERE id = ?1 AND status = 'completed'
+                   AND NOT EXISTS (
+                       SELECT 1 FROM storage_purges p WHERE p.backup_id = backups.id
+                   )
                    AND version_id IS NOT NULL AND length(version_id) BETWEEN 1 AND 256
                    AND verified_size_bytes = size_bytes
                    AND verified_sha256 = sha256
@@ -868,6 +895,9 @@ impl Database {
                         verified_sha256, verified_at
                  FROM backups
                  WHERE status = 'completed'
+                   AND NOT EXISTS (
+                       SELECT 1 FROM storage_purges p WHERE p.backup_id = backups.id
+                   )
                    AND version_id IS NOT NULL AND length(version_id) BETWEEN 1 AND 256
                    AND verified_size_bytes = size_bytes
                    AND verified_sha256 = sha256
@@ -885,6 +915,174 @@ impl Database {
             .into_iter()
             .filter(has_recovery_authority)
             .collect())
+    }
+
+    pub fn claim_storage_purges(
+        &self,
+        policy: RetentionPolicy,
+    ) -> Result<Vec<StoragePurgeCandidate>> {
+        validate_retention_policy(policy)?;
+        let now = now_epoch();
+        let rolling_cutoff = retention_cutoff(now, policy.rolling_seconds)?;
+        let daily_cutoff = retention_cutoff(now, policy.daily_seconds)?;
+        let monthly_cutoff = retention_cutoff(now, policy.monthly_seconds)?;
+        let pending_cutoff = retention_cutoff(now, policy.pending_max_age_seconds)?;
+        let mut connection = self.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(AppError::internal)?;
+
+        let unfinished = transaction
+            .query_row(
+                "SELECT COUNT(*) FROM storage_purges WHERE completed_at IS NULL",
+                [],
+                |row| row.get::<_, u32>(0),
+            )
+            .map_err(AppError::internal)?;
+        let mut remaining = policy.cleanup_limit.saturating_sub(unfinished);
+        if remaining > 0 {
+            let pending_limit = remaining.min(policy.pending_cleanup_limit);
+            transaction
+                .execute(
+                    "INSERT INTO storage_purges(backup_id, started_at)
+                     SELECT b.id, ?1
+                     FROM backups b
+                     WHERE b.status = 'pending'
+                       AND b.upload_expires_at < ?2
+                       AND NOT EXISTS (
+                           SELECT 1 FROM storage_purges existing
+                           WHERE existing.backup_id = b.id
+                       )
+                     ORDER BY b.upload_expires_at ASC, b.id ASC
+                     LIMIT ?3",
+                    params![now, pending_cutoff, pending_limit],
+                )
+                .map_err(AppError::internal)?;
+            let unfinished_after_pending = transaction
+                .query_row(
+                    "SELECT COUNT(*) FROM storage_purges WHERE completed_at IS NULL",
+                    [],
+                    |row| row.get::<_, u32>(0),
+                )
+                .map_err(AppError::internal)?;
+            remaining = policy
+                .cleanup_limit
+                .saturating_sub(unfinished_after_pending);
+        }
+        if remaining > 0 {
+            transaction
+                .execute(
+                    "INSERT INTO storage_purges(backup_id, started_at)
+                     SELECT b.id, ?1
+                     FROM backups b
+                     WHERE b.status = 'completed'
+                       AND b.completed_at IS NOT NULL
+                       AND NOT EXISTS (
+                           SELECT 1 FROM storage_purges existing
+                           WHERE existing.backup_id = b.id
+                       )
+                       AND b.completed_at < CASE b.retention_class
+                           WHEN 'rolling' THEN ?2
+                           WHEN 'daily' THEN ?3
+                           WHEN 'monthly' THEN ?4
+                       END
+                       AND b.id <> (
+                           SELECT newest.id
+                           FROM backups newest
+                           WHERE newest.device_id = b.device_id
+                             AND newest.retention_class = b.retention_class
+                             AND newest.status = 'completed'
+                             AND newest.completed_at IS NOT NULL
+                             AND NOT EXISTS (
+                                 SELECT 1 FROM storage_purges newest_purge
+                                 WHERE newest_purge.backup_id = newest.id
+                             )
+                           ORDER BY newest.completed_at DESC, newest.id DESC
+                           LIMIT 1
+                       )
+                     ORDER BY b.completed_at ASC, b.id ASC
+                     LIMIT ?5",
+                    params![now, rolling_cutoff, daily_cutoff, monthly_cutoff, remaining],
+                )
+                .map_err(AppError::internal)?;
+        }
+
+        let candidates = {
+            let mut statement = transaction
+                .prepare(
+                    "SELECT p.backup_id, b.object_key
+                     FROM storage_purges p
+                     JOIN backups b ON b.id = p.backup_id
+                     WHERE p.completed_at IS NULL
+                     ORDER BY p.started_at ASC, p.backup_id ASC
+                     LIMIT ?1",
+                )
+                .map_err(AppError::internal)?;
+            let rows = statement
+                .query_map(params![policy.cleanup_limit], |row| {
+                    Ok(StoragePurgeCandidate {
+                        backup_id: row.get(0)?,
+                        object_key: row.get(1)?,
+                    })
+                })
+                .map_err(AppError::internal)?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(AppError::internal)?
+        };
+        transaction.commit().map_err(AppError::internal)?;
+        Ok(candidates)
+    }
+
+    pub fn finish_storage_purge(&self, backup_id: &str) -> Result<()> {
+        let mut connection = self.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(AppError::internal)?;
+        let status = transaction
+            .query_row(
+                "SELECT b.status
+                 FROM storage_purges p
+                 JOIN backups b ON b.id = p.backup_id
+                 WHERE p.backup_id = ?1 AND p.completed_at IS NULL",
+                params![backup_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(AppError::internal)?
+            .ok_or(AppError::NotFound)?;
+        if status == "pending" {
+            transaction
+                .execute(
+                    "DELETE FROM storage_purges
+                     WHERE backup_id = ?1 AND completed_at IS NULL",
+                    params![backup_id],
+                )
+                .map_err(AppError::internal)?;
+            let changed = transaction
+                .execute(
+                    "DELETE FROM backups WHERE id = ?1 AND status = 'pending'",
+                    params![backup_id],
+                )
+                .map_err(AppError::internal)?;
+            if changed != 1 {
+                return Err(AppError::Conflict(
+                    "stale pending backup changed during storage cleanup",
+                ));
+            }
+        } else if status == "completed" {
+            transaction
+                .execute(
+                    "UPDATE storage_purges
+                 SET completed_at = COALESCE(completed_at, ?2)
+                 WHERE backup_id = ?1",
+                    params![backup_id, now_epoch()],
+                )
+                .map_err(AppError::internal)?;
+        } else {
+            return Err(AppError::Conflict("storage purge status was invalid"));
+        }
+        transaction.commit().map_err(AppError::internal)?;
+        Ok(())
     }
 
     fn new_device_credential(&self, name: &str, now: i64) -> Result<DeviceCredential> {
@@ -1043,6 +1241,26 @@ fn validate_admission_policy(policy: AdmissionPolicy) -> Result<()> {
     Ok(())
 }
 
+fn validate_retention_policy(policy: RetentionPolicy) -> Result<()> {
+    if policy.rolling_seconds == 0
+        || policy.daily_seconds < policy.rolling_seconds
+        || policy.monthly_seconds < policy.daily_seconds
+        || policy.pending_max_age_seconds == 0
+        || policy.pending_cleanup_limit == 0
+        || policy.pending_cleanup_limit > 1000
+        || policy.cleanup_limit == 0
+        || policy.cleanup_limit > 1000
+    {
+        return Err(AppError::BadRequest("retention policy is invalid"));
+    }
+    Ok(())
+}
+
+fn retention_cutoff(now: i64, retention_seconds: u64) -> Result<i64> {
+    let retention_seconds = i64::try_from(retention_seconds).map_err(AppError::internal)?;
+    Ok(now.saturating_sub(retention_seconds))
+}
+
 fn validate_completion_evidence(
     version_id: &str,
     verified_size_bytes: u64,
@@ -1057,7 +1275,7 @@ fn validate_completion_evidence(
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
     if !version_is_valid || verified_size_bytes == 0 || !hash_is_valid {
         return Err(AppError::Upstream(
-            "B2 completion evidence was invalid".to_owned(),
+            "storage completion evidence was invalid".to_owned(),
         ));
     }
     Ok(())
@@ -1107,7 +1325,7 @@ mod tests {
             .unwrap()
             .collect::<rusqlite::Result<Vec<_>>>()
             .unwrap();
-        assert_eq!(versions, vec![1, 2, 3]);
+        assert_eq!(versions, vec![1, 2, 3, 4]);
     }
 
     #[test]
@@ -1180,10 +1398,19 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(migration_count, 3);
+        let purge_table_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'table' AND name = 'storage_purges'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(migration_count, 4);
         assert_eq!(retention_column_count, 1);
         assert_eq!(verification_column_count, 3);
         assert_eq!(authorization_table_count, 1);
+        assert_eq!(purge_table_count, 1);
     }
 
     #[test]
@@ -1393,7 +1620,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_resign_charges_persisted_quota_across_database_reopen() {
+    fn reservation_refresh_charges_persisted_quota_across_database_reopen() {
         let (directory, database) = database();
         let device = database.issue_device("quota", 5).unwrap();
         let policy = AdmissionPolicy {
@@ -1458,7 +1685,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_limit_cleanup_is_bounded_and_frees_one_slot() {
+    fn pending_cleanup_claim_is_bounded_and_frees_one_slot_after_unlink() {
         let (_directory, database) = database();
         let device = database.issue_device("cleanup", 5).unwrap();
         let policy = AdmissionPolicy {
@@ -1502,6 +1729,21 @@ mod tests {
                 "UPDATE upload_authorizations SET authorized_at = ?1",
                 params![now_epoch() - 2 * 24 * 60 * 60],
             )
+            .unwrap();
+
+        let claimed = database
+            .claim_storage_purges(RetentionPolicy {
+                rolling_seconds: 14 * DAY_SECONDS as u64,
+                daily_seconds: 60 * DAY_SECONDS as u64,
+                monthly_seconds: 400 * DAY_SECONDS as u64,
+                pending_max_age_seconds: DAY_SECONDS as u64,
+                pending_cleanup_limit: 1,
+                cleanup_limit: 1,
+            })
+            .unwrap();
+        assert_eq!(claimed.len(), 1);
+        database
+            .finish_storage_purge(&claimed[0].backup_id)
             .unwrap();
 
         database
@@ -1725,5 +1967,329 @@ mod tests {
             AppError::NotFound
         ));
         assert!(database.list_completed_backups(10).unwrap().is_empty());
+    }
+
+    fn insert_completed_for_retention(
+        database: &Database,
+        device_id: &str,
+        retention: RetentionClass,
+        completed_at: i64,
+        suffix: &str,
+    ) -> (String, String) {
+        let backup_id = Uuid::new_v4().to_string();
+        let object_key = format!(
+            "backups/{}/{device_id}/{suffix}.sqlite3.age",
+            retention.as_str()
+        );
+        let sha256 = hex::encode(Sha256::digest(suffix.as_bytes()));
+        database
+            .connect()
+            .unwrap()
+            .execute(
+                "INSERT INTO backups(
+                    id, device_id, object_key, size_bytes, sha256,
+                    status, created_at, upload_expires_at, completed_at,
+                    version_id, retention_class, verified_size_bytes,
+                    verified_sha256, verified_at
+                 ) VALUES (?1, ?2, ?3, 10, ?4, 'completed', ?5, ?6, ?7,
+                           ?8, ?9, 10, ?4, ?7)",
+                params![
+                    backup_id,
+                    device_id,
+                    object_key,
+                    sha256,
+                    completed_at - 10,
+                    completed_at + 890,
+                    completed_at,
+                    format!("fs-sha256-{sha256}"),
+                    retention.as_str()
+                ],
+            )
+            .unwrap();
+        (backup_id, object_key)
+    }
+
+    #[test]
+    fn retention_is_bounded_resumable_and_excludes_claimed_recovery_rows() {
+        let (_directory, database) = database();
+        let device = database.issue_device("retention", 5).unwrap();
+        let now = now_epoch();
+        let (oldest_id, oldest_key) = insert_completed_for_retention(
+            &database,
+            &device.device_id,
+            RetentionClass::Rolling,
+            now - 30 * DAY_SECONDS,
+            "oldest",
+        );
+        let (older_id, _) = insert_completed_for_retention(
+            &database,
+            &device.device_id,
+            RetentionClass::Rolling,
+            now - 20 * DAY_SECONDS,
+            "older",
+        );
+        let (newest_id, _) = insert_completed_for_retention(
+            &database,
+            &device.device_id,
+            RetentionClass::Rolling,
+            now - 15 * DAY_SECONDS,
+            "newest",
+        );
+        let policy = RetentionPolicy {
+            rolling_seconds: 14 * DAY_SECONDS as u64,
+            daily_seconds: 60 * DAY_SECONDS as u64,
+            monthly_seconds: 400 * DAY_SECONDS as u64,
+            pending_max_age_seconds: 30 * DAY_SECONDS as u64,
+            pending_cleanup_limit: 100,
+            cleanup_limit: 1,
+        };
+
+        let first = database.claim_storage_purges(policy).unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].backup_id, oldest_id);
+        assert_eq!(first[0].object_key, oldest_key);
+        assert!(matches!(
+            database.completed_backup(&oldest_id),
+            Err(AppError::NotFound)
+        ));
+        assert!(matches!(
+            database.backup_for_device(&device.device_id, &oldest_id),
+            Err(AppError::NotFound)
+        ));
+
+        let interrupted_retry = database.claim_storage_purges(policy).unwrap();
+        assert_eq!(interrupted_retry[0].backup_id, oldest_id);
+        database.finish_storage_purge(&oldest_id).unwrap();
+        let second = database.claim_storage_purges(policy).unwrap();
+        assert_eq!(second[0].backup_id, older_id);
+        database.finish_storage_purge(&older_id).unwrap();
+
+        assert!(database.claim_storage_purges(policy).unwrap().is_empty());
+        assert_eq!(database.completed_backup(&newest_id).unwrap().id, newest_id);
+    }
+
+    #[test]
+    fn retention_uses_independent_class_boundaries() {
+        let (_directory, database) = database();
+        let device = database.issue_device("class retention", 5).unwrap();
+        let now = now_epoch();
+        for (retention, expired_days, current_days) in [
+            (RetentionClass::Rolling, 15, 13),
+            (RetentionClass::Daily, 61, 59),
+            (RetentionClass::Monthly, 401, 399),
+        ] {
+            insert_completed_for_retention(
+                &database,
+                &device.device_id,
+                retention,
+                now - expired_days * DAY_SECONDS,
+                &format!("{}-expired", retention.as_str()),
+            );
+            insert_completed_for_retention(
+                &database,
+                &device.device_id,
+                retention,
+                now - current_days * DAY_SECONDS,
+                &format!("{}-current", retention.as_str()),
+            );
+        }
+        let candidates = database
+            .claim_storage_purges(RetentionPolicy {
+                rolling_seconds: 14 * DAY_SECONDS as u64,
+                daily_seconds: 60 * DAY_SECONDS as u64,
+                monthly_seconds: 400 * DAY_SECONDS as u64,
+                pending_max_age_seconds: 30 * DAY_SECONDS as u64,
+                pending_cleanup_limit: 100,
+                cleanup_limit: 10,
+            })
+            .unwrap();
+        assert_eq!(candidates.len(), 3);
+        assert!(candidates
+            .iter()
+            .all(|candidate| candidate.object_key.contains("-expired")));
+    }
+
+    #[tokio::test]
+    async fn interrupted_retention_claim_is_resumed_through_object_unlink() {
+        use crate::storage::{prune_retention, LocalObjectStore};
+
+        let (directory, database) = database();
+        let storage = LocalObjectStore::new(directory.path().join("objects"), 0).unwrap();
+        let device = database.issue_device("retention unlink", 5).unwrap();
+        let now = now_epoch();
+        let mut records = Vec::new();
+        for (index, completed_at) in [now - 30 * DAY_SECONDS, now - 20 * DAY_SECONDS]
+            .into_iter()
+            .enumerate()
+        {
+            let body = format!("ciphertext-{index}").into_bytes();
+            let hash = hex::encode(Sha256::digest(&body));
+            let backup_id = Uuid::new_v4().to_string();
+            let object_key = format!(
+                "backups/rolling/{}/2026/07/15/{backup_id}.sqlite3.age",
+                device.device_id
+            );
+            database
+                .reserve_or_reuse_backup(
+                    &device.device_id,
+                    &backup_id,
+                    &object_key,
+                    body.len() as u64,
+                    &hash,
+                    RetentionClass::Rolling,
+                    now + 900,
+                    AdmissionPolicy {
+                        byte_quota_24h: 1024 * 1024,
+                        ..admission_policy()
+                    },
+                )
+                .unwrap();
+            let spool = directory.path().join(format!("spool-{index}.age"));
+            tokio::fs::write(&spool, &body).await.unwrap();
+            let verified = storage
+                .store_verified_spool(&object_key, body.len() as u64, &hash, &spool)
+                .await
+                .unwrap();
+            database
+                .mark_backup_completed(
+                    &device.device_id,
+                    &backup_id,
+                    None,
+                    &verified.version_id,
+                    verified.size_bytes,
+                    &verified.sha256,
+                )
+                .unwrap();
+            database
+                .connect()
+                .unwrap()
+                .execute(
+                    "UPDATE backups
+                     SET created_at = ?2, upload_expires_at = ?3,
+                         completed_at = ?4, verified_at = ?4
+                     WHERE id = ?1",
+                    params![
+                        backup_id,
+                        completed_at - 10,
+                        completed_at + 890,
+                        completed_at
+                    ],
+                )
+                .unwrap();
+            records.push((backup_id, object_key));
+        }
+        let policy = RetentionPolicy {
+            rolling_seconds: 14 * DAY_SECONDS as u64,
+            daily_seconds: 60 * DAY_SECONDS as u64,
+            monthly_seconds: 400 * DAY_SECONDS as u64,
+            pending_max_age_seconds: 30 * DAY_SECONDS as u64,
+            pending_cleanup_limit: 100,
+            cleanup_limit: 10,
+        };
+
+        let claimed = database.claim_storage_purges(policy).unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].backup_id, records[0].0);
+        assert!(storage.root().join(&records[0].1).exists());
+
+        assert_eq!(
+            prune_retention(database.clone(), storage.clone(), policy)
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(!storage.root().join(&records[0].1).exists());
+        assert!(storage.root().join(&records[1].1).exists());
+        let completed: i64 = database
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM storage_purges
+                 WHERE backup_id = ?1 AND completed_at IS NOT NULL",
+                params![records[0].0],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(completed, 1);
+    }
+
+    #[tokio::test]
+    async fn stale_pending_cleanup_unlinks_before_deleting_its_database_row() {
+        use crate::storage::{prune_retention, LocalObjectStore};
+
+        let (directory, database) = database();
+        let storage = LocalObjectStore::new(directory.path().join("objects"), 0).unwrap();
+        let device = database.issue_device("stale pending", 5).unwrap();
+        let body = b"published-before-completion";
+        let hash = hex::encode(Sha256::digest(body));
+        let backup_id = Uuid::new_v4().to_string();
+        let object_key = format!(
+            "backups/rolling/{}/2026/07/15/{backup_id}.sqlite3.age",
+            device.device_id
+        );
+        database
+            .reserve_or_reuse_backup(
+                &device.device_id,
+                &backup_id,
+                &object_key,
+                body.len() as u64,
+                &hash,
+                RetentionClass::Rolling,
+                now_epoch() + 900,
+                admission_policy(),
+            )
+            .unwrap();
+        database
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE backups
+                 SET created_at = ?2, upload_expires_at = ?3
+                 WHERE id = ?1",
+                params![
+                    backup_id,
+                    now_epoch() - 3 * DAY_SECONDS,
+                    now_epoch() - 2 * DAY_SECONDS
+                ],
+            )
+            .unwrap();
+        let spool = directory.path().join("stale-pending-spool.age");
+        tokio::fs::write(&spool, body).await.unwrap();
+        storage
+            .store_verified_spool(&object_key, body.len() as u64, &hash, &spool)
+            .await
+            .unwrap();
+        assert!(storage.root().join(&object_key).exists());
+
+        let removed = prune_retention(
+            database.clone(),
+            storage.clone(),
+            RetentionPolicy {
+                rolling_seconds: 14 * DAY_SECONDS as u64,
+                daily_seconds: 60 * DAY_SECONDS as u64,
+                monthly_seconds: 400 * DAY_SECONDS as u64,
+                pending_max_age_seconds: DAY_SECONDS as u64,
+                pending_cleanup_limit: 10,
+                cleanup_limit: 10,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(removed, 1);
+        assert!(!storage.root().join(&object_key).exists());
+        assert!(matches!(
+            database.backup_for_device(&device.device_id, &backup_id),
+            Err(AppError::NotFound)
+        ));
+        let purge_rows: u64 = database
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM storage_purges WHERE backup_id = ?1",
+                params![backup_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(purge_rows, 0);
     }
 }

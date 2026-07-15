@@ -1,58 +1,76 @@
-# Pusula Desktop Release Runbook
+# Pusula Desktop release runbook
 
-Pusula releases are built from one immutable `main` commit. The Windows
-installers are Authenticode signed, the lean NSIS installer is also signed
-directly with the Tauri updater key embedded in the application, and the exact
-candidate assets are published again under a new stable tag without rebuilding
-them after acceptance. The detached `.exe.sig` authenticates the same lean
-installer bytes used as the updater payload; there is no updater ZIP.
+This runbook publishes a managed single-machine Windows release. The NSIS
+installers are intentionally Authenticode `NotSigned`. The initial
+browser-downloaded installer requires one explicit SmartScreen acknowledgement;
+updates are authenticated by the mandatory Tauri signature embedded in Pusula.
 
-## Repository and environment gates
+The normal operator can perform the full workflow with the existing GitHub
+environment secrets and local DPAPI-protected key custody. Azure Artifact
+Signing, a separate reviewer, a Windows certificate, and an administration
+token are not prerequisites.
 
-Before any release:
+## Non-negotiable gates
 
-1. Protect `main`; require a pull request and both `CI / desktop` and
-   `CI / gateway` checks.
-2. Protect the `windows-release` environment with a required reviewer, prevent
-   self-review, and disable administrator bypass where the GitHub plan allows.
-   Current live state (2026-07-15) has no required reviewer and administrator
-   bypass is enabled, so initial release remains an explicit repository-owner
-   gate until GitHub enforcement is tightened.
-3. Restrict that environment to `main` and configure all values listed in
-   `CODE_SIGNING.md`, including `EXPECTED_WINDOWS_PUBLISHER` and
-   `EXPECTED_WINDOWS_CERTIFICATE_SHA256`.
-4. Enable immutable GitHub Releases for the repository before creating any
-   candidate. Configure the read-only `RELEASE_ADMIN_READ_TOKEN` described in
-   `CODE_SIGNING.md`; the signed-release and stable-publication workflows use it
-   to check the live repository setting before privileged work. Both workflows
-   also require each published release to read back as immutable. The live
-   repository setting is enabled.
-5. Keep the active tag ruleset named `Protect release tags`. It must target
-   tags, include only `refs/tags/v*`, prohibit update and deletion, have no
-   bypass actors, and report that the current user can never bypass it. Tag
-   creation intentionally remains allowed. The workflows query the ruleset by
-   name, not a hard-coded numeric ID.
-6. Keep a recoverable administrator copy of the Tauri updater signing key. The
-   public key in `src-tauri/tauri.conf.json` must match it; the release workflow
-   verifies that relationship before publishing.
-7. Before an initial baseline run, generate and retain a one-time random
-   password of at least 24 characters, then configure it as the protected
-   `windows-release` environment secret
-   `ACCEPTANCE_BASELINE_ARCHIVE_PASSWORD`. GitHub cannot reveal a saved secret,
-   so the acceptance operator must retain the value in an approved password
-   manager until testing is complete.
+Do not publish a stable release until all of these are proven:
 
-## Prepare the candidate
+- `main` is clean, pushed, and the exact commit under test;
+- desktop, frontend, restore, release-policy, and gateway tests pass;
+- the full offline and lean updater installers report Authenticode
+  `NotSigned`;
+- the lean updater's `.exe.sig` verifies against the embedded Tauri key;
+- a clean standard-user profile installs the private 0.0.9 baseline offline,
+  acknowledges SmartScreen only for that initial installer, and updates in-app
+  to the candidate with exactly one Pusula confirmation, zero Windows prompts,
+  and no certificate installation;
+- the invalid-signature runtime harness rejects a changed updater before
+  installation confirmation;
+- fixture import, offline business writes, restart persistence, failure
+  atomicity, encrypted gateway upload, idempotent retry, independent storage
+  readback, and guarded restore all pass; and
+- canonical evidence is bound to the exact immutable candidate.
 
-1. Bump the same strict SemVer in `package.json`, `package-lock.json`,
-   `src-tauri/tauri.conf.json`, `src-tauri/Cargo.toml`, and
-   `src-tauri/Cargo.lock`. Keep NSIS downgrades disabled because Pusula's SQLite
-   migrations are forward-only; the release-policy test also enforces the
-   current-user and offline-WebView installer modes.
+## Existing one-time configuration
+
+The GitHub environment `windows-release` is restricted to `main` and
+contains:
+
+- `TAURI_SIGNING_PRIVATE_KEY`
+- `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`
+- `ACCEPTANCE_BASELINE_ARCHIVE_PASSWORD`
+
+It intentionally has no required reviewer. The packaging job reads these
+secrets; publication jobs use only GitHub's job-scoped contents token.
+
+Verify the recoverable public key without printing private material:
+
+```powershell
+$config = Get-Content -Raw .\src-tauri\tauri.conf.json | ConvertFrom-Json
+$localPublic = (Get-Content -Raw "$env:USERPROFILE\.pusula-secrets\tauri-updater.key.pub").Trim()
+if ([string]$config.plugins.updater.pubkey -cne $localPublic) {
+  throw 'Recoverable updater public key does not match the application.'
+}
+(Get-Acl "$env:USERPROFILE\.pusula-secrets\tauri-updater.key").Access
+```
+
+The key ACL must allow only the owning Windows account. Never use the
+superseded `%USERPROFILE%\.tauri\pusula-desktop.key`.
+
+Release immutability and the no-bypass `v*` update/delete ruleset remain
+server controls. They can be inspected with the signed-in owner session:
+
+```powershell
+gh api repos/stronganchor/pusula-desktop/immutable-releases
+gh api repos/stronganchor/pusula-desktop/rulesets
+```
+
+## 1. Prepare the release commit
+
+1. Set the same final SemVer in `package.json`,
+   `src-tauri/tauri.conf.json`, and `src-tauri/Cargo.toml`.
 2. Run:
 
    ```powershell
-   .\scripts\Test-VersionConsistency.ps1 -ExpectedVersion '0.1.0'
    npm ci
    npm run build
    npm run test:frontend
@@ -63,279 +81,191 @@ Before any release:
    cargo clippy --manifest-path gateway/Cargo.toml --all-targets -- -D warnings
    cargo test --manifest-path gateway/Cargo.toml
    powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\restore-harness.tests.ps1
+   powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\recovery-custody.tests.ps1
    powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\release-policy.tests.ps1
-   npm run tauri -- build --no-bundle --ci
-   npm run tauri -- bundle --bundles nsis --no-sign --ci
    ```
 
-3. Merge through the protected branch and require both CI jobs green. The
-   signed-release workflow independently validates the exact gateway source on
-   Linux and will not enter its protected signing job unless both its Windows
-   desktop and gateway validation jobs pass.
-4. From the `main` branch in GitHub Actions, run **Signed Windows Release** with
-   the final version. The workflow can publish only a GitHub prerelease
-   candidate under the deterministic tag
-   `v<version>-candidate.<full-40-character-main-SHA>`; it rejects SemVer
-   prerelease suffixes and cannot publish a stable or latest release directly.
-   For the initial `0.1.0` release, also set
-   `build_initial_acceptance_baseline=true` and
-   `acceptance_baseline_version=0.0.9`. Every preflight independently proves
-   there is no prior stable release before allowing that flag, requires exactly
-   `0.0.9`, and refuses a synthetic baseline after any stable release exists.
-   The workflow refuses a moving branch,
-   duplicate/non-monotonic version, missing signing value, unexpected
-   publisher, invalid updater signature, incomplete asset set, remote asset
-   digest mismatch, tag conflict, disabled release immutability, or partial
-   publication. It creates the lightweight candidate tag when absent or safely
-   resumes that exact protected tag at the same commit. It similarly creates or
-   resumes only the exact private prerelease draft, verifies every existing
-   numeric asset ID/name/size/digest, and uploads only missing files without
-   clobbering. Then one write-token process rechecks the
-   live controls, exact numeric release and asset IDs, tag, `main`, and
-   case-sensitive remote bytes immediately before publication. It publishes
-   these exact candidate assets:
+3. Commit and push `main`. Record the full commit and exact green CI run.
 
-   ```text
-   Pusula_<version>_x64_offline-setup.exe
-   Pusula_<version>_x64-setup.exe
-   Pusula_<version>_x64-setup.exe.sig
-   latest.json
-   SHA256SUMS.txt
-   ```
+The recovery-custody test validates the portable key-kit generator described
+in `RECOVERY_KEY_CUSTODY.md`; it uses Git for Windows' bundled `gpg.exe` and
+does not expose either production private key.
 
-   `Pusula_<version>_x64-setup.exe` is the Authenticode-signed lean NSIS
-   installer and the direct Tauri v2 updater payload. Its adjacent `.exe.sig`
-   is the detached Tauri signature referenced by `latest.json`. The separate
-   `Pusula_<version>_x64_offline-setup.exe` includes the offline WebView2 runtime
-   for disconnected installation and is not downloaded by the in-app updater.
+## 2. Build the immutable candidate
 
-A failure after candidate tag/draft creation is resumable only by rerunning the
-failed publication job with the same signed artifact from the same workflow
-run. The helper accepts only the exact tag, commit, deterministic private draft,
-and matching asset subset, then uploads only missing files. Do not rebuild or
-resign over a partial draft, and never delete, retag, or clobber it. A published,
-foreign, or mismatched candidate remains an incident and may burn the version;
-diagnose it and use a strictly greater version. The optional baseline is uploaded only as the encrypted,
-three-day Actions artifact
-`pusula-encrypted-initial-acceptance-baseline-<commit>`; it is never attached to
-the GitHub Release, and no plaintext baseline is uploaded.
+For the first release, dispatch `release.yml` from `main`:
 
-## Exercise the exact prerelease updater
+```powershell
+gh workflow run release.yml --repo stronganchor/pusula-desktop --ref main -f version=0.1.0 -f build_initial_acceptance_baseline=true -f acceptance_baseline_version=0.0.9
+```
 
-GitHub excludes prereleases from `/releases/latest`, so production installations
-do not see a candidate before it is accepted. The candidate's immutable manifest
-is nevertheless available at:
+The workflow rechecks version/tag/commit identity, runs desktop and gateway
+validation, compiles the candidate and private baseline, builds the full
+offline installer with `--no-sign`, builds and Tauri-signs the lean updater,
+requires Authenticode `NotSigned`, independently verifies the Tauri
+signature with pinned Minisign, and publishes an immutable prerelease tagged:
 
 ```text
-https://github.com/stronganchor/pusula-desktop/releases/download/v<version>-candidate.<full-40-character-main-SHA>/latest.json
+v<version>-candidate.<full-commit>
 ```
 
-The first release has no prior signed production build, so its private baseline
-must be built during the same protected workflow run. The workflow freshly
-compiles `0.0.9` before Azure authentication with the embedded updater version
-and that exact immutable candidate-tag manifest endpoint. It then signs and
-bundles that baseline with the same Tauri public key and Authenticode publisher
-as the candidate. It does not rename or rebundle the `0.1.0` executable.
+The five candidate assets are:
 
-For initial-release acceptance:
+```text
+Pusula_<version>_x64_offline-setup.exe
+Pusula_<version>_x64-setup.exe
+Pusula_<version>_x64-setup.exe.sig
+latest.json
+SHA256SUMS.txt
+```
 
-1. Download the encrypted baseline Actions artifact from the exact successful
-   candidate workflow run. Verify the `.7z` file's SHA-256 against the adjacent
-   `.sha256` file before extraction.
-2. On the controlled acceptance machine, extract it with 7-Zip and the retained
-   one-time password. Do not upload the decrypted installer to a release, send
-   it to the customer, or retain it after acceptance. Avoid entering the
-   password directly on a command line that will be saved in shell history.
+The encrypted private baseline is a three-day Actions artifact named
+`pusula-encrypted-initial-acceptance-baseline-<candidate-commit>`. It is
+never a release asset. Reruns may resume only the same tag, commit, and bytes;
+the helpers never delete, clobber, or retag.
 
-   ```powershell
-   $archive = Get-Item 'C:\secure\Pusula_0.0.9_to_0.1.0_acceptance-only.7z'
-   $expected = ((Get-Content -Raw "$($archive.FullName).sha256") -split '\s+')[0]
-   $actual = (Get-FileHash -Algorithm SHA256 $archive.FullName).Hash.ToLowerInvariant()
-   if ($actual -ne $expected) { throw 'Acceptance baseline archive hash mismatch.' }
-   ```
+## 3. Retrieve the private baseline
 
-   After the hash passes, use the 7-Zip graphical password prompt to extract
-   the installer so the password is not retained in PowerShell history.
+Download the Actions artifact, then use the local DPAPI password without
+displaying it:
 
-3. Install it in a clean Windows test profile with no existing Pusula data.
-4. Open Pusula, verify the actual installed executable, then open **Veri ve
-   Yedekleme** and require the visible value `Pusula sürümü: 0.0.9`. Stop if it
-   shows `0.1.0`, `Bilinmiyor`, or any other value.
+```powershell
+$secure = Get-Content "$env:USERPROFILE\.pusula-secrets\acceptance-baseline-password.dpapi" | ConvertTo-SecureString
+$pointer = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
+try {
+  $password = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($pointer)
+  & 7z.exe t "-p$password" .\Pusula_0.0.9_to_0.1.0_acceptance-only.7z
+  if ($LASTEXITCODE -ne 0) { throw 'Baseline archive verification failed.' }
+  & 7z.exe x "-p$password" .\Pusula_0.0.9_to_0.1.0_acceptance-only.7z
+  if ($LASTEXITCODE -ne 0) { throw 'Baseline archive extraction failed.' }
+} finally {
+  if ($pointer -ne [IntPtr]::Zero) {
+    [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($pointer)
+  }
+  Remove-Variable password,secure -ErrorAction SilentlyContinue
+}
+```
 
-   ```powershell
-   $expectedVersion = '0.0.9'
-   $expectedPublisher = '<exact EXPECTED_WINDOWS_PUBLISHER value>'
-   $expectedCertificate = '<exact EXPECTED_WINDOWS_CERTIFICATE_SHA256 value>'
-   $installedExe = (Get-Process -Name 'pusula-desktop' -ErrorAction Stop |
-     Select-Object -First 1).Path
-   $productVersion = [Diagnostics.FileVersionInfo]::GetVersionInfo($installedExe).ProductVersion
-   if ($productVersion -ne $expectedVersion) { throw "Installed version is $productVersion." }
-   $signature = Get-AuthenticodeSignature -LiteralPath $installedExe
-   $publisher = $signature.SignerCertificate.GetNameInfo(
-     [Security.Cryptography.X509Certificates.X509NameType]::SimpleName,
-     $false
-   )
-   $certificate = ([BitConverter]::ToString(
-     [Security.Cryptography.SHA256]::Create().ComputeHash(
-       $signature.SignerCertificate.RawData
-     )
-   )).Replace('-', '').ToLowerInvariant()
-   if ($signature.Status -ne 'Valid' -or -not $signature.TimeStamperCertificate -or
-       $publisher -cne $expectedPublisher -or $certificate -cne $expectedCertificate) {
-     throw "Installed Pusula signature gate failed: $($signature.Status), $publisher, $certificate"
-   }
-   ```
-5. Confirm its updater request resolves only to:
+Verify the archive SHA-256 against its checksum and metadata. Keep the extracted
+installer outside the repository and delete it after acceptance.
+
+## 4. Run clean-machine acceptance
+
+Use a clean Windows 10/11 x64 standard-user profile. Record exact UTC start and
+completion times.
+
+1. Disconnect all network adapters.
+2. Verify the baseline installer hash and require
+   `Get-AuthenticodeSignature` status `NotSigned`.
+3. Run it. After confirming the exact filename, acknowledge **More info** /
+   **Run anyway** once. Do not import a certificate.
+4. Import `tests/fixtures/pusula-lite-v1.json` and prove exact counts,
+   integer-kuruş totals, and manifest checksum.
+5. Complete every offline, restart, single-instance, and failure item in
+   `OFFLINE_ACCEPTANCE_TEST.md`.
+6. Reconnect and use Pusula's in-app updater.
+7. Confirm the update once inside Pusula, then require the exact candidate to
+   install with zero manual Windows prompts, no certificate installation, and
+   all prior records intact.
+8. Record baseline and candidate installed-executable SHA-256 values.
+
+A second SmartScreen/installer prompt during the in-app update is a failed
+acceptance result. Do not install a self-signed root or disable Windows
+security.
+
+## 5. Prove backup and restore
+
+1. Enroll the desktop with the staged gateway.
+2. Produce and upload a new encrypted backup.
+3. Record backup ID, ciphertext SHA-256/size, gateway SHA-256/size,
+   deterministic version ID, and gateway verification time.
+4. Use the VPS root-only `download-backup` command for independent readback.
+   The desktop queue is not storage evidence.
+5. Require:
 
    ```text
-   https://github.com/stronganchor/pusula-desktop/releases/download/v0.1.0-candidate.<full-40-character-main-SHA>/latest.json
+   ciphertext_sha256 == gateway_sha256 == storage_sha256
+   desktop_size == gateway_size == storage_size
+   gateway_version_id == storage_version_id == fs-sha256-<ciphertext_sha256>
    ```
 
-6. Complete every item in `OFFLINE_ACCEPTANCE_TEST.md`, including:
+6. Require an in-interval gateway verification time and empty spool.
+7. Retry the same backup ID after a simulated lost response. Require one object
+   and the same version ID.
+8. Restore the independently read ciphertext with
+   `scripts\Restore-PusulaBackup.ps1` and prove SQLite integrity, foreign
+   keys, row counts, and financial totals.
 
-   - offline installation and fixture import;
-   - single-instance behavior and the disconnected business workflow;
-   - updater rejection with a deliberately invalid Tauri signature;
-   - candidate download, durable pre-update backup, install, and relaunch;
-   - visible version `Pusula sürümü: 0.1.0` after relaunch;
-   - encrypted upload and a real recovery-key restore with matching
-     counts/totals.
-   - repeat the installed-executable signature command with
-     `$expectedVersion = '0.1.0'` after the updater relaunches.
-   - run the **Controlled invalid-signature drill** with the exact candidate
-     `.exe` and `.exe.sig`. Accept only its runtime `result: pass` evidence;
-     the harness's preparation-only mode is an automated policy-test fixture,
-     not release evidence.
-7. Delete the decrypted installer and installed test profile, delete the
-   workflow artifact, and remove or rotate
-   `ACCEPTANCE_BASELINE_ARCHIVE_PASSWORD` after recording acceptance evidence.
+The gateway never receives SQLite plaintext or the recovery private key.
 
-For later releases, exercise the updater from the prior stable signed version.
-When a controlled override is needed, generate it outside the repository:
+## 6. Prove invalid-signature rejection
 
-```powershell
-.\scripts\New-CandidateUpdaterConfig.ps1 `
-  -CandidateVersion '0.2.0' `
-  -CandidateTag 'v0.2.0-candidate.<full-40-character-main-SHA>' `
-  -OutputPath "$env:TEMP\pusula-0.2.0-candidate.json" `
-  -Force
-```
+Run `scripts\Test-InvalidTauriUpdaterAcceptance.ps1` against the exact
+candidate `.exe` and `.exe.sig`. It must report `result: pass`,
+reject the changed payload during download/verification, and never call
+installation confirmation. Record its evidence SHA-256.
 
-Any acceptance-only build with an override must remain private and must be
-signed, version-identifiable, and compiled from the intended baseline source.
-Never patch, rename, or rebundle a candidate executable to imitate an older
-version.
+## 7. Canonicalize acceptance evidence
 
-The invalid-signature drill is deliberately separate from that positive update
-test. It creates a one-bit-changed copy outside the repository, verifies the
-untouched candidate first, and exercises the actual updater download verifier
-in a uniquely identified, no-bundle debug app against a loopback-only
-manifest. It never changes an immutable release, replaces the production
-updater public key, enables an insecure production transport option, installs
-the changed executable, or writes to an external service. The generated app,
-payload, local manifest, and isolated app data are deleted automatically; keep
-and hash only `invalid-signature-evidence.json`.
-The harness requires the candidate's full 40-character source commit, verifies
-that exact clean `HEAD` before and after the runtime test, and records it in the
-pass evidence. Its unique application identifier also gives it a separate
-Windows Credential Manager service, so it cannot reuse the production backup
-token. Process cleanup and both loopback ports are fail-closed: cleanup failure
-prevents pass evidence from being written.
+Copy `docs\acceptance-evidence.template.json` outside the repository and
+replace only placeholders with observed values. Closed schema version 3
+requires:
 
-Record only the closed, non-sensitive JSON schema in
-`docs/acceptance-evidence.template.json`; do not add notes, operator names,
-paths, tokens, URLs, exports, or other free text. Replace every template value
-with observed evidence. The fixture binding is the logical manifest checksum
-`d709a52df5147bddd57d569d1de4113f76ac10f8841405d970e4e60bdd90ade6`
-plus the exact counts and kuruÅŸ totals. It intentionally does not hash the
-platform-dependent CRLF/LF representation of the fixture file.
+- the exact five candidate assets and workflow run;
+- clean standard-user/offline properties;
+- `managed_unsigned_single_machine`, `currentUser`, both installer
+  statuses `NotSigned`, initial hash/SmartScreen acknowledgements, no trusted
+  publisher certificate, verified Tauri signature, exactly one Pusula
+  confirmation, and zero Windows/SmartScreen update prompts;
+- baseline/candidate executable hashes;
+- fixture source/restored counts and totals;
+- matching desktop/gateway/storage ciphertext and deterministic
+  `fs-sha256-...` version ID; and
+- invalid-signature evidence and enumerated pass checks.
 
-For backup evidence, capture the desktop ciphertext hash/size from the queue
-sidecar before confirmed upload removes it. Read the completed gateway record
-with the root-only lookup command and independently read the exact B2 object
-version. Record the same bounded, non-control version ID for gateway and B2,
-the gateway's actual-body verification time in canonical UTC, and identical
-desktop/gateway/B2 ciphertext hashes and sizes. Do not record a presigned URL,
-device token, runtime key, or recovery identity.
-
-Download the exact five immutable candidate assets into a clean directory,
-then produce the only accepted compact UTF-8/no-BOM representation:
+Create the canonical file:
 
 ```powershell
-.\scripts\New-ReleaseAcceptanceEvidence.ps1 `
-  -InputPath 'C:\secure\pusula-acceptance-evidence-input.json' `
-  -OutputPath 'C:\secure\pusula-acceptance-evidence.json' `
-  -CandidateAssetDirectory 'C:\secure\pusula-0.1.0-candidate' `
-  -Repository 'stronganchor/pusula-desktop' `
-  -Version '0.1.0' `
-  -CandidateTag 'v0.1.0-candidate.<full-40-character-main-SHA>' `
-  -CandidateCommit '<full-40-character-main-SHA>' `
-  -ExpectedWindowsPublisher '<exact protected variable>' `
-  -ExpectedWindowsCertificateSha256 '<exact protected variable>'
+.\scripts\New-ReleaseAcceptanceEvidence.ps1 -InputPath C:\secure\pusula-acceptance-input.json -OutputPath C:\secure\pusula-acceptance-canonical.json -CandidateAssetDirectory C:\secure\pusula-candidate-assets -Repository stronganchor/pusula-desktop -Version 0.1.0 -CandidateTag 'v0.1.0-candidate.<full-commit>' -CandidateCommit '<full-commit>'
 ```
 
-The producer validates the strict closed schema, committed logical fixture,
-exact five asset names/sizes/SHA-256 values, both signed identities, all pass
-states, backup equality, restore totals, and invalid-signature source binding.
-It prints the canonical SHA-256 and strict standard base64 needed for dispatch.
-The promotion workflow rejects duplicate/unknown/missing fields, non-canonical
-JSON, whitespace or non-canonical base64, more than 60 KiB encoded, or more
-than 45 KiB decoded.
+Record its SHA-256 and base64. Do not add names, notes, filesystem paths, URLs,
+tokens, credentials, customer data, database files, or keys.
 
-## Publish stable without rebuilding
+## 8. Promote the accepted candidate
 
-Do not merge another commit while a candidate is under acceptance. After every
-acceptance item passes, run **Publish Accepted Windows Release** from the exact
-candidate commit on `main` with:
+Dispatch `promote-release.yml` from the candidate commit with:
 
-- the exact candidate version;
-- its exact immutable `v<version>-candidate.<40-character-SHA>` tag;
-- the canonical acceptance evidence SHA-256;
-- the exact canonical JSON encoded as strict standard base64;
-- confirmation `PROMOTE v<version>`.
+```text
+version: 0.1.0
+candidate_tag: v0.1.0-candidate.<full-commit>
+acceptance_evidence_sha256: <64 lowercase hex>
+acceptance_evidence_base64: <canonical JSON as strict standard base64>
+confirmation: PROMOTE v0.1.0
+```
 
-The workflow requires immutable releases to be enabled, requires the candidate
-itself to report `isImmutable=true`, and proves its tag and release target equal
-the current `main` commit. It downloads the candidate, revalidates the exact
-asset allowlist, SHA-256 values, Tauri updater signature, Authenticode
-publisher, signer-certificate SHA-256, and timestamps. It also binds the
-evidence to the successful candidate workflow run ID/repository/commit and
-requires the exact fixture counts/totals, clean standard-user offline/restart
-drill, positive update, identical desktop/gateway/B2 ciphertext hashes and
-sizes, exact matching gateway/B2 version IDs, an in-interval gateway
-verification timestamp, empty gateway spool, restored SQLite integrity, and
-invalid-signature runtime pass.
+Promotion revalidates the immutable candidate, exact tag/commit/assets,
+Tauri signature, both Authenticode `NotSigned` statuses, canonical evidence,
+and source workflow run. It adds the evidence as the sixth stable asset and
+publishes immutable `v<version>`.
 
-The workflow creates the stable lightweight tag `v<version>` at that same
-commit and a private draft. A failure after tag or draft creation is resumable:
-rerun only with the same version, candidate, commit, evidence digest, and six
-local files. The helper accepts only an exact protected tag and exact private
-draft, verifies every existing numeric asset ID/name/size/digest, and uploads
-only missing assets without `--clobber`. It never deletes or retags. Any
-mismatch is a preserved release incident, not something to repair in place.
+Verify:
 
-Stable contains the five candidate files byte-for-byte plus
-`Pusula_<version>_acceptance-evidence.json` as the sixth asset. The final helper
-uses one contents-write-token process to recheck repository controls, candidate
-identity, `main`, both exact refs, numeric release ID, and each numeric asset
-ID/name/size/digest immediately before a numeric PATCH. It then verifies the
-immutable readback, exact remote evidence digest, GitHub release attestation,
-and latest-release identity. It does not rebuild, resign, or edit the immutable
-candidate.
+```powershell
+gh release view v0.1.0 --repo stronganchor/pusula-desktop --json tagName,isDraft,isImmutable,isPrerelease,targetCommitish,assets
+gh release verify v0.1.0 --repo stronganchor/pusula-desktop
+gh api repos/stronganchor/pusula-desktop/releases/latest --jq .tag_name
+```
 
-GitHub exposes no documented conditional transaction that makes "publish only
-if this ref and these asset digests still match" atomic with the release PATCH.
-There is therefore a residual read-to-PATCH race even though revalidation and
-PATCH are adjacent in one process. During release, grant release/tag write
-custody only to these serialized workflows; do not let people or other
-automation mutate drafts or `v*` tags. If the post-PATCH immutable readback
-fails, preserve the release and logs as an incident. Never delete it to retry.
+The stable release must be immutable, non-draft, non-prerelease, target the
+accepted commit, contain exactly six assets, and be the latest stable release.
 
-The copied stable `latest.json` intentionally keeps its updater URL pointed at
-the immutable candidate tag. The stable release serves that same manifest
-through `/releases/latest`, while the signed updater payload remains anchored to
-the exact candidate bytes exercised during acceptance. Keep both immutable
-releases permanently.
+## Later releases
 
-If acceptance fails, leave the candidate as a prerelease, diagnose it, and
-release a strictly greater version. Never replace a published candidate asset.
+Set `build_initial_acceptance_baseline=false`, update from the previous
+stable build, retain the same updater public key, repeat the acceptance drills,
+and publish only a strictly greater final SemVer.
+
+If the updater key is lost, recover it or perform a separately managed full
+reinstall. Do not rotate the embedded public key and claim existing
+installations can update.

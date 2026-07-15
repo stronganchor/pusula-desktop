@@ -49,8 +49,11 @@ entire export succeeds.
 
 ## 2. Install and import
 
-1. Install the Authenticode-signed `Pusula_<version>_x64_offline-setup.exe` on
-   the designated Windows PC. The offline installer includes WebView2.
+1. Follow `INSTALLATION_AND_UPDATES.md` to verify the SHA-256 and install the
+   intentionally Authenticode-`NotSigned`
+   `Pusula_<version>_x64_offline-setup.exe` on the designated Windows PC. The
+   offline installer includes WebView2 and the one-time SmartScreen
+   acknowledgement is expected only after the filename and hash match.
 2. Copy the final JSON export to that PC using an approved encrypted transfer.
 3. Start Pusula. On the first-run screen select **JSON İÇE AKTAR** and choose the
    export.
@@ -88,8 +91,10 @@ records entered independently in both systems.
 1. Record the acceptance time and final export checksum.
 2. Mark WordPress Pusula Lite read-only or remove operator access to its entry
    interface. Keep its backup for the agreed retention period.
-3. Enroll the desktop backup client and confirm that an encrypted object reaches
-   Backblaze B2.
+3. Enroll the desktop backup client and confirm that the encrypted object is
+   durably stored by the gateway. Independently download it with the root-only
+   gateway command and verify the same ciphertext SHA-256, size, and
+   `fs-sha256-<ciphertext-sha256>` version ID.
 4. Securely delete temporary JSON copies from the server and transfer media.
 5. Resume entry only in Pusula Desktop.
 

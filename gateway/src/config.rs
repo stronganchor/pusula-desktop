@@ -1,29 +1,27 @@
-use std::{env, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    env,
+    net::SocketAddr,
+    path::{Component, Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 
-use reqwest::redirect::Policy;
-use url::Url;
-
-use crate::error::{AppError, Result};
+use crate::{
+    db::RetentionPolicy,
+    error::{AppError, Result},
+};
 
 pub const DEFAULT_DATABASE_PATH: &str = "/var/lib/pusula-backup-gateway/gateway.sqlite3";
-
-#[derive(Clone)]
-pub struct B2Config {
-    pub endpoint: Url,
-    pub region: String,
-    pub bucket: String,
-    pub prefix: String,
-    pub key_id: String,
-    pub application_key: String,
-    pub presign_ttl: Duration,
-}
 
 #[derive(Clone)]
 pub struct ServiceConfig {
     pub bind: SocketAddr,
     pub database_path: PathBuf,
+    pub object_root: PathBuf,
     pub token_pepper: Arc<[u8]>,
     pub max_backup_bytes: u64,
+    pub min_free_bytes: u64,
+    pub reservation_ttl: Duration,
     pub rate_capacity: u32,
     pub rate_refill: Duration,
     pub max_pending_per_device: u32,
@@ -37,8 +35,7 @@ pub struct ServiceConfig {
     pub max_db_concurrency: usize,
     pub global_request_capacity: u32,
     pub global_request_refill: Duration,
-    pub b2: B2Config,
-    pub http_client: reqwest::Client,
+    pub retention_policy: RetentionPolicy,
 }
 
 impl ServiceConfig {
@@ -55,6 +52,8 @@ impl ServiceConfig {
         let database_path = database_override.unwrap_or_else(|| {
             PathBuf::from(env_or("PUSULA_GATEWAY_DATABASE", DEFAULT_DATABASE_PATH))
         });
+        let object_root = object_root_from_env(&database_path)?;
+
         let pepper = required_env("PUSULA_GATEWAY_TOKEN_PEPPER")?;
         if pepper.len() < 32 {
             return Err(AppError::BadRequest(
@@ -62,42 +61,22 @@ impl ServiceConfig {
             ));
         }
 
-        let endpoint = Url::parse(&required_env("PUSULA_GATEWAY_B2_ENDPOINT")?)
-            .map_err(|_| AppError::BadRequest("PUSULA_GATEWAY_B2_ENDPOINT is invalid"))?;
-        let allow_insecure = parse_bool_env("PUSULA_GATEWAY_ALLOW_INSECURE_B2_ENDPOINT", false)?;
-        if endpoint.scheme() != "https" && !(allow_insecure && endpoint.scheme() == "http") {
-            return Err(AppError::BadRequest(
-                "B2 endpoint must use HTTPS (HTTP is test-only)",
-            ));
-        }
-        if endpoint.host_str().is_none()
-            || endpoint.query().is_some()
-            || endpoint.fragment().is_some()
-            || !endpoint.username().is_empty()
-            || endpoint.password().is_some()
-        {
-            return Err(AppError::BadRequest(
-                "B2 endpoint must be absolute and contain no credentials, query, or fragment",
-            ));
-        }
-
-        let bucket = env_or(
-            "PUSULA_GATEWAY_B2_BUCKET",
-            "stronganchor-pusula-desktop-backups",
-        );
-        validate_bucket(&bucket)?;
-        let prefix = normalize_prefix(&env_or("PUSULA_GATEWAY_B2_PREFIX", "backups/"))?;
-
         let max_backup_bytes = parse_env("PUSULA_GATEWAY_MAX_BACKUP_BYTES", 268_435_456_u64)?;
         if max_backup_bytes == 0 || max_backup_bytes > 5 * 1024 * 1024 * 1024 {
             return Err(AppError::BadRequest(
                 "PUSULA_GATEWAY_MAX_BACKUP_BYTES must be between 1 and 5368709120",
             ));
         }
-        let presign_ttl_seconds = parse_env("PUSULA_GATEWAY_PRESIGN_TTL_SECONDS", 900_u64)?;
-        if !(60..=3600).contains(&presign_ttl_seconds) {
+        let min_free_bytes = parse_env("PUSULA_GATEWAY_MIN_FREE_BYTES", 1_073_741_824_u64)?;
+        if !(64 * 1024 * 1024..=1024 * 1024 * 1024 * 1024).contains(&min_free_bytes) {
             return Err(AppError::BadRequest(
-                "PUSULA_GATEWAY_PRESIGN_TTL_SECONDS must be between 60 and 3600",
+                "PUSULA_GATEWAY_MIN_FREE_BYTES must be between 64 MiB and 1 TiB",
+            ));
+        }
+        let reservation_ttl_seconds = parse_env("PUSULA_GATEWAY_RESERVATION_TTL_SECONDS", 900_u64)?;
+        if !(60..=3600).contains(&reservation_ttl_seconds) {
+            return Err(AppError::BadRequest(
+                "PUSULA_GATEWAY_RESERVATION_TTL_SECONDS must be between 60 and 3600",
             ));
         }
         let rate_capacity = parse_env("PUSULA_GATEWAY_UPLOAD_BURST", 5_u32)?;
@@ -187,42 +166,16 @@ impl ServiceConfig {
             ));
         }
 
-        let http_client = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(5))
-            .timeout(Duration::from_secs(20))
-            .redirect(Policy::none())
-            .user_agent(concat!("pusula-backup-gateway/", env!("CARGO_PKG_VERSION")))
-            .build()
-            .map_err(AppError::internal)?;
-
-        let region = required_env("PUSULA_GATEWAY_B2_REGION")?;
-        if region.len() < 3
-            || region.len() > 32
-            || region.starts_with('-')
-            || region.ends_with('-')
-            || !region
-                .bytes()
-                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
-        {
-            return Err(AppError::BadRequest("PUSULA_GATEWAY_B2_REGION is invalid"));
-        }
-        let key_id = required_env("PUSULA_GATEWAY_B2_KEY_ID")?;
-        let application_key = required_env("PUSULA_GATEWAY_B2_APPLICATION_KEY")?;
-        if !(3..=128).contains(&key_id.len())
-            || key_id.bytes().any(|byte| byte.is_ascii_whitespace())
-            || !(16..=256).contains(&application_key.len())
-            || application_key
-                .bytes()
-                .any(|byte| byte.is_ascii_whitespace())
-        {
-            return Err(AppError::BadRequest("B2 credentials are malformed"));
-        }
+        let retention_policy = retention_policy_from_env()?;
 
         Ok(Self {
             bind,
             database_path,
+            object_root,
             token_pepper: Arc::from(pepper.into_bytes()),
             max_backup_bytes,
+            min_free_bytes,
+            reservation_ttl: Duration::from_secs(reservation_ttl_seconds),
             rate_capacity,
             rate_refill: Duration::from_secs(refill_seconds),
             max_pending_per_device,
@@ -236,16 +189,7 @@ impl ServiceConfig {
             max_db_concurrency,
             global_request_capacity,
             global_request_refill: Duration::from_secs(global_request_refill_seconds),
-            b2: B2Config {
-                endpoint,
-                region,
-                bucket,
-                prefix,
-                key_id,
-                application_key,
-                presign_ttl: Duration::from_secs(presign_ttl_seconds),
-            },
-            http_client,
+            retention_policy,
         })
     }
 }
@@ -258,6 +202,65 @@ pub fn token_pepper_from_env() -> Result<Arc<[u8]>> {
         ));
     }
     Ok(Arc::from(pepper.into_bytes()))
+}
+
+pub fn object_root_from_env(database_path: &Path) -> Result<PathBuf> {
+    validate_absolute_normalized_path(database_path, "PUSULA_GATEWAY_DATABASE is invalid")?;
+    let default_object_root = database_path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("/var/lib/pusula-backup-gateway"))
+        .join("objects");
+    let object_root = env::var("PUSULA_GATEWAY_OBJECT_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or(default_object_root);
+    validate_absolute_normalized_path(&object_root, "PUSULA_GATEWAY_OBJECT_ROOT is invalid")?;
+    if object_root == database_path {
+        return Err(AppError::BadRequest(
+            "PUSULA_GATEWAY_OBJECT_ROOT must not equal the database path",
+        ));
+    }
+    Ok(object_root)
+}
+
+pub fn retention_policy_from_env() -> Result<RetentionPolicy> {
+    let rolling_days = parse_retention_days("PUSULA_GATEWAY_RETENTION_ROLLING_DAYS", 14)?;
+    let daily_days = parse_retention_days("PUSULA_GATEWAY_RETENTION_DAILY_DAYS", 60)?;
+    let monthly_days = parse_retention_days("PUSULA_GATEWAY_RETENTION_MONTHLY_DAYS", 400)?;
+    if rolling_days > daily_days || daily_days > monthly_days {
+        return Err(AppError::BadRequest(
+            "storage retention days must satisfy rolling <= daily <= monthly",
+        ));
+    }
+    let cleanup_limit = parse_env("PUSULA_GATEWAY_RETENTION_CLEANUP_LIMIT", 100_u32)?;
+    if !(1..=1000).contains(&cleanup_limit) {
+        return Err(AppError::BadRequest(
+            "PUSULA_GATEWAY_RETENTION_CLEANUP_LIMIT must be between 1 and 1000",
+        ));
+    }
+    let pending_max_age_seconds = parse_env(
+        "PUSULA_GATEWAY_PENDING_MAX_AGE_SECONDS",
+        30 * 24 * 60 * 60_u64,
+    )?;
+    if !(24 * 60 * 60..=180 * 24 * 60 * 60).contains(&pending_max_age_seconds) {
+        return Err(AppError::BadRequest(
+            "PUSULA_GATEWAY_PENDING_MAX_AGE_SECONDS must be between 1 and 180 days",
+        ));
+    }
+    let pending_cleanup_limit = parse_env("PUSULA_GATEWAY_PENDING_CLEANUP_LIMIT", 100_u32)?;
+    if !(1..=1000).contains(&pending_cleanup_limit) {
+        return Err(AppError::BadRequest(
+            "PUSULA_GATEWAY_PENDING_CLEANUP_LIMIT must be between 1 and 1000",
+        ));
+    }
+    Ok(RetentionPolicy {
+        rolling_seconds: rolling_days * 24 * 60 * 60,
+        daily_seconds: daily_days * 24 * 60 * 60,
+        monthly_seconds: monthly_days * 24 * 60 * 60,
+        pending_max_age_seconds,
+        pending_cleanup_limit,
+        cleanup_limit,
+    })
 }
 
 fn env_or(name: &str, default: &str) -> String {
@@ -284,48 +287,24 @@ where
     }
 }
 
-fn parse_bool_env(name: &'static str, default: bool) -> Result<bool> {
-    match env::var(name) {
-        Ok(value) => match value.to_ascii_lowercase().as_str() {
-            "1" | "true" | "yes" => Ok(true),
-            "0" | "false" | "no" => Ok(false),
-            _ => Err(AppError::BadRequest(name)),
-        },
-        Err(_) => Ok(default),
+fn parse_retention_days(name: &'static str, default: u64) -> Result<u64> {
+    let days = parse_env(name, default)?;
+    if !(1..=3650).contains(&days) {
+        return Err(AppError::BadRequest(name));
     }
+    Ok(days)
 }
 
-fn validate_bucket(bucket: &str) -> Result<()> {
-    if bucket.len() < 3
-        || bucket.len() > 63
-        || bucket.starts_with(['.', '-'].as_slice())
-        || bucket.ends_with(['.', '-'].as_slice())
-        || bucket.contains("..")
-        || !bucket
-            .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || b".-".contains(&byte))
+fn validate_absolute_normalized_path(path: &Path, message: &'static str) -> Result<()> {
+    if !path.is_absolute()
+        || path.parent().is_none()
+        || path
+            .components()
+            .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
     {
-        return Err(AppError::BadRequest("B2 bucket name is invalid"));
+        return Err(AppError::BadRequest(message));
     }
     Ok(())
-}
-
-fn normalize_prefix(prefix: &str) -> Result<String> {
-    let prefix = prefix.trim_matches('/');
-    if prefix.is_empty()
-        || prefix.len() > 200
-        || prefix.split('/').any(|part| {
-            part.is_empty()
-                || part == "."
-                || part == ".."
-                || !part
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
-        })
-    {
-        return Err(AppError::BadRequest("B2 object prefix is invalid"));
-    }
-    Ok(format!("{prefix}/"))
 }
 
 fn validate_device_byte_quota(max_backup_bytes: u64, quota: u64) -> Result<()> {
@@ -334,7 +313,7 @@ fn validate_device_byte_quota(max_backup_bytes: u64, quota: u64) -> Result<()> {
     ))?;
     if quota < minimum_fallback_quota || quota > 1024 * 1024 * 1024 * 1024 {
         return Err(AppError::BadRequest(
-            "PUSULA_GATEWAY_DEVICE_24H_BYTE_QUOTA must cover one direct grant plus one relay and not exceed 1 TiB",
+            "PUSULA_GATEWAY_DEVICE_24H_BYTE_QUOTA must cover one reservation plus one relay and not exceed 1 TiB",
         ));
     }
     Ok(())
@@ -345,11 +324,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn byte_quota_must_cover_a_direct_grant_and_relay_fallback() {
+    fn byte_quota_must_cover_a_reservation_and_relay() {
         assert!(validate_device_byte_quota(256, 512).is_ok());
         assert!(matches!(
             validate_device_byte_quota(256, 511),
             Err(AppError::BadRequest(_))
         ));
+    }
+
+    #[test]
+    fn storage_paths_must_be_absolute_and_normalized() {
+        assert!(
+            validate_absolute_normalized_path(Path::new("relative/objects"), "invalid").is_err()
+        );
+        assert!(validate_absolute_normalized_path(
+            Path::new("/var/lib/pusula/../objects"),
+            "invalid"
+        )
+        .is_err());
+        let current = std::env::current_dir().unwrap();
+        let filesystem_root = current.ancestors().last().unwrap();
+        assert!(validate_absolute_normalized_path(filesystem_root, "invalid").is_err());
     }
 }

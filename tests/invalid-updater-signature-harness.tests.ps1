@@ -35,6 +35,14 @@ try {
     $node = (Get-Command node -ErrorAction Stop).Source
     & $node --check $runtimeHelper
     if ($LASTEXITCODE -ne 0) { throw 'Invalid updater runtime helper did not pass Node syntax checking.' }
+    & $node $runtimeHelper self-test
+    if ($LASTEXITCODE -ne 0) { throw 'Invalid updater runtime helper self-test failed.' }
+    $runtimeText = Get-Content -Raw -LiteralPath $runtimeHelper
+    if ($runtimeText -notmatch 'Page\.addScriptToEvaluateOnNewDocument' -or
+        $runtimeText -notmatch "button\.click\(\);\s*button\.click\(\);" -or
+        $runtimeText -match 'awaitPromise:\s*true') {
+        throw 'Runtime helper must install the confirmation guard across contexts and initialize first-run synchronously.'
+    }
 
     $tokens = $null
     $parseErrors = $null
@@ -52,6 +60,29 @@ try {
     )
     if ($cleanupIndex -lt 0 -or $passEvidenceWriteIndex -le $cleanupIndex) {
         throw 'Runtime pass evidence must be written only after fail-closed cleanup completes.'
+    }
+    if ([regex]::Matches($harnessText, 'Assert-ExpectedCleanSource').Count -lt 3 -or
+        $harnessText -notmatch 'source_commit\s*=\s*\$sourceCommit' -or
+        $harnessText -notmatch 'source_clean\s*=\s*\$true') {
+        throw 'Runtime source guards and pass evidence must remain bound to the exact clean commit.'
+    }
+    foreach ($cleanupIntegrationPattern in @(
+            'Stop-ExactProcess\s+-Process\s+\$appProcess',
+            'Stop-ExactProcess\s+-Process\s+\$serverProcess',
+            'Wait-LoopbackPortClosed\s+-Port\s+\$DebugPort',
+            'Wait-LoopbackPortClosed\s+-Port\s+\$Port',
+            'if\s*\(\$cleanupProblems\.Count\s+-gt\s+0\)',
+            'throw\s+"Invalid-signature harness cleanup failed:'
+        )) {
+        if ($harnessText -notmatch $cleanupIntegrationPattern) {
+            throw "Fail-closed runtime cleanup integration is missing: $cleanupIntegrationPattern"
+        }
+    }
+    if ([regex]::Matches(
+            $harnessText,
+            'if\s*\(\$cleanupProblem\)\s*\{\s*\$cleanupProblems\s*\+=\s*\$cleanupProblem\s*\}'
+        ).Count -lt 4) {
+        throw 'Runtime cleanup must propagate each process and port failure into the final gate.'
     }
     foreach ($functionName in @(
             'Stop-ExactProcess',
@@ -318,6 +349,19 @@ exit /b 0
             -ExpectedSourceCommit $sourceCommit `
             -MinisignPath $fakeMinisignPath `
             -OutputDirectory (Join-Path $fixtureRoot 'bad-version') `
+            -TauriConfigPath $configPath `
+            -PreparationOnly
+    }
+
+    Assert-ThrowsLike -Pattern '*Expected version 0.1.1, found 0.1.0*' -Action {
+        & $harnessScript `
+            -ArtifactPath $artifactPath `
+            -SignaturePath $signaturePath `
+            -CandidateVersion '0.1.1' `
+            -HarnessVersion '0.0.9' `
+            -ExpectedSourceCommit $sourceCommit `
+            -MinisignPath $fakeMinisignPath `
+            -OutputDirectory (Join-Path $fixtureRoot 'repository-version-mismatch') `
             -TauriConfigPath $configPath `
             -PreparationOnly
     }

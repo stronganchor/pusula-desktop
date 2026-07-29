@@ -5,6 +5,11 @@ database on that computer. The full installer contains the WebView2 runtime and
 works without internet access. Internet is needed only for optional updates and
 encrypted off-machine backup.
 
+The desktop crate is intentionally Windows-only and fails closed during build
+when `CARGO_CFG_TARGET_OS` is not `windows`. Do not publish a Linux or macOS
+desktop package from the cross-platform Cargo lockfile. The independently
+validated backup gateway remains the only Linux component.
+
 ## First installation on the managed computer
 
 Use only the stable GitHub release at:

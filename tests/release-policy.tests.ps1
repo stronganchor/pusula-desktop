@@ -37,6 +37,14 @@ if (Test-Path -LiteralPath (Join-Path $repoRoot ('scripts\Invoke-Artifact' + 'Si
     throw 'Obsolete Azure Artifact Signing helper must not remain in the managed single-machine release.'
 }
 $tauriConfig = Get-Content -Raw -LiteralPath (Join-Path $repoRoot 'src-tauri\tauri.conf.json') | ConvertFrom-Json
+$desktopBuildScript = Get-Content -Raw -LiteralPath (Join-Path $repoRoot 'src-tauri\build.rs')
+$desktopLibrary = Get-Content -Raw -LiteralPath (Join-Path $repoRoot 'src-tauri\src\lib.rs')
+if ($desktopBuildScript.IndexOf('CARGO_CFG_TARGET_OS', [StringComparison]::Ordinal) -lt 0 -or
+    $desktopBuildScript.IndexOf('target_os != "windows"', [StringComparison]::Ordinal) -lt 0 -or
+    $desktopLibrary.IndexOf('#[cfg(not(target_os = "windows"))]', [StringComparison]::Ordinal) -lt 0 -or
+    $desktopLibrary.IndexOf('compile_error!', [StringComparison]::Ordinal) -lt 0) {
+    throw 'The desktop crate must fail closed for every unsupported non-Windows target.'
+}
 if ([string]$tauriConfig.bundle.windows.webviewInstallMode.type -cne 'offlineInstaller') {
     throw 'Release installer must embed the offline WebView2 installer.'
 }

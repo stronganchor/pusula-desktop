@@ -24,6 +24,7 @@ test('transitive frontend build dependencies stay above advisory floors', () => 
   const dependencyFloors = {
     nanoid: '3.3.18',
     postcss: '8.5.23',
+    'source-map-js': '1.2.2',
   }
 
   for (const [dependency, minimum] of Object.entries(dependencyFloors)) {

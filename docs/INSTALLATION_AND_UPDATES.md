@@ -86,6 +86,15 @@ The release workflow independently verifies the same `.exe.sig` with pinned
 Minisign and refuses to publish an installer whose Authenticode status is
 anything other than the documented `NotSigned` state.
 
+Before packaging a release, run `npm run test:frontend`, `npm audit`, and the
+locked desktop Rust tests. The dependency checks enforce Vite 6.4.4 for its
+Windows editor command-injection fixes and rustls 0.23.46 / rustls-webpki
+0.103.16 for the TLS advisory fixes. Recheck the actual Windows dependency
+graph when updating the locks: a package listed only for another target is
+not evidence that its vulnerable path runs in the supported build. Keep the
+signed-update, encrypted-backup, offline workflow and restore acceptance gates
+after any transport dependency update.
+
 ## Offline update fallback
 
 If the in-app route is unavailable:

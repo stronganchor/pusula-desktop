@@ -1,3 +1,6 @@
+#[cfg(not(target_os = "windows"))]
+compile_error!("Pusula Desktop supports only Windows; use the x86_64-pc-windows-msvc target.");
+
 mod api;
 mod backup;
 pub mod db;

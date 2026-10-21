@@ -20,6 +20,11 @@ $env:Path = "$env:USERPROFILE\.cargo\bin;$env:Path"
 npm run tauri dev
 ```
 
+`src-tauri` intentionally rejects every non-Windows compilation target. Cargo
+may retain target-specific GTK dependencies in its cross-platform lockfile,
+but they are outside the supported and buildable Pusula Desktop target. The
+separate `gateway/` crate remains a supported Linux service.
+
 Fast validation:
 
 ```powershell

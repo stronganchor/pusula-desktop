@@ -5,6 +5,11 @@ database on that computer. The full installer contains the WebView2 runtime and
 works without internet access. Internet is needed only for optional updates and
 encrypted off-machine backup.
 
+The desktop crate is intentionally Windows-only and fails closed during build
+when `CARGO_CFG_TARGET_OS` is not `windows`. Do not publish a Linux or macOS
+desktop package from the cross-platform Cargo lockfile. The independently
+validated backup gateway remains the only Linux component.
+
 ## First installation on the managed computer
 
 Use only the stable GitHub release at:
@@ -80,6 +85,15 @@ The updater signature is separate from Authenticode and cannot be disabled.
 The release workflow independently verifies the same `.exe.sig` with pinned
 Minisign and refuses to publish an installer whose Authenticode status is
 anything other than the documented `NotSigned` state.
+
+Before packaging a release, run `npm run test:frontend`, `npm audit`, and the
+locked desktop Rust tests. The dependency checks enforce Vite 6.4.4 for its
+Windows editor command-injection fixes and rustls 0.23.46 / rustls-webpki
+0.103.16 for the TLS advisory fixes. Recheck the actual Windows dependency
+graph when updating the locks: a package listed only for another target is
+not evidence that its vulnerable path runs in the supported build. Keep the
+signed-update, encrypted-backup, offline workflow and restore acceptance gates
+after any transport dependency update.
 
 ## Offline update fallback
 
